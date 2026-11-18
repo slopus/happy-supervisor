@@ -25,6 +25,7 @@ protocol rule in `client` or `testing`.
 | `sandbox/linux.rs` | Linux sandbox track |
 | `sandbox/macos.rs` | macOS sandbox track |
 | `fs` (bodies of `perform` and `handle`), `watch` | files track |
+| `proxy/*` | proxy track |
 | `node_info/*` | node-info track |
 
 Stay inside your files. A change to a frozen signature, a shared type, or a dependency goes

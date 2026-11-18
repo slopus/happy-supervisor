@@ -22,27 +22,30 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 
 | Type | Module | Owner |
 |---|---|---|
-| Link frames (`hello`, `welcome`, `msg`, `ack`, `bye`), every message kind's body type (commands, replies, events), `Access`, `Policy` wire shape, `NodeInfo` | `protocol` | scaffold, frozen |
+| Link frames (`hello`, `welcome`, `msg`, `ack`, `bye`), every message kind's body type (commands, replies, events), `Access`, `Policy` wire shape, `NodeInfo`, the proxy types (`ProxySpec`, `ProxyToken`, `HostPattern`, `StreamId`, `ProxyMessage` and its bodies) | `protocol` | scaffold, frozen |
 | `Wire::{Plain, Deflate}` (subprotocol ↔ frame codec: 1-byte prefix, raw deflate, 32 MiB inflate bound), `to_cbor`/`from_cbor`/`to_value`/`from_value`, the dynamic body `Value` | `wire` | scaffold |
 | `Error { kind: ErrorKind, message }`, `ErrorKind` ↔ `kind` string table | `error` | scaffold |
-| `Policy` (validated when built or parsed: path rules, list sizes), `ResolvedPolicy` (canonical grants, `ignored`, hidden state dir, `can_read`/`can_write`), `Confinement::{Raw, Sandboxed(ResolvedPolicy)}` | `policy` | scaffold |
+| `Policy` (validated when built or parsed: path rules, list sizes), `ResolvedPolicy` (canonical grants, `ignored`, hidden state dir, `can_read`/`can_write`, `grant_read_file` for the CA bundle), `Confinement::{Raw, Sandboxed(ResolvedPolicy)}` | `policy` | scaffold |
 | `Job { policy: ResolvedPolicy, op: JobOp }`, `JobOp::{Exec, Fs}`, the length-prefixed job framing on the helper's stdin, the exec status pipe, `helper::main` | `helper` | scaffold |
 | `sandbox::prepare(&Job) -> Result<std::process::Command>`, `sandbox::probe() -> SandboxInfo`, `sandbox::baseline_read()`, `sandbox::enter(&ResolvedPolicy)` (Linux, inside helper) | `sandbox/{mod,linux,macos,windows}` | Linux / macOS tracks |
-| `StateDir` (paths, installation ID, credentials load/store) | `state` | transport track |
+| `StateDir` (paths, `private_dir`/`public_dir`, installation ID, credentials load/store) | `state` | transport track |
 | `link::Session`: the sans-IO session state machine (outgoing queue with droppable/retained budgets and drop accounting, UUIDv7 IDs, cursor acks, dedup, resend on resume, lost-session detection). Used unchanged by the node and `testing::ControlPlane`; `Role` is the only difference | `link` | scaffold |
 | `Outbox`: the cloneable handle exec, watch and the driver use to send events, commands and replies into the session | `link` | scaffold |
 | `enroll::join`, `client::run` (WebSocket, reconnect loop, driving the `Session`), `testing::ControlPlane` | `enroll`, `client`, `testing` | transport track |
 | `ExecManager` (processes, timeouts, output logs, `exec.log`) | `exec`, `process/{unix,windows}` | exec track |
 | `fs::perform(&FsRequest) -> Result<FsResponse>`, `fs::handle(FsRequest, Confinement)` | `fs` | files track |
 | `WatchManager` | `watch` | files track |
+| `NodeCa` (the CA and `public/ca-bundle.pem`), `ProxyManager` (`start_for_exec` → `ProxyLease`, `on_event`, `session_lost`), `Upstream` (implemented by `Outbox`) | `proxy/*` | proxy track |
 | `node_info::collect(installation_id, name, &SandboxInfo) -> NodeInfo` | `node_info/*` | node-info track |
-| `Node`, `dispatch(&Node, kind, body) -> Result<Value>` for every command kind | `dispatch` | scaffold wires kinds to the functions above |
+| `Node`, `dispatch(&Node, kind, body) -> Option<Result<Value>>`: a reply for every command kind, `None` for a `proxy.*` stream message | `dispatch` | scaffold wires kinds to the functions above |
 
 `dispatch` is the command boundary. It parses bodies into the `protocol` types, which validate
 IDs, argv, absolute paths, policies and log limits as they parse. It turns `access` into a
 `Confinement` once: `raw` stays raw, and `sandboxed` replies `sandbox_unavailable` unless the
-probed `SandboxInfo` is available, then resolves the policy against the state directory. Code
-behind it trusts those types and does not validate them again.
+probed `SandboxInfo` is available, then resolves the policy with `private/` as the hidden path.
+For an `exec.start` with `proxy` it starts the command's proxy, grants a sandboxed command read
+access to the CA bundle, and hands the `ProxyLease` to `ExecManager::start`, which holds it until
+the command exits. Code behind it trusts those types and does not validate them again.
 
 ## The sandbox helper
 
@@ -89,7 +92,8 @@ handlers; sleep until `deadline` and call `tick`; wake on `changed` (an `Outbox`
 drain again; close the socket when `is_closing` and nothing is left to transmit; call
 `disconnected` when the socket is gone. On the node, after `Incoming::Opened`, if
 `needs_ready()` collect `Node::ready_state` and call `ready`. Every `Incoming::Message` goes to
-`dispatch`, and its result to `Outbox::reply`. The clock is injected (`link::Clock`), so tests
+`dispatch`, and its result, when there is one, to `Outbox::reply`. On `Incoming::Lost` call
+`Node::session_lost`. The clock is injected (`link::Clock`), so tests
 use `link::ManualClock`.
 
 ## Process lifetime

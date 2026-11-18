@@ -34,8 +34,8 @@ use crate::error::{Error, Result};
 use crate::protocol::{
     ACK_DELAY_MS, ACK_EVERY_MSGS, Ack, Bye, ByeReason, Bytes, Change, DROPPABLE_QUEUE_BYTES,
     ExecExit, ExecId, ExecOutput, ExecSummary, ExecTimedOut, ExitStatus, Frame, Hello, MsgId,
-    NodeInfo, NodeReady, Outcome, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply, SessionId, Stream,
-    TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
+    NodeInfo, NodeReady, Outcome, ProxyMessage, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply, SessionId,
+    Stream, TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
 };
 use crate::wire::{Value, Wire, from_cbor, from_value, to_cbor};
 
@@ -605,6 +605,21 @@ impl Outbox {
             s.overflow(watch_id);
         }
     }
+
+    /// Queues a `proxy.*` stream message (proxy.md). Never dropped: the stream's flow-control
+    /// window, not the queue, bounds how much is in flight.
+    pub fn proxy(&self, message: ProxyMessage) {
+        let kind = message.kind();
+        let mut s = self.lock();
+        match &message {
+            ProxyMessage::Request(body) => s.enqueue(kind, body, Class::Retained),
+            ProxyMessage::Response(body) => s.enqueue(kind, body, Class::Retained),
+            ProxyMessage::Body(body) => s.enqueue(kind, body, Class::Retained),
+            ProxyMessage::End(body) => s.enqueue(kind, body, Class::Retained),
+            ProxyMessage::Reset(body) => s.enqueue(kind, body, Class::Retained),
+            ProxyMessage::Credit(body) => s.enqueue(kind, body, Class::Retained),
+        };
+    }
 }
 
 impl State {
@@ -963,7 +978,7 @@ mod tests {
 
     use super::*;
     use crate::error::ErrorKind;
-    use crate::protocol::{ChangeKind, ExecState};
+    use crate::protocol::{ChangeKind, ExecState, ProxyBody, ProxyEnd, StreamId};
     use crate::testkit::cbor;
 
     const T0: u64 = 1_763_496_000_000;
@@ -1373,6 +1388,28 @@ mod tests {
             drain(&mut session)[0]["body"],
             json!({ "watchId": "w", "changes": [ { "kind": "modified", "path": "/c" } ] })
         );
+    }
+
+    #[test]
+    fn proxy_messages_are_never_dropped() {
+        let limits = Limits {
+            droppable_bytes: 300,
+            retained_bytes: 1 << 20,
+        };
+        let (mut session, outbox, _clock) = open_node(limits);
+        let stream = StreamId(Uuid::parse_str(S2).unwrap());
+        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 200]);
+        outbox.proxy(ProxyMessage::Body(ProxyBody {
+            stream_id: stream,
+            data: Bytes(vec![b'b'; 1000]),
+        }));
+        outbox.proxy(ProxyMessage::End(ProxyEnd { stream_id: stream }));
+        let frames = drain(&mut session);
+        assert_eq!(
+            frames.iter().map(|f| f["kind"].clone()).collect::<Vec<_>>(),
+            ["exec.output", "proxy.body", "proxy.end"]
+        );
+        assert_eq!(frames[2]["body"], json!({ "streamId": u(S2) }));
     }
 
     #[test]

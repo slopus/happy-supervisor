@@ -194,7 +194,7 @@ mod on_this_machine {
             "{mount_points:?}"
         );
 
-        if expected_arch_is_apple_silicon() {
+        if is_physical_apple_silicon() {
             assert!(
                 info.gpus.iter().any(|gpu| gpu.vendor == GpuVendor::Apple
                     && gpu.name.starts_with("Apple M")
@@ -205,8 +205,10 @@ mod on_this_machine {
         }
     }
 
+    /// GitHub's macOS VMs report no GPU.
     #[cfg(target_os = "macos")]
-    fn expected_arch_is_apple_silicon() -> bool {
+    fn is_physical_apple_silicon() -> bool {
         shell("sysctl -n hw.optional.arm64 2>/dev/null || echo 0") == "1"
+            && shell("sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0") == "0"
     }
 }

@@ -6,8 +6,9 @@ every `node.ready` event, and collected again on each `node.info` command (api.m
 sampled over time. Free disk space is the one value that changes between collections.
 
 A probe that fails leaves its field `null` (or a list empty) rather than failing the whole
-collection. On the wire a `null` field is omitted (api.md, Encoding). Collection must finish in under 5 seconds. A slow external probe (for example
-`nvidia-smi`) is cut off at 3 seconds.
+collection. On the wire a `null` field is omitted (api.md, Encoding). Collection must finish in
+under 5 seconds. The external probes (`nvidia-smi`, `system_profiler`, PowerShell) run alongside
+the rest of the collection, and each is cut off at 3 seconds.
 
 ## Example
 
@@ -122,14 +123,20 @@ How each platform finds them:
 
 * **Linux.** PCI devices of class `0x03` (display) under `/sys/bus/pci/devices`, with vendor
   from the PCI vendor ID. NVIDIA names, memory and driver come from `nvidia-smi
-  --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits` when it is on
-  `PATH`. Otherwise the name is `/sys/.../label` or the vendor and device IDs (`"10de:27b8"`).
-  AMD dedicated memory is `mem_info_vram_total` under the device's `drm` directory.
+  --query-gpu=pci.bus_id,memory.total,driver_version,name --format=csv,noheader,nounits` when
+  it is on `PATH`, matched to the PCI device by bus ID. A card the driver does not support is
+  absent from `nvidia-smi` and is listed from PCI alone. Otherwise the name is the device's
+  `label`, its name in `pci.ids` (`"AD102 [GeForce RTX 4090]"`), or the vendor and device IDs
+  (`"10de:2684"`), and the driver version is the bound driver module's `version`. AMD dedicated
+  memory is `mem_info_vram_total` in the PCI device directory. GPUs `nvidia-smi` lists that are
+  not on the PCI bus are appended.
 * **macOS.** `system_profiler SPDisplaysDataType -json`: `sppci_model` for the name, vendor from
   `spdisplays_vendor`, and `spdisplays_vram` for discrete memory. Apple Silicon reports
   unified memory as `null`.
 * **Windows.** `Win32_VideoController` through PowerShell `Get-CimInstance` (`Name`,
-  `AdapterCompatibility`, `AdapterRAM`, `DriverVersion`). Basic display and remote display
+  `AdapterCompatibility`, `AdapterRAM`, `DriverVersion`, `PNPDeviceID`). The vendor is the PCI
+  vendor in `PNPDeviceID`, else `AdapterCompatibility`. `AdapterRAM` is a 32-bit field that
+  saturates near 4 GiB, so a saturated value reports `null`. Basic display and remote display
   adapters are left out.
 
 ### `sandbox`

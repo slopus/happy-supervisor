@@ -98,16 +98,26 @@ performs the file operation.
 | Policy | Mechanism |
 |---|---|
 | `read` | Landlock read-file, read-dir and execute on each granted path. |
-| `write` | Landlock write, create (regular, directory, symlink, FIFO), remove, truncate (ABI 3+) and cross-directory rename and link (ABI 2+). Device-node creation is never granted. |
-| state directory | Landlock is allow-only, so when a granted directory contains the state directory, that grant is replaced by grants on each existing sibling along the path to it. |
-| `localBind: false` | Landlock denies TCP bind (ABI 4+, kernel 6.7+). When `unixSockets` is also false, seccomp denies `bind` and `listen` outright, which also covers UDP. |
+| `write` | Landlock write, create (regular, directory, symlink, FIFO), remove, truncate (ABI 3+) and cross-directory rename and link (ABI 2+). Device-node creation is never granted. A file grant gets only the rights that apply to a file (read, execute, write, truncate). |
+| state directory | Landlock is allow-only, so when a granted directory contains the state directory, that grant is replaced by grants on each existing entry beside the path to it. The directories on that path are not granted themselves: they cannot be listed, and entries created in them later are denied. Symlinks among those entries are skipped. |
+| `localBind: false` | Landlock denies TCP bind (ABI 4+, kernel 6.7+). When `unixSockets` is also false, seccomp denies `bind` and `listen` outright with `EPERM`, which also covers UDP and every other socket family, netlink included. |
 | `unixSockets: false` | Landlock withholds socket creation in every directory. When `localBind` is also false, seccomp's `bind` denial also covers abstract-namespace sockets. |
 | processes | `no_new_privs`. Landlock confines ptrace to the sandbox. ABI 6+ also scopes signals and abstract Unix socket connections to the sandbox. |
 
+Every requested restriction must be fully enforced. The helper asks Landlock for exactly the
+rights its kernel's ABI supports and fails with `sandbox_unavailable` rather than run under a
+weaker ruleset. Landlock's device ioctl (ABI 5) and Unix socket connect (ABI 9) rights are not
+handled, so ioctl on an opened device and connecting to a socket work as without a sandbox.
+
+The seccomp filter only allows system calls of the native architecture. A 32-bit (compat)
+program is killed at its first system call when the filter applies, because its socket calls
+cannot be filtered reliably.
+
 Gaps the node reports:
 
-* With `localBind: false, unixSockets: true`, UDP ports can still be bound. Landlock has no UDP
-  control.
+* With `localBind: false, unixSockets: true`, UDP ports can still be bound, and a TCP socket can
+  still listen on an ephemeral port by calling `listen` without `bind`. Landlock controls only
+  explicit TCP `bind`, and seccomp cannot tell a TCP `listen` from a Unix socket one.
 * With `localBind: true, unixSockets: false`, abstract-namespace Unix sockets can still be
   bound. Filesystem sockets are denied.
 * On ABI 1 to 3 kernels, `localBind: false` is enforced only with `unixSockets: false` (the

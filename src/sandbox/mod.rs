@@ -11,6 +11,8 @@
 //!   The caller adds stdio, the process group, and for exec jobs the status pipe.
 //! * Linux only, `enter(&ResolvedPolicy) -> Result<()>`: confines the calling helper process.
 
+use std::path::Path;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -51,17 +53,47 @@ pub fn baseline_read() -> Vec<String> {
             "/Library",
             "/private/etc",
             "/private/var/db/timezone",
-            "/dev",
+            "/private/var/select",
+            "/dev/fd",
+            "/dev/tty",
             "/opt/homebrew",
         ]
     } else {
         &[]
     };
-    candidates
+    let mut baseline: Vec<String> = candidates
         .iter()
-        .filter(|path| std::path::Path::new(path).exists())
+        .filter(|path| Path::new(path).exists())
         .map(|path| path.to_string())
-        .collect()
+        .collect();
+    if cfg!(target_os = "macos") {
+        baseline.extend(developer_bundle());
+    }
+    baseline
+}
+
+/// The app bundle holding the active developer directory (`xcode-select -p`), such as
+/// `/Applications/Xcode.app`. `/usr/bin/git`, `python3` and other shims run their tool from it,
+/// and the tools load frameworks from all over the bundle. Command Line Tools live under
+/// `/Library`, which the list already has.
+fn developer_bundle() -> Option<String> {
+    let selected = [
+        "/private/var/db/xcode_select_link",
+        "/private/var/select/developer_dir",
+    ]
+    .iter()
+    .find_map(|link| std::fs::read_link(link).ok());
+    let bundle = match &selected {
+        Some(dir) => dir
+            .ancestors()
+            .find(|path| path.extension() == Some("app".as_ref()))?,
+        // With nothing selected, the shims use Xcode at its default location.
+        None => Path::new("/Applications/Xcode.app"),
+    };
+    if !bundle.exists() {
+        return None;
+    }
+    bundle.to_str().map(str::to_string)
 }
 
 #[cfg(test)]
@@ -82,6 +114,8 @@ mod tests {
     fn baseline_keeps_existing_paths_only() {
         let baseline = super::baseline_read();
         assert!(baseline.contains(&"/System".to_string()));
+        assert!(baseline.contains(&"/private/var/select".to_string()));
+        assert!(!baseline.contains(&"/dev".to_string()));
         assert!(!baseline.contains(&"/proc".to_string()));
     }
 }

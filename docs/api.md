@@ -2,50 +2,59 @@
 
 `happy-supervisor` runs on a machine and lets one trusted control plane run commands, read and
 write files, and watch for changes there. The supervisor opens no inbound port. It dials out to
-the control plane, proves who it is, and then serves requests over that one connection.
+the control plane, proves who it is, and then the two sides exchange messages over that one
+connection.
 
-This document is the wire contract. The policy carried by sandboxed requests is in
+The protocol is built to survive bad networks. Both sides are peers that send each other
+messages, like actors. Every message has a UUIDv7 ID, waits in its sender's outgoing queue
+until the receiver confirms it, and is resent after a reconnect. A dropped connection resumes
+where it left off. When resuming is impossible, both sides find out, and they start over
+knowingly rather than silently losing messages.
+
+This document is the wire contract. The policy carried by sandboxed commands is in
 [policy.md](policy.md). The node description is in [node-info.md](node-info.md).
 
 ## Joining and credentials
 
 A machine joins once with a **join token**: short-lived, single-use, issued by the control plane
 to whoever installs the supervisor. Joining exchanges it for a **node token**, a long-lived
-credential only this machine holds. The join token is never stored.
+credential only this machine holds, and tells the node where to connect. The join token is
+never stored.
 
 ```
-happy-supervisor join --server https://control.example.com --token <join token> [--name <name>]
+happy-supervisor join --url https://control.example.com/api/nodes/join --token <join token> [--name <name>]
 ```
 
-1. The supervisor loads or creates its installation ID (see node-info.md) and collects node info.
-2. `POST {server}/v1/nodes/join`, JSON body:
+`--url` is the **join endpoint itself**, a full URL the control plane hands out with the token.
+The supervisor does not derive any path from it.
+
+1. The supervisor loads or creates its installation ID (node-info.md) and collects node info.
+2. `POST <join url>`, JSON body:
 
    ```json
-   { "joinToken": "jt_…", "installationId": "tz4a98xxat96iws9zmbrgj3a", "info": { …NodeInfo… } }
+   { "joinToken": "jt_…", "installationId": "tz4a98xxat96iws9zmbrgj3a", "name": "build-box-3", "info": { …NodeInfo… } }
    ```
 
 3. `200` answers:
 
    ```json
-   { "nodeId": "n_…", "nodeToken": "nt_…" }
+   { "nodeId": "n_…", "nodeToken": "nt_…", "endpoint": "wss://edge-2.control.example.com/nodes/connect" }
    ```
 
-   Any other status is a failed join. `401`/`403` mean the token is invalid, expired or spent.
-   The body may carry `{ "error": "…" }`, which the CLI prints.
-4. The supervisor writes `credentials.json` atomically (write a temp file in the state directory,
-   then rename), owner-only (`0600` on Unix). It holds `server`, `nodeId` and `nodeToken`.
+   `endpoint` is the full WebSocket URL the node connects to from now on. It may be on another
+   host than the join URL. Any other status is a failed join. `401`/`403` mean the token is
+   invalid, expired or spent. The body may carry `{ "error": "…" }`, which the CLI prints.
+4. The supervisor writes `credentials.json` atomically (a temp file in the state directory,
+   then rename), owner-only (`0600` on Unix). It holds `endpoint`, `nodeId`, `nodeToken` and
+   `name`.
 
 Joining again replaces the stored credentials. The installation ID is kept.
 
-`server` must be `https://host[:port]` with no path, query or credentials. Plain `http://` is
-accepted only for a loopback host, for tests. TLS uses the platform's trust store.
+The join URL must be `https://`, and `endpoint` must be `wss://`. Plain `http://` and `ws://`
+are accepted only for a loopback host, for tests. Neither may carry user credentials. TLS uses
+the platform's trust store.
 
-### Rotation
-
-The control plane can replace the node token at any time with `node.rotateCredential` (below).
-The supervisor stores the new token durably before it answers, so an answered rotation is
-never lost. If the answer is lost, the control plane should accept both tokens until the node
-next connects with the new one.
+The control plane can later change the token, the endpoint, or both, with `node.update` (below).
 
 ## Connection
 
@@ -53,70 +62,165 @@ next connects with the new one.
 happy-supervisor run [--state-dir <dir>]
 ```
 
-`run` opens a WebSocket to `{server}/v1/nodes/connect` (`wss://`, or `ws://` for a loopback
-`http://` server) with `Authorization: Bearer <nodeToken>`.
+`run` opens a WebSocket to the stored `endpoint` with `Authorization: Bearer <nodeToken>`.
 
 * A `401` or `403` on the upgrade means the credential was revoked. `run` exits with code `3`
   and does not retry.
 * Any other failure, or a dropped connection, is retried with exponential backoff from 1 s to
-  60 s with ±20 % jitter. A connection that stays up for 60 s resets the backoff.
-* WebSocket pings from the node every 20 s. A connection with no inbound frame for 60 s is
-  closed and redialed.
+  30 s with ±20 % jitter. A connection that stays up for 60 s resets the backoff.
+* Each side sends a WebSocket ping every 15 s. A side that receives no frame for 45 s considers
+  the connection dead, closes it, and (the node) redials.
 
-Commands and watches **outlive the connection**. They keep running while the node redials.
-Their events queue until the next connection (see Event delivery).
+Processes and watches **outlive connections and sessions**. They keep running while the node
+redials.
 
-## Messages
+## Link protocol
 
-Every frame is one UTF-8 JSON text message in [JSON-RPC 2.0](https://www.jsonrpc.org/specification)
-form. The control plane sends **requests**. The node answers each with a **response** carrying
-the same `id`. The node also sends **notifications**, which have no `id` and get no answer.
-Requests are handled concurrently, and responses may arrive in any order.
+Every WebSocket frame is one UTF-8 JSON text message with a `t` field naming the frame type.
+Binary payloads inside message bodies (file contents, process output, stdin) are standard
+base64 with padding, in fields named `data`.
+
+### Sessions
+
+A **session** is the state the two sides share about one conversation: each side's outgoing
+queue, and the last message each has received from the other. A session spans any number of
+connections. A connection is one WebSocket.
+
+Each connection opens with a handshake. The node sends `hello`, the control plane answers
+`welcome`, and neither sends anything else first.
 
 ```json
-{ "jsonrpc": "2.0", "id": 7, "method": "fs.read", "params": { … } }
-{ "jsonrpc": "2.0", "id": 7, "result": { … } }
-{ "jsonrpc": "2.0", "id": 7, "error": { "code": -32003, "message": "…", "data": { "kind": "permission_denied" } } }
-{ "jsonrpc": "2.0", "method": "exec.output", "params": { … } }
+{ "t": "hello", "session": "0193a3b4-…", "cursor": "0193a3b5-…", "nodeId": "n_…", "installationId": "tz4a98xxat96iws9zmbrgj3a", "version": "0.1.0" }
+{ "t": "welcome", "session": "0193a3b4-…", "resumed": true, "cursor": "0193a3b6-…", "resumeWindowMs": 300000 }
 ```
 
-Binary payloads (file contents, process output, stdin) are standard base64 with padding, in
-fields named `data`.
+* `hello.session` is the session the node wants to resume, or `null` for a new one.
+  `hello.cursor` is the node's cursor in that session (the latest message it received), or `null`.
+* `welcome.resumed: true` means the control plane still has that session. Its `cursor` is
+  the latest message it received from the node. Each side then resends, in order, every queued
+  message after the other's cursor, and carries on.
+* `welcome.resumed: false` means a **new session** with the `session` ID the control plane chose
+  (a UUIDv7). The old session is lost (see Lost sessions). Both sides empty their queues and
+  start again from nothing. The node's first message in a new session is always `node.ready`.
+* `resumeWindowMs` is how long the control plane keeps a session after its connection drops.
+  The node uses the same window (below).
 
-### Hello
+### Messages
 
-The first frame on every connection is the node's `node.hello` notification:
+```json
+{ "t": "msg", "id": "0193a3b4-7c2e-7aa1-9f00-3c1d2e4f5a6b", "kind": "exec.start", "body": { … } }
+```
+
+* `id` is a UUIDv7 the sender generates. Within a session, each sender's IDs strictly increase,
+  in the order it sent them. A sender that generates several IDs in one millisecond uses the
+  RFC 9562 monotonic counter, so the order still holds.
+* `kind` names the message. The tables below list every kind and its `body`.
+* Messages from one sender are delivered and processed in ID order.
+
+The receiver keeps the highest ID it has processed in the session. A message with an ID at or
+below it is a duplicate from a resend: it is not processed again, only confirmed again by the next cursor. So each
+message takes effect exactly once per session, however often the link breaks.
+
+### Confirmations are a cursor
+
+Each side confirms what it has received with a **cursor**: the UUIDv7 of the latest message it
+has received and accepted from the other side. It never lists individual IDs. Because each
+sender's IDs strictly increase and messages are processed in order, one cursor confirms that
+message and every message before it.
+
+```json
+{ "t": "ack", "cursor": "0193a3b4-7c2e-7aa1-9f00-3c1d2e4f5a6b" }
+```
+
+When an `ack` arrives, its receiver drops every queued message with an ID at or below `cursor`.
+Accepted means handed to the handler, not finished (that is what a `reply` says). A side sends
+its cursor no later than 200 ms after receiving a message, or after 64 messages since its last
+`ack`, whichever comes first. An `ack` whose cursor has not moved is not sent, except to answer
+a duplicate (its sender evidently missed the last one). Acks are not
+messages: they have no ID, are never queued and never confirmed. A lost ack costs nothing,
+because the next one carries a later cursor, and the handshake carries the cursor too.
+
+### Commands and replies
+
+Both sides send messages. A **command** asks the other side to do something and gets exactly one
+`reply`. An **event** reports something and gets no reply. Today the control plane sends the
+commands (`exec.start`, `fs.read`, …) and the node sends the events (`exec.output`,
+`watch.event`, …), but the link does not care who sends what.
+
+```json
+{ "t": "msg", "id": "0193…a7", "kind": "reply", "body": { "to": "0193…12", "ok": { … } } }
+{ "t": "msg", "id": "0193…a8", "kind": "reply", "body": { "to": "0193…13", "error": { "kind": "permission_denied", "message": "…" } } }
+```
+
+`to` is the command's message ID. A reply is an ordinary message, queued, resent and
+confirmed like any other, so a command sent before a disconnect still gets its reply after the
+link resumes. The node handles commands concurrently, so replies can arrive in any order.
+
+### Lost sessions
+
+A session is **lost**, and cannot be recovered, when:
+
+* the control plane answers a `hello` with `resumed: false` (it restarted, or the window passed);
+* the node could not reconnect within `resumeWindowMs` of the connection dropping. It then sends
+  `hello` with `session: null`;
+* either side sends `bye` (below);
+* a side's queue of messages it must not drop passes 64 MiB. It sends `bye` with
+  `"reason": "queue_overflow"` if it can and treats the session as lost.
+
+```json
+{ "t": "bye", "reason": "revoked", "message": "node removed by admin" }
+```
+
+`bye` ends the session on purpose. `reason` is `shutdown` (the sender is stopping), `revoked`
+(the control plane removed the node, and `run` exits with code `3`), `queue_overflow` or
+`protocol_error` (the peer sent something invalid). After `bye` the sender closes the WebSocket.
+A node that receives any `bye` other than `revoked` reconnects with `session: null`.
+
+When a session is lost, commands that had not been confirmed were never processed, and their
+replies will never come. Messages the node had queued but the control plane never confirmed are
+discarded. Processes and watches keep running. The node's `node.ready`, first in the new
+session, lists all of them with their current state, so the control plane reconciles from that
+and from `exec.log`, never from memory of the old session.
+
+### `node.ready` (event)
 
 ```json
 {
-  "nodeId": "n_…",
-  "installationId": "tz4a98xxat96iws9zmbrgj3a",
-  "version": "0.1.0",
   "info": { …NodeInfo… },
-  "execs": [ { "execId": "build-1", "state": "running" } ],
+  "previousSession": "0193a3b4-…",
+  "execs": [ { "execId": "build-1", "state": "running", "logBytes": 1200 } ],
   "watches": [ "w-1" ]
 }
 ```
 
-`execs` and `watches` list what survived from earlier connections, so the control plane can
-reconcile after a reconnect.
+`previousSession` is the lost session, or `null` on a node's first session since it started.
 
-### Errors
+## Errors
 
-| `data.kind` | `code` | Meaning |
-|---|---|---|
-| `invalid_params` | -32602 | Params do not parse, or violate a rule in this document or policy.md. |
-| `method_not_found` | -32601 | Unknown method. |
-| `not_found` | -32004 | The path, exec or watch does not exist. |
-| `already_exists` | -32009 | An ID is in use, or `fs.write` with `create` found a file. |
-| `permission_denied` | -32003 | The policy, or the OS, refused the operation. |
-| `sandbox_unavailable` | -32010 | Sandboxed access was requested but this node cannot enforce it. `message` says why. |
-| `too_large` | -32013 | A size limit in this document was exceeded. |
-| `io` | -32000 | Any other OS error. `message` carries it. |
+A reply's `error.kind` is one of:
+
+| `kind` | Meaning |
+|---|---|
+| `invalid_params` | The body does not parse, or violates a rule in this document or policy.md. |
+| `unknown_kind` | The receiver does not know this message kind. |
+| `not_found` | The path, process or watch does not exist. |
+| `already_exists` | An ID is in use, or `fs.write` with `create` found a file. |
+| `permission_denied` | The policy, or the OS, refused the operation. |
+| `sandbox_unavailable` | Sandboxed access was requested but this node cannot enforce it. `message` says why. |
+| `too_large` | A size limit in this document was exceeded. |
+| `io` | Any other OS error. `message` carries it. |
+
+A message of unknown kind is confirmed like any other and replied to with `unknown_kind`. The
+receiver cannot tell an unknown command from an unknown event, so it replies to both, and a
+side ignores a reply whose `to` is not a command it is waiting on. Either side can therefore add
+events without breaking the other, at the cost of one small reply per unknown event.
+
+In the sections below, a command's **params** are its message `body`, and its **result** is the
+reply's `ok`. A `(event)` heading marks an event.
 
 ## Access
 
-Every exec, file and watch request carries `access`. It is one of two shapes:
+Every exec, file and watch command carries `access`. It is one of two shapes:
 
 ```json
 { "mode": "raw" }
@@ -125,7 +229,7 @@ Every exec, file and watch request carries `access`. It is one of two shapes:
 
 `raw` runs with the supervisor's full rights. `sandboxed` runs confined by the policy, enforced
 by the operating system. The full policy rules are in policy.md. A node that cannot enforce
-sandboxing answers sandboxed requests with `sandbox_unavailable`. It never falls back to raw.
+sandboxing replies to sandboxed commands with `sandbox_unavailable`. It never falls back to raw.
 
 ## Node
 
@@ -133,15 +237,19 @@ sandboxing answers sandboxed requests with `sandbox_unavailable`. It never falls
 
 Params `{}`. Result: a freshly collected NodeInfo (node-info.md).
 
-### `node.rotateCredential`
+### `node.update`
 
-Params `{ "nodeToken": "nt_…" }`. The node stores the token durably, then answers `{}`. Later
-connections use the new token. The current connection stays open.
+Params `{ "nodeToken": "nt_…", "endpoint": "wss://edge-5.control.example.com/nodes/connect" }`.
+Both fields are optional, and at least one is required. The node stores them durably in
+`credentials.json`, then replies `{}`. Later connections use them, and the current connection
+stays open. A stored update is never lost. If the reply is lost, the session's resend delivers
+it, or the control plane should accept both the old and new token until the node next
+connects with the new one.
 
 ## Processes
 
 A process is identified by an `execId` the control plane chooses. That makes `exec.start` safe
-to retry. A retried start with an ID already in use answers `already_exists` and starts nothing.
+to retry. A retried start with an ID already in use replies `already_exists` and starts nothing.
 IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
 
 ### `exec.start`
@@ -187,7 +295,7 @@ Result:
 It is empty for raw access.
 
 A process that cannot start (binary missing, `cwd` refused) still gets its ID. The start
-answers with the error, and no `exec.exit` follows.
+replies with the error, and no `exec.exit` follows.
 
 Each command runs in its own process group (Unix) or Job Object (Windows). Killing it kills
 the whole tree. A sandboxed process and everything it starts stay inside the sandbox.
@@ -202,16 +310,17 @@ closes stdin after the data. `data` may be empty. Writing to a process started w
 
 Params `{ "execId": "…", "signal": "terminate" }`, where `signal` is `terminate` (SIGTERM to the
 process group, or `TerminateJobObject` on Windows) or `kill` (SIGKILL to the group, or
-`TerminateJobObject`). Answers `{}` immediately. The exit arrives as `exec.exit`. Killing an
-exited process answers `{}` and does nothing.
+`TerminateJobObject`). Replies `{}` immediately. The exit arrives as `exec.exit`. Killing an
+exited process replies `{}` and does nothing.
 
 ### `exec.list`
 
-Params `{}`. Result `{ "execs": [ { "execId": "…", "state": "running" }, { "execId": "…", "state": "exited", "exit": { … } } ] }`.
+Params `{}`. Result `{ "execs": [ { "execId": "…", "state": "running", "logBytes": 1200 }, { "execId": "…", "state": "exited", "exit": { … }, "logBytes": 0 } ] }`,
+the same entries as `node.ready`'s `execs`.
 The node keeps the 256 most recent exited processes. Older ones are forgotten, and their IDs
 may be reused.
 
-### `exec.output` (notification)
+### `exec.output` (event)
 
 ```json
 { "execId": "build-1", "stream": "stdout", "data": "<base64>", "droppedBytes": 0 }
@@ -221,7 +330,7 @@ Chunks are at most 64 KiB. Chunks of one stream arrive in order. `droppedBytes` 
 this stream that was dropped since the previous delivered chunk because the event queue was
 full (see Event delivery).
 
-### `exec.exit` (notification)
+### `exec.exit` (event)
 
 ```json
 { "execId": "build-1", "exit": { "kind": "exited", "code": 0 }, "logBytes": 183022 }
@@ -238,7 +347,7 @@ A backgrounded process that later exits reports `exited` or `signaled` as usual.
 `exec.exit` is sent after the last `exec.output` of the process, and is never dropped.
 `logBytes` is the total output the process produced.
 
-### `exec.timedOut` (notification)
+### `exec.timedOut` (event)
 
 ```json
 { "execId": "build-1", "action": "background", "logBytes": 183022 }
@@ -272,7 +381,7 @@ answered `offset` says where. A read never crosses a dropped range: it stops at 
 and the caller continues from the next `retained` start. To follow a running process, read from
 the previous `offset` + data length until it reaches `totalBytes`.
 
-A forgotten process (beyond the 256 retained) answers `not_found`. A file log's file remains on
+A forgotten process (beyond the 256 retained) replies `not_found`. A file log's file remains on
 disk after that.
 
 ## Output logs
@@ -292,8 +401,8 @@ output is the least useful.
 * `{ "kind": "memory", "limitBytes": 1048576 }`. Held in the supervisor's memory. `limitBytes`
   defaults to 1 MiB and may be at most 16 MiB. All memory logs on a node share a 256 MiB budget.
   When it is exceeded, the logs of the oldest exited processes are discarded first (their
-  `exec.log` then answers with empty `retained`). An `exec.start` that would exceed the budget
-  with running processes alone answers `too_large`.
+  `exec.log` then replies with empty `retained`). An `exec.start` that would exceed the budget
+  with running processes alone replies `too_large`.
 * `{ "kind": "file", "path": "/abs/path.log", "limitBytes": 67108864 }`. Written to `path` as plain
   text, so it can also be read with `fs.read` or by people on the machine. `limitBytes` defaults
   to 64 MiB and may be at most 1 GiB. The parent directory must exist. The node never creates
@@ -306,10 +415,10 @@ output is the least useful.
 
 ## Files
 
-Every file request carries `path`, an absolute path, and `access`. Under a sandbox, reads need
+Every file command carries `path`, an absolute path, and `access`. Under a sandbox, reads need
 the path in the policy's read set, and writes need it in the write set (policy.md). The
 operation runs inside the same OS sandbox as a command with that policy. A sandboxed file
-request therefore can do exactly what a sandboxed command could do.
+command therefore can do exactly what a sandboxed command could do.
 
 Symlinks are followed, as `open` follows them. Under a sandbox, a symlink whose target lies
 outside the policy is refused by the OS.
@@ -329,7 +438,7 @@ only from `fs.list`.
 
 Params `{ "path", "access" }`. Result `{ "entries": [ { "name": "src", "kind": "directory", "size": 4096 } ] }`,
 sorted by name. Entries are not followed, so a symlink lists as `symlink`. At most 10 000 entries.
-A larger directory answers `too_large`.
+A larger directory replies `too_large`.
 
 ### `fs.read`
 
@@ -377,7 +486,7 @@ watches. Result `{}`.
 
 Params `{ "watchId" }`. Result `{}`. Stopping an unknown watch is `not_found`.
 
-### `watch.event` (notification)
+### `watch.event` (event)
 
 ```json
 { "watchId": "w-1", "changes": [ { "kind": "modified", "path": "/home/me/repo/src/main.rs" } ] }
@@ -399,22 +508,31 @@ then stops the watch.
 
 ## Event delivery
 
-Notifications go through one outbound queue of at most 16 MiB. While the connection is down,
-or the control plane reads slowly, the queue fills.
+Each side has one outgoing queue per session. A message stays in it from the moment it is sent
+until an `ack` covers it. While the connection is down, or the peer reads slowly, the queue
+grows. The node bounds it in two parts:
 
-* When full, new `exec.output` chunks are dropped. The next delivered chunk of that stream
-  carries the count in `droppedBytes`.
-* When full, new `watch.event` changes are dropped, and the watch's next event is
-  `overflow: true`.
-* `exec.timedOut` and `exec.exit` are never dropped. There is at most one of each per process.
+* **Droppable** messages, `exec.output` and `watch.event`, may use 16 MiB of the queue. When that
+  is full, a new one is not queued at all, so it never gets an ID. Output and changes are
+  never lost for good this way, because the process log keeps output (`exec.log`), and
+  `overflow` tells the control plane to rescan.
+  * A dropped `exec.output` chunk is counted. The next queued chunk of that stream carries the
+    count in `droppedBytes`.
+  * Dropped `watch.event` changes make the watch's next queued event `overflow: true`.
+* **Everything else** (replies, `exec.exit`, `exec.timedOut`, `node.ready`) is never dropped. If
+  these alone pass 64 MiB, the session is lost (`queue_overflow`). Replies are bounded by the
+  commands in flight and exits by the processes, so this means the peer stopped confirming.
 
-On reconnect, `node.hello` is sent first, then the queue drains in order.
+On resume, each side resends its queue after the peer's cursor, then carries on. In a new
+session, `node.ready` goes first.
 
 ## Limits
 
 | What | Limit |
 |---|---|
-| Request frame | 32 MiB |
+| WebSocket frame | 32 MiB |
+| Ack delay | 200 ms or 64 messages |
+| Session resume window | set by `welcome.resumeWindowMs` |
 | `fs.read` / `fs.write` data | 16 MiB per call |
 | `exec.write` data | 1 MiB per call |
 | `exec.output` chunk | 64 KiB |
@@ -423,4 +541,5 @@ On reconnect, `node.hello` is sent first, then the queue drains in order.
 | Memory log | 1 MiB default, 16 MiB max per process, 256 MiB per node |
 | File log | 64 MiB default, 1 GiB max per process |
 | Watches | 64 |
-| Outbound event queue | 16 MiB |
+| Outgoing queue, droppable messages | 16 MiB |
+| Outgoing queue, everything else | 64 MiB, then the session is lost |

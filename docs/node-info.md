@@ -2,7 +2,7 @@
 
 NodeInfo is the supervisor's description of its machine: what it is, what it has, and what it
 can enforce. It is basic inventory, not monitoring. It is collected when the node joins, sent in
-every `node.hello`, and collected again on each `node.info` request (api.md). Nothing is
+every `node.ready` event, and collected again on each `node.info` command (api.md). Nothing is
 sampled over time. Free disk space is the one value that changes between collections.
 
 A probe that fails leaves its field `null` (or a list empty) rather than failing the whole
@@ -122,12 +122,12 @@ How each platform finds them:
 
 ### `sandbox`
 
-What this node can enforce for `{ "mode": "sandboxed" }` requests (policy.md).
+What this node can enforce for `{ "mode": "sandboxed" }` commands (policy.md).
 
 | Field | Type | Meaning |
 |---|---|---|
 | `mechanism` | `"landlock"` \| `"seatbelt"` \| `"none"` | The backend. |
-| `available` | bool | Whether sandboxed requests can run. Decided by actually running a sandboxed `true` at startup, not by checking for features. |
+| `available` | bool | Whether sandboxed commands can run. Decided by actually running a sandboxed `true` at startup, not by checking for features. |
 | `reason` | string \| null | Why it is unavailable, in one sentence (for example "Landlock is not in the kernel's active LSM list"). |
 | `landlockAbi` | integer \| null | Linux only. The Landlock ABI version the kernel supports. It determines the gaps listed in policy.md. |
 | `baselineRead` | array of paths | Existing system paths that ordinary programs need to read on this machine. The supervisor never adds these to a policy itself. |

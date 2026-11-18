@@ -1,10 +1,10 @@
 # happy-supervisor sandbox policy
 
-A **policy** is the manifest a sandboxed request carries. It says which paths the operation may
+A **policy** is the manifest a sandboxed command carries. It says which paths the operation may
 read, which it may write, and whether it may bind local ports or Unix sockets. Everything not
 granted is denied, and the operating system enforces it, not the supervisor's own checks. The
-same policy means the same thing for a command (`exec.start`), a file request (`fs.*`) and a
-watch (`watch.start`). The wire format of requests is in [api.md](api.md).
+same policy means the same thing for a command (`exec.start`), a file command (`fs.*`) and a
+watch (`watch.start`). The wire format of commands is in [api.md](api.md).
 
 ```json
 {
@@ -29,7 +29,7 @@ All four fields are required. Each list holds at most 256 paths.
 ## Paths
 
 * A path must be absolute and normalized: no `.` or `..` components, no empty components, no NUL.
-  A trailing separator is ignored. A path that breaks these rules makes the request
+  A trailing separator is ignored. A path that breaks these rules makes the command
   `invalid_params`.
 * A directory grant covers the directory and everything below it. A file grant covers that
   file only.
@@ -83,8 +83,8 @@ outside its own sandbox where the platform can prevent it (table below).
 
 ## Enforcement by platform
 
-The node reports what it can enforce in NodeInfo's `sandbox` section. A request whose policy
-needs a restriction the node cannot enforce answers `sandbox_unavailable` and does not run. The
+The node reports what it can enforce in NodeInfo's `sandbox` section. A command whose policy
+needs a restriction the node cannot enforce replies `sandbox_unavailable` and does not run. The
 supervisor never weakens a policy silently.
 
 ### Linux: Landlock and seccomp
@@ -109,7 +109,7 @@ Gaps the node reports:
 * With `localBind: true, unixSockets: false`, abstract-namespace Unix sockets can still be
   bound. Filesystem sockets are denied.
 * On ABI 1 to 3 kernels, `localBind: false` is enforced only with `unixSockets: false` (the
-  seccomp path). Other combinations answer `sandbox_unavailable`.
+  seccomp path). Other combinations reply `sandbox_unavailable`.
 * On ABI 1 and 2, `truncate(2)` on a readable file is not restricted by Landlock. File
   permissions still apply.
 
@@ -127,7 +127,7 @@ and process inspection are limited to the same sandbox.
 
 ### Windows
 
-No sandbox. Sandboxed requests answer `sandbox_unavailable`. Raw requests work.
+No sandbox. Sandboxed commands reply `sandbox_unavailable`. Raw commands work.
 
 ## Raw access
 

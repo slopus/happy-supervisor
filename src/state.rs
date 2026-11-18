@@ -49,7 +49,8 @@ impl StateDir {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Credentials {
-    pub server: String,
+    /// The full WebSocket URL to connect to (api.md, Joining).
+    pub endpoint: String,
     pub node_id: String,
     pub node_token: String,
     pub name: String,
@@ -58,7 +59,7 @@ pub struct Credentials {
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Credentials")
-            .field("server", &self.server)
+            .field("endpoint", &self.endpoint)
             .field("node_id", &self.node_id)
             .field("node_token", &"<redacted>")
             .field("name", &self.name)

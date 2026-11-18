@@ -1,7 +1,7 @@
 //! Running commands (`exec.*`). Owned by the exec track; the scaffold froze the signatures.
 
 use crate::error::{Error, Result};
-use crate::events::Events;
+use crate::link::Outbox;
 use crate::policy::Confinement;
 use crate::protocol::{
     ExecId, ExecLogParams, ExecLogResult, ExecStartParams, ExecStartResult, ExecSummary,
@@ -11,12 +11,12 @@ use crate::protocol::{
 /// Every command of this node, running or recently exited. Commands outlive connections.
 pub struct ExecManager {
     #[expect(dead_code, reason = "the exec track sends output and exits through it")]
-    events: Events,
+    outbox: Outbox,
 }
 
 impl ExecManager {
-    pub fn new(events: Events) -> ExecManager {
-        ExecManager { events }
+    pub fn new(outbox: Outbox) -> ExecManager {
+        ExecManager { outbox }
     }
 
     /// Starts a command. Sandboxed ones go through `sandbox::prepare` and the helper.
@@ -46,7 +46,7 @@ impl ExecManager {
         Err(Error::not_implemented("exec.log"))
     }
 
-    /// Running commands and the most recent exited ones, for `exec.list` and `node.hello`.
+    /// Running commands and the most recent exited ones, for `exec.list` and `node.ready`.
     pub fn list(&self) -> Vec<ExecSummary> {
         Vec::new()
     }

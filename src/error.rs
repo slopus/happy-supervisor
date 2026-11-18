@@ -1,4 +1,5 @@
-//! The one error type. Its kinds are the error table in docs/api.md.
+//! The one error type. Its kinds are the error table in docs/api.md, and it is the `error` of a
+//! reply on the wire.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -7,7 +8,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     InvalidParams,
-    MethodNotFound,
+    UnknownKind,
     NotFound,
     AlreadyExists,
     PermissionDenied,
@@ -19,7 +20,7 @@ pub enum ErrorKind {
 impl ErrorKind {
     pub const ALL: [ErrorKind; 8] = [
         ErrorKind::InvalidParams,
-        ErrorKind::MethodNotFound,
+        ErrorKind::UnknownKind,
         ErrorKind::NotFound,
         ErrorKind::AlreadyExists,
         ErrorKind::PermissionDenied,
@@ -28,26 +29,17 @@ impl ErrorKind {
         ErrorKind::Io,
     ];
 
-    /// The JSON-RPC `code` and `data.kind` of this kind, as in api.md's error table.
-    const fn wire(self) -> (i64, &'static str) {
-        match self {
-            ErrorKind::InvalidParams => (-32602, "invalid_params"),
-            ErrorKind::MethodNotFound => (-32601, "method_not_found"),
-            ErrorKind::NotFound => (-32004, "not_found"),
-            ErrorKind::AlreadyExists => (-32009, "already_exists"),
-            ErrorKind::PermissionDenied => (-32003, "permission_denied"),
-            ErrorKind::SandboxUnavailable => (-32010, "sandbox_unavailable"),
-            ErrorKind::TooLarge => (-32013, "too_large"),
-            ErrorKind::Io => (-32000, "io"),
-        }
-    }
-
-    pub const fn code(self) -> i64 {
-        self.wire().0
-    }
-
     pub const fn as_str(self) -> &'static str {
-        self.wire().1
+        match self {
+            ErrorKind::InvalidParams => "invalid_params",
+            ErrorKind::UnknownKind => "unknown_kind",
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::AlreadyExists => "already_exists",
+            ErrorKind::PermissionDenied => "permission_denied",
+            ErrorKind::SandboxUnavailable => "sandbox_unavailable",
+            ErrorKind::TooLarge => "too_large",
+            ErrorKind::Io => "io",
+        }
     }
 
     pub fn from_name(kind: &str) -> Option<ErrorKind> {
@@ -129,22 +121,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kinds_have_the_codes_of_the_api_table() {
-        let table: Vec<(i64, &str)> = ErrorKind::ALL
-            .iter()
-            .map(|k| (k.code(), k.as_str()))
-            .collect();
+    fn kinds_are_the_api_table() {
+        let names: Vec<&str> = ErrorKind::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(
-            table,
+            names,
             [
-                (-32602, "invalid_params"),
-                (-32601, "method_not_found"),
-                (-32004, "not_found"),
-                (-32009, "already_exists"),
-                (-32003, "permission_denied"),
-                (-32010, "sandbox_unavailable"),
-                (-32013, "too_large"),
-                (-32000, "io"),
+                "invalid_params",
+                "unknown_kind",
+                "not_found",
+                "already_exists",
+                "permission_denied",
+                "sandbox_unavailable",
+                "too_large",
+                "io",
             ]
         );
     }

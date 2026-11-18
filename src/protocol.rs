@@ -1,4 +1,5 @@
-//! Everything on the wire: docs/api.md and docs/node-info.md as serde types.
+//! Everything on the wire: docs/api.md and docs/node-info.md as serde types: link frames, the
+//! body of every message kind, the join exchange, and NodeInfo.
 //!
 //! Incoming values are parsed into these types at the dispatcher, so code past it can trust them:
 //! IDs, argv and absolute paths are validated by their `TryFrom` impls, and policies by
@@ -10,8 +11,9 @@ use std::path::Path;
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use uuid::Uuid;
 
-use crate::error::{Error, ErrorKind};
+use crate::error::Error;
 pub use crate::policy::Policy;
 
 pub const MAX_FRAME_BYTES: usize = 32 << 20;
@@ -28,121 +30,139 @@ pub const MAX_FILE_LOG_BYTES: u64 = 1 << 30;
 pub const MAX_WATCHES: usize = 64;
 pub const MAX_LIST_ENTRIES: usize = 10_000;
 pub const MAX_CHANGES_PER_EVENT: usize = 256;
-pub const EVENT_QUEUE_BYTES: usize = 16 << 20;
+pub const ACK_DELAY_MS: u64 = 200;
+pub const ACK_EVERY_MSGS: u32 = 64;
+pub const DROPPABLE_QUEUE_BYTES: usize = 16 << 20;
+pub const RETAINED_QUEUE_BYTES: usize = 64 << 20;
 
 // ---------------------------------------------------------------------------------------------
-// JSON-RPC envelope
+// Link frames (api.md, Link protocol)
 
-/// The `"jsonrpc": "2.0"` member. Deserializes only from `"2.0"`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct JsonRpcVersion;
+/// A message ID: a UUIDv7, strictly increasing per sender within a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MsgId(pub Uuid);
 
-impl Serialize for JsonRpcVersion {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str("2.0")
+/// A session ID: a UUIDv7 chosen by the control plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(pub Uuid);
+
+impl std::fmt::Display for MsgId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
-impl<'de> Deserialize<'de> for JsonRpcVersion {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        match String::deserialize(d)?.as_str() {
-            "2.0" => Ok(JsonRpcVersion),
-            other => Err(serde::de::Error::custom(format!(
-                "unsupported jsonrpc version `{other}`"
-            ))),
-        }
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
-/// A request from the control plane. `params` stays raw until the dispatcher knows the method.
+/// One WebSocket text frame.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Request {
-    pub jsonrpc: JsonRpcVersion,
-    pub id: Value,
-    pub method: String,
+#[serde(tag = "t", rename_all = "lowercase")]
+pub enum Frame {
+    Hello(Hello),
+    Welcome(Welcome),
+    Msg(Msg),
+    Ack(Ack),
+    Bye(Bye),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hello {
+    /// The session to resume, or `None` for a new one.
+    pub session: Option<SessionId>,
+    pub cursor: Option<MsgId>,
+    pub node_id: String,
+    pub installation_id: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Welcome {
+    pub session: SessionId,
+    pub resumed: bool,
+    /// The control plane's cursor. Always `None` when `resumed` is false.
+    pub cursor: Option<MsgId>,
+    pub resume_window_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Msg {
+    pub id: MsgId,
+    pub kind: String,
     #[serde(default)]
-    pub params: Value,
+    pub body: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    pub cursor: MsgId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bye {
+    pub reason: ByeReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ByeReason {
+    Shutdown,
+    Revoked,
+    QueueOverflow,
+    ProtocolError,
+}
+
+/// The message kind of a reply.
+pub const REPLY_KIND: &str = "reply";
+
+/// A reply's body: `{"to": …, "ok": …}` or `{"to": …, "error": {"kind", "message"}}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Response {
-    pub jsonrpc: JsonRpcVersion,
-    pub id: Value,
+pub struct Reply {
+    pub to: MsgId,
     #[serde(flatten)]
     pub outcome: Outcome,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Outcome {
-    #[serde(rename = "result")]
-    Result(Value),
-    #[serde(rename = "error")]
-    Error(RpcError),
+    Ok(Value),
+    Error(Error),
 }
 
-impl Response {
-    pub fn new(id: Value, result: crate::Result<Value>) -> Response {
-        Response {
-            jsonrpc: JsonRpcVersion,
-            id,
-            outcome: match result {
-                Ok(value) => Outcome::Result(value),
-                Err(err) => Outcome::Error(err.into()),
-            },
+impl From<crate::Result<Value>> for Outcome {
+    fn from(result: crate::Result<Value>) -> Outcome {
+        match result {
+            Ok(value) => Outcome::Ok(value),
+            Err(err) => Outcome::Error(err),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RpcError {
-    pub code: i64,
-    pub message: String,
-    pub data: RpcErrorData,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RpcErrorData {
-    pub kind: ErrorKind,
-}
-
-impl From<Error> for RpcError {
-    fn from(err: Error) -> RpcError {
-        RpcError {
-            code: err.kind.code(),
-            message: err.message,
-            data: RpcErrorData { kind: err.kind },
+impl From<Outcome> for crate::Result<Value> {
+    fn from(outcome: Outcome) -> crate::Result<Value> {
+        match outcome {
+            Outcome::Ok(value) => Ok(value),
+            Outcome::Error(err) => Err(err),
         }
     }
 }
 
-impl From<RpcError> for Error {
-    fn from(err: RpcError) -> Error {
-        Error::new(err.data.kind, err.message)
-    }
-}
-
-/// An outgoing notification frame: `{"jsonrpc": "2.0", "method": …, "params": …}`.
+/// The events the node sends, as `{"kind": …, "body": …}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct NotificationFrame {
-    pub jsonrpc: JsonRpcVersion,
-    #[serde(flatten)]
-    pub notification: Notification,
-}
-
-impl From<Notification> for NotificationFrame {
-    fn from(notification: Notification) -> NotificationFrame {
-        NotificationFrame {
-            jsonrpc: JsonRpcVersion,
-            notification,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "method", content = "params")]
-pub enum Notification {
-    #[serde(rename = "node.hello")]
-    Hello(Box<Hello>),
+#[serde(tag = "kind", content = "body")]
+pub enum Event {
+    #[serde(rename = "node.ready")]
+    NodeReady(Box<NodeReady>),
     #[serde(rename = "exec.output")]
     ExecOutput(ExecOutput),
     #[serde(rename = "exec.exit")]
@@ -153,11 +173,31 @@ pub enum Notification {
     WatchEvent(WatchEvent),
 }
 
-/// The request methods the node serves.
+impl Event {
+    pub const KINDS: [&str; 5] = [
+        "node.ready",
+        "exec.output",
+        "exec.exit",
+        "exec.timedOut",
+        "watch.event",
+    ];
+
+    /// Parses a received message as an event. `None` for a kind that is not an event.
+    pub fn parse(kind: &str, body: Value) -> Option<Result<Event, serde_json::Error>> {
+        if !Event::KINDS.contains(&kind) {
+            return None;
+        }
+        Some(serde_json::from_value(
+            serde_json::json!({ "kind": kind, "body": body }),
+        ))
+    }
+}
+
+/// The commands the node serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Method {
+pub enum CommandKind {
     NodeInfo,
-    NodeRotateCredential,
+    NodeUpdate,
     ExecStart,
     ExecWrite,
     ExecKill,
@@ -173,53 +213,80 @@ pub enum Method {
     WatchStop,
 }
 
-impl Method {
-    pub const ALL: [Method; 15] = [
-        Method::NodeInfo,
-        Method::NodeRotateCredential,
-        Method::ExecStart,
-        Method::ExecWrite,
-        Method::ExecKill,
-        Method::ExecList,
-        Method::ExecLog,
-        Method::FsStat,
-        Method::FsList,
-        Method::FsRead,
-        Method::FsWrite,
-        Method::FsMkdir,
-        Method::FsRemove,
-        Method::WatchStart,
-        Method::WatchStop,
+impl CommandKind {
+    pub const ALL: [CommandKind; 15] = [
+        CommandKind::NodeInfo,
+        CommandKind::NodeUpdate,
+        CommandKind::ExecStart,
+        CommandKind::ExecWrite,
+        CommandKind::ExecKill,
+        CommandKind::ExecList,
+        CommandKind::ExecLog,
+        CommandKind::FsStat,
+        CommandKind::FsList,
+        CommandKind::FsRead,
+        CommandKind::FsWrite,
+        CommandKind::FsMkdir,
+        CommandKind::FsRemove,
+        CommandKind::WatchStart,
+        CommandKind::WatchStop,
     ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Method::NodeInfo => "node.info",
-            Method::NodeRotateCredential => "node.rotateCredential",
-            Method::ExecStart => "exec.start",
-            Method::ExecWrite => "exec.write",
-            Method::ExecKill => "exec.kill",
-            Method::ExecList => "exec.list",
-            Method::ExecLog => "exec.log",
-            Method::FsStat => "fs.stat",
-            Method::FsList => "fs.list",
-            Method::FsRead => "fs.read",
-            Method::FsWrite => "fs.write",
-            Method::FsMkdir => "fs.mkdir",
-            Method::FsRemove => "fs.remove",
-            Method::WatchStart => "watch.start",
-            Method::WatchStop => "watch.stop",
+            CommandKind::NodeInfo => "node.info",
+            CommandKind::NodeUpdate => "node.update",
+            CommandKind::ExecStart => "exec.start",
+            CommandKind::ExecWrite => "exec.write",
+            CommandKind::ExecKill => "exec.kill",
+            CommandKind::ExecList => "exec.list",
+            CommandKind::ExecLog => "exec.log",
+            CommandKind::FsStat => "fs.stat",
+            CommandKind::FsList => "fs.list",
+            CommandKind::FsRead => "fs.read",
+            CommandKind::FsWrite => "fs.write",
+            CommandKind::FsMkdir => "fs.mkdir",
+            CommandKind::FsRemove => "fs.remove",
+            CommandKind::WatchStart => "watch.start",
+            CommandKind::WatchStop => "watch.stop",
         }
     }
 
-    pub fn from_name(name: &str) -> Option<Method> {
-        Method::ALL.into_iter().find(|m| m.as_str() == name)
+    pub fn from_name(name: &str) -> Option<CommandKind> {
+        CommandKind::ALL.into_iter().find(|k| k.as_str() == name)
     }
 }
 
 /// `{}` as params or result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Empty {}
+
+// ---------------------------------------------------------------------------------------------
+// Joining (api.md, Joining and credentials)
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinRequest {
+    pub join_token: String,
+    pub installation_id: String,
+    pub name: String,
+    pub info: NodeInfo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinResponse {
+    pub node_id: String,
+    pub node_token: String,
+    /// The full WebSocket URL to connect to from now on.
+    pub endpoint: String,
+}
+
+/// The body of a failed join, when the control plane sends one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinError {
+    pub error: String,
+}
 
 // ---------------------------------------------------------------------------------------------
 // Validated primitives
@@ -412,21 +479,49 @@ pub struct WithAccess<T> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Node methods
+// Node
 
+/// `node.update`: a new token, a new endpoint, or both. Parsing rejects an update with neither.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RotateCredentialParams {
-    pub node_token: String,
+#[serde(rename_all = "camelCase", try_from = "NodeUpdateWire")]
+pub struct NodeUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeUpdateWire {
+    #[serde(default)]
+    node_token: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+impl TryFrom<NodeUpdateWire> for NodeUpdate {
+    type Error = Error;
+
+    fn try_from(wire: NodeUpdateWire) -> Result<NodeUpdate, Error> {
+        if wire.node_token.is_none() && wire.endpoint.is_none() {
+            return Err(Error::invalid_params(
+                "node.update needs nodeToken, endpoint or both",
+            ));
+        }
+        Ok(NodeUpdate {
+            node_token: wire.node_token,
+            endpoint: wire.endpoint,
+        })
+    }
+}
+
+/// `node.ready`, the node's first message in every new session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Hello {
-    pub node_id: String,
-    pub installation_id: String,
-    pub version: String,
+pub struct NodeReady {
     pub info: NodeInfo,
+    pub previous_session: Option<SessionId>,
     pub execs: Vec<ExecSummary>,
     pub watches: Vec<WatchId>,
 }
@@ -610,6 +705,7 @@ pub struct ExecSummary {
     pub exec_id: ExecId,
     #[serde(flatten)]
     pub state: ExecState,
+    pub log_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1094,104 +1190,179 @@ mod tests {
     }
 
     #[test]
-    fn api_md_methods_are_all_modeled() {
+    fn api_md_kinds_are_all_modeled() {
         let doc = include_str!("../docs/api.md");
-        let notifications = [
-            "node.hello",
-            "exec.output",
-            "exec.exit",
-            "exec.timedOut",
-            "watch.event",
-        ];
-        let mut methods = Vec::new();
+        let mut commands = Vec::new();
         for line in doc.lines() {
             let Some(name) = line.strip_prefix("### `").and_then(|l| l.split('`').next()) else {
                 continue;
             };
-            if line.ends_with("(notification)") {
-                assert!(
-                    notifications.contains(&name),
-                    "notification {name} is not modeled"
-                );
+            if line.ends_with("(event)") {
+                assert!(Event::KINDS.contains(&name), "event {name} is not modeled");
             } else {
-                methods.push(
-                    Method::from_name(name).unwrap_or_else(|| panic!("{name} is not a Method")),
+                commands.push(
+                    CommandKind::from_name(name)
+                        .unwrap_or_else(|| panic!("{name} is not a CommandKind")),
                 );
             }
         }
-        assert_eq!(methods, Method::ALL);
+        assert_eq!(commands, CommandKind::ALL);
+    }
+
+    const ID_A: &str = "0193a3b4-7c2e-7aa1-9f00-3c1d2e4f5a6b";
+    const ID_B: &str = "0193a3b5-0000-7000-8000-000000000001";
+
+    fn id(text: &str) -> Uuid {
+        Uuid::parse_str(text).unwrap()
     }
 
     #[test]
-    fn envelope() {
-        let request: Request = round_trip(
-            json!({ "jsonrpc": "2.0", "id": 7, "method": "fs.read", "params": { "path": "/x" } }),
-        );
-        assert_eq!((request.id, request.method.as_str()), (json!(7), "fs.read"));
-        let no_params: Request =
-            serde_json::from_value(json!({ "jsonrpc": "2.0", "id": "a", "method": "exec.list" }))
-                .unwrap();
-        assert_eq!(no_params.params, Value::Null);
-        assert!(
-            rejects::<Request>(json!({ "jsonrpc": "1.0", "id": 1, "method": "x" }))
-                .contains("unsupported jsonrpc version `1.0`")
-        );
-
-        let ok = Response::new(json!(7), Ok(json!({ "size": 1 })));
-        assert_eq!(
-            serde_json::to_value(&ok).unwrap(),
-            json!({ "jsonrpc": "2.0", "id": 7, "result": { "size": 1 } })
-        );
-        let err = Response::new(json!(7), Err(Error::new(ErrorKind::PermissionDenied, "…")));
-        let err_json = json!({ "jsonrpc": "2.0", "id": 7, "error": { "code": -32003, "message": "…", "data": { "kind": "permission_denied" } } });
-        assert_eq!(serde_json::to_value(&err).unwrap(), err_json);
-        assert_eq!(round_trip::<Response>(err_json), err);
-
-        let frame: NotificationFrame = round_trip(
-            json!({ "jsonrpc": "2.0", "method": "exec.output", "params": { "execId": "build-1", "stream": "stdout", "data": "aGk=", "droppedBytes": 0 } }),
+    fn link_frames() {
+        let hello: Frame = round_trip(
+            json!({ "t": "hello", "session": ID_A, "cursor": ID_B, "nodeId": "n_1", "installationId": "tz4a98xxat96iws9zmbrgj3a", "version": "0.1.0" }),
         );
         assert_eq!(
-            frame.notification,
-            Notification::ExecOutput(ExecOutput {
-                exec_id: ExecId::try_from("build-1").unwrap(),
-                stream: Stream::Stdout,
-                data: Base64Bytes(b"hi".to_vec()),
-                dropped_bytes: 0,
+            hello,
+            Frame::Hello(Hello {
+                session: Some(SessionId(id(ID_A))),
+                cursor: Some(MsgId(id(ID_B))),
+                node_id: "n_1".to_string(),
+                installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
+                version: "0.1.0".to_string(),
             })
         );
+        round_trip::<Frame>(
+            json!({ "t": "hello", "session": null, "cursor": null, "nodeId": "n_1", "installationId": "x", "version": "0.1.0" }),
+        );
+        let welcome: Frame = round_trip(
+            json!({ "t": "welcome", "session": ID_A, "resumed": true, "cursor": ID_B, "resumeWindowMs": 300000 }),
+        );
+        assert_eq!(
+            welcome,
+            Frame::Welcome(Welcome {
+                session: SessionId(id(ID_A)),
+                resumed: true,
+                cursor: Some(MsgId(id(ID_B))),
+                resume_window_ms: 300000,
+            })
+        );
+        let msg: Frame = round_trip(
+            json!({ "t": "msg", "id": ID_A, "kind": "exec.start", "body": { "execId": "build-1" } }),
+        );
+        assert_eq!(
+            msg,
+            Frame::Msg(Msg {
+                id: MsgId(id(ID_A)),
+                kind: "exec.start".to_string(),
+                body: json!({ "execId": "build-1" }),
+            })
+        );
+        let ack: Frame = round_trip(json!({ "t": "ack", "cursor": ID_A }));
+        assert_eq!(
+            ack,
+            Frame::Ack(Ack {
+                cursor: MsgId(id(ID_A))
+            })
+        );
+        let bye: Frame = round_trip(
+            json!({ "t": "bye", "reason": "revoked", "message": "node removed by admin" }),
+        );
+        assert_eq!(
+            bye,
+            Frame::Bye(Bye {
+                reason: ByeReason::Revoked,
+                message: Some("node removed by admin".to_string()),
+            })
+        );
+        for reason in ["shutdown", "queue_overflow", "protocol_error"] {
+            round_trip::<Frame>(json!({ "t": "bye", "reason": reason }));
+        }
+        assert!(rejects::<Frame>(json!({ "t": "ping" })).contains("unknown variant `ping`"));
+        assert!(rejects::<Frame>(json!({ "t": "ack", "cursor": "nope" })).contains("UUID"));
     }
 
     #[test]
-    fn hello_and_node_info() {
+    fn replies() {
+        let ok: Reply = round_trip(json!({ "to": ID_A, "ok": { "size": 1 } }));
+        assert_eq!(
+            ok,
+            Reply {
+                to: MsgId(id(ID_A)),
+                outcome: Outcome::Ok(json!({ "size": 1 })),
+            }
+        );
+        let err: Reply = round_trip(
+            json!({ "to": ID_B, "error": { "kind": "permission_denied", "message": "…" } }),
+        );
+        assert_eq!(
+            crate::Result::<Value>::from(err.outcome),
+            Err(Error::new(crate::ErrorKind::PermissionDenied, "…"))
+        );
+    }
+
+    #[test]
+    fn join_exchange() {
+        let request: JoinRequest = round_trip(
+            json!({ "joinToken": "jt_1", "installationId": "tz4a98xxat96iws9zmbrgj3a", "name": "build-box-3", "info": node_info_json() }),
+        );
+        assert_eq!(request.name, "build-box-3");
+        let response: JoinResponse = round_trip(
+            json!({ "nodeId": "n_1", "nodeToken": "nt_1", "endpoint": "wss://edge-2.control.example.com/nodes/connect" }),
+        );
+        assert_eq!(
+            response.endpoint,
+            "wss://edge-2.control.example.com/nodes/connect"
+        );
+        let error: JoinError = round_trip(json!({ "error": "token spent" }));
+        assert_eq!(error.error, "token spent");
+    }
+
+    #[test]
+    fn node_ready_and_node_info() {
         let info: NodeInfo = round_trip(node_info_json());
         assert_eq!(info.sandbox.mechanism, Mechanism::Landlock { abi: Some(6) });
         assert_eq!(info.sandbox.require_available(), Ok(()));
         assert_eq!(info.os.arch, Arch::X86_64);
         assert_eq!(info.gpus[0].vendor, GpuVendor::Nvidia);
 
-        let hello = json!({ "jsonrpc": "2.0", "method": "node.hello", "params": {
-            "nodeId": "n_1",
-            "installationId": "tz4a98xxat96iws9zmbrgj3a",
-            "version": "0.1.0",
+        let ready = json!({ "kind": "node.ready", "body": {
             "info": node_info_json(),
-            "execs": [ { "execId": "build-1", "state": "running" } ],
+            "previousSession": ID_A,
+            "execs": [ { "execId": "build-1", "state": "running", "logBytes": 1200 } ],
             "watches": [ "w-1" ]
         }});
-        let NotificationFrame {
-            notification: Notification::Hello(hello),
-            ..
-        } = round_trip(hello)
-        else {
-            panic!("not a hello");
+        let Event::NodeReady(ready) = round_trip(ready) else {
+            panic!("not node.ready");
         };
+        assert_eq!(ready.previous_session, Some(SessionId(id(ID_A))));
         assert_eq!(
-            hello.execs,
+            ready.execs,
             [ExecSummary {
                 exec_id: ExecId::try_from("build-1").unwrap(),
-                state: ExecState::Running
+                state: ExecState::Running,
+                log_bytes: 1200,
             }]
         );
-        assert_eq!(hello.watches, [WatchId::try_from("w-1").unwrap()]);
+        assert_eq!(ready.watches, [WatchId::try_from("w-1").unwrap()]);
+    }
+
+    #[test]
+    fn events_parse_by_kind() {
+        let event = Event::parse(
+            "exec.output",
+            json!({ "execId": "build-1", "stream": "stdout", "data": "aGk=", "droppedBytes": 0 }),
+        );
+        assert_eq!(
+            event.unwrap().unwrap(),
+            Event::ExecOutput(ExecOutput {
+                exec_id: ExecId::try_from("build-1").unwrap(),
+                stream: Stream::Stdout,
+                data: Base64Bytes(b"hi".to_vec()),
+                dropped_bytes: 0,
+            })
+        );
+        assert!(Event::parse("exec.start", json!({})).is_none());
+        assert!(Event::parse("exec.exit", json!({})).unwrap().is_err());
     }
 
     #[test]
@@ -1363,10 +1534,10 @@ mod tests {
         assert_eq!(kill.signal, KillSignal::Terminate);
 
         let list: ExecListResult = round_trip(json!({ "execs": [
-            { "execId": "a", "state": "running" },
-            { "execId": "b", "state": "exited", "exit": { "kind": "exited", "code": 0 } },
-            { "execId": "c", "state": "exited", "exit": { "kind": "signaled", "signal": 9 } },
-            { "execId": "d", "state": "exited", "exit": { "kind": "timedOut" } }
+            { "execId": "a", "state": "running", "logBytes": 1200 },
+            { "execId": "b", "state": "exited", "exit": { "kind": "exited", "code": 0 }, "logBytes": 0 },
+            { "execId": "c", "state": "exited", "exit": { "kind": "signaled", "signal": 9 }, "logBytes": 1 },
+            { "execId": "d", "state": "exited", "exit": { "kind": "timedOut" }, "logBytes": 2 }
         ]}));
         let exits: Vec<ExecState> = list.execs.into_iter().map(|s| s.state).collect();
         assert_eq!(
@@ -1385,23 +1556,23 @@ mod tests {
             ]
         );
 
-        let exit: NotificationFrame = round_trip(
-            json!({ "jsonrpc": "2.0", "method": "exec.exit", "params": { "execId": "build-1", "exit": { "kind": "exited", "code": 0 }, "logBytes": 183022 } }),
+        let exit: Event = round_trip(
+            json!({ "kind": "exec.exit", "body": { "execId": "build-1", "exit": { "kind": "exited", "code": 0 }, "logBytes": 183022 } }),
         );
         assert_eq!(
-            exit.notification,
-            Notification::ExecExit(ExecExit {
+            exit,
+            Event::ExecExit(ExecExit {
                 exec_id: ExecId::try_from("build-1").unwrap(),
                 exit: ExitStatus::Exited { code: 0 },
                 log_bytes: 183022
             })
         );
-        let timed_out: NotificationFrame = round_trip(
-            json!({ "jsonrpc": "2.0", "method": "exec.timedOut", "params": { "execId": "build-1", "action": "background", "logBytes": 183022 } }),
+        let timed_out: Event = round_trip(
+            json!({ "kind": "exec.timedOut", "body": { "execId": "build-1", "action": "background", "logBytes": 183022 } }),
         );
         assert_eq!(
-            timed_out.notification,
-            Notification::ExecTimedOut(ExecTimedOut {
+            timed_out,
+            Event::ExecTimedOut(ExecTimedOut {
                 exec_id: ExecId::try_from("build-1").unwrap(),
                 action: TimeoutAction::Background,
                 log_bytes: 183022
@@ -1500,8 +1671,19 @@ mod tests {
 
     #[test]
     fn node_methods() {
-        let rotate: RotateCredentialParams = round_trip(json!({ "nodeToken": "nt_2" }));
-        assert_eq!(rotate.node_token, "nt_2");
+        let both: NodeUpdate = round_trip(
+            json!({ "nodeToken": "nt_2", "endpoint": "wss://edge-5.control.example.com/nodes/connect" }),
+        );
+        assert_eq!(both.node_token.as_deref(), Some("nt_2"));
+        let token: NodeUpdate = round_trip(json!({ "nodeToken": "nt_3" }));
+        assert_eq!(
+            (token.node_token.as_deref(), token.endpoint),
+            (Some("nt_3"), None)
+        );
+        assert!(
+            rejects::<NodeUpdate>(json!({}))
+                .contains("node.update needs nodeToken, endpoint or both")
+        );
         assert_eq!(round_trip::<Empty>(json!({})), Empty {});
     }
 }

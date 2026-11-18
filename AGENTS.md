@@ -8,14 +8,18 @@ in the same commit. If code and doc disagree, one of them is a bug. Decide which
 that commit.
 
 `src/protocol.rs` models every wire shape. Its tests round-trip each api.md and node-info.md
-example as literal JSON, and `api_md_methods_are_all_modeled` fails when api.md gains a method
-heading that `Method` lacks.
+example as literal JSON, and `api_md_kinds_are_all_modeled` fails when api.md gains a command
+heading that `CommandKind` lacks, or an `(event)` heading that `Event` lacks.
+
+`src/link.rs` holds every link-protocol rule (queue, acks, dedup, resume, lost sessions) as a
+sans-IO state machine. Transport code only moves frames and calls it. Do not reimplement a
+protocol rule in `client` or `testing`.
 
 ## Module ownership
 
 | Module | Owner |
 |---|---|
-| `protocol`, `error`, `policy`, `helper`, `events`, `dispatch`, `lib.rs`, `sandbox/mod.rs`, `sandbox/windows.rs`, `Cargo.toml`, `Cargo.lock`, CI | scaffold |
+| `protocol`, `error`, `policy`, `helper`, `link`, `dispatch`, `lib.rs`, `sandbox/mod.rs`, `sandbox/windows.rs`, `Cargo.toml`, `Cargo.lock`, CI | scaffold |
 | `state`, `enroll`, `client`, `testing`, `main.rs` | transport track |
 | `exec`, `process/*` | exec track |
 | `sandbox/linux.rs` | Linux sandbox track |

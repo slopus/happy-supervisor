@@ -3,9 +3,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use happy_supervisor::client::{self, RunExit};
-use happy_supervisor::dispatch::Node;
 use happy_supervisor::state::StateDir;
-use happy_supervisor::{enroll, helper};
+use happy_supervisor::{Error, ErrorKind, enroll, helper, node_info, sandbox};
 
 /// The argument that makes this binary the sandbox helper.
 const HELPER_ARG: &str = "__sandbox";
@@ -24,9 +23,9 @@ struct Cli {
 enum Command {
     /// Exchange a join token for node credentials.
     Join {
-        /// The control plane, `https://host[:port]`.
+        /// The full join endpoint the control plane handed out with the token.
         #[arg(long)]
-        server: String,
+        url: String,
         /// The single-use join token.
         #[arg(long)]
         token: String,
@@ -79,14 +78,17 @@ fn main() -> ExitCode {
 async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
     match command {
         Command::Join {
-            server,
+            url,
             token,
             name,
             state_dir,
         } => {
             let state = StateDir::open(state_dir)?;
-            let credentials = enroll::join(&server, &token, name, &state).await?;
-            println!("joined {} as {}", credentials.server, credentials.node_id);
+            let credentials = enroll::join(&url, &token, name, &state).await?;
+            println!(
+                "joined as {}, endpoint {}",
+                credentials.node_id, credentials.endpoint
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Run { state_dir } => match client::run(StateDir::open(state_dir)?).await? {
@@ -98,12 +100,18 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         },
         Command::Info { state_dir } => {
             let state = StateDir::open(state_dir)?;
-            let (node, _events) = tokio::task::spawn_blocking(move || Node::open(state))
-                .await
-                .map_err(|err| {
-                    happy_supervisor::Error::new(happy_supervisor::ErrorKind::Io, err.to_string())
-                })??;
-            let info = node.info().await?;
+            let info = tokio::task::spawn_blocking(move || {
+                let installation_id = state.installation_id()?;
+                let name = state.credentials()?.map(|c| c.name);
+                let sandbox = sandbox::probe();
+                Ok::<_, Error>(node_info::collect(
+                    &installation_id,
+                    name.as_deref(),
+                    &sandbox,
+                ))
+            })
+            .await
+            .map_err(|err| Error::new(ErrorKind::Io, err.to_string()))??;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&info).expect("NodeInfo serializes")

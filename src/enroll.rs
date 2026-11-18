@@ -4,14 +4,14 @@
 use crate::error::{Error, Result};
 use crate::state::{Credentials, StateDir};
 
-/// Exchanges a join token for node credentials and stores them. `name` defaults to the
-/// hostname.
+/// Exchanges a join token at the full join endpoint `url` for node credentials, and stores
+/// them. `name` defaults to the hostname.
 pub async fn join(
-    server: &str,
+    url: &str,
     token: &str,
     name: Option<String>,
     state: &StateDir,
 ) -> Result<Credentials> {
-    let _ = (server, token, name, state);
+    let _ = (url, token, name, state);
     Err(Error::not_implemented("join"))
 }

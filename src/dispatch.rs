@@ -1,25 +1,25 @@
-//! The request boundary: parses each method's params, resolves `access` once, and calls the
-//! module that owns the method.
+//! The command boundary: parses each command's body, resolves `access` once, and calls the
+//! module that owns the command.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::error::{Error, ErrorKind, Result};
-use crate::events::{self, EventReceiver};
 use crate::exec::ExecManager;
 use crate::fs::{self, FsRequest};
+use crate::link::Outbox;
 use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
-    Access, EVENT_QUEUE_BYTES, Empty, ExecKillParams, ExecListResult, ExecLogParams,
-    ExecStartParams, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams, FsRemoveParams,
-    FsWriteParams, Hello, Method, NodeInfo, RotateCredentialParams, SandboxInfo, WatchStartParams,
-    WatchStopParams, WithAccess,
+    Access, CommandKind, Empty, ExecKillParams, ExecListResult, ExecLogParams, ExecStartParams,
+    ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams, FsRemoveParams,
+    FsWriteParams, NodeInfo, NodeUpdate, SandboxInfo, WatchId, WatchStartParams, WatchStopParams,
+    WithAccess,
 };
 use crate::state::StateDir;
 use crate::watch::WatchManager;
 
-/// Everything one supervisor serves. Lives across connections.
+/// Everything one supervisor serves. Lives across connections and sessions.
 pub struct Node {
     state: StateDir,
     installation_id: String,
@@ -33,11 +33,11 @@ pub struct Node {
 impl Node {
     /// Reads the installation ID and the joined name from `state` and probes the sandbox.
     /// Blocking.
-    pub fn open(state: StateDir) -> Result<(Node, EventReceiver)> {
+    pub fn open(state: StateDir, outbox: Outbox) -> Result<Node> {
         let installation_id = state.installation_id()?;
         let name = state.credentials()?.map(|c| c.name);
         let sandbox = crate::sandbox::probe();
-        Ok(Node::new(state, installation_id, name, sandbox))
+        Ok(Node::new(state, installation_id, name, sandbox, outbox))
     }
 
     pub fn new(
@@ -45,17 +45,16 @@ impl Node {
         installation_id: String,
         name: Option<String>,
         sandbox: SandboxInfo,
-    ) -> (Node, EventReceiver) {
-        let (events, receiver) = events::channel(EVENT_QUEUE_BYTES);
-        let node = Node {
+        outbox: Outbox,
+    ) -> Node {
+        Node {
             state,
             installation_id,
             name,
             sandbox,
-            exec: ExecManager::new(events.clone()),
-            watch: WatchManager::new(events),
-        };
-        (node, receiver)
+            exec: ExecManager::new(outbox.clone()),
+            watch: WatchManager::new(outbox),
+        }
     }
 
     pub fn sandbox(&self) -> &SandboxInfo {
@@ -74,16 +73,10 @@ impl Node {
         .map_err(|err| Error::new(ErrorKind::Io, format!("node info collection failed: {err}")))
     }
 
-    /// The first frame of a connection.
-    pub async fn hello(&self, node_id: String) -> Result<Hello> {
-        Ok(Hello {
-            node_id,
-            installation_id: self.installation_id.clone(),
-            version: crate::VERSION.to_string(),
-            info: self.info().await?,
-            execs: self.exec.list(),
-            watches: self.watch.ids(),
-        })
+    /// The processes and watches a new session's `node.ready` lists, with fresh NodeInfo. The
+    /// driver passes them to [`Session::ready`](crate::link::Session::ready).
+    pub async fn ready_state(&self) -> Result<(NodeInfo, Vec<ExecSummary>, Vec<WatchId>)> {
+        Ok((self.info().await?, self.exec.list(), self.watch.ids()))
     }
 
     /// Kills every running command, for a normal exit.
@@ -108,17 +101,22 @@ impl Node {
         }
     }
 
-    async fn rotate_credential(&self, params: RotateCredentialParams) -> Result<()> {
+    async fn update(&self, update: NodeUpdate) -> Result<()> {
         let state = self.state.clone();
         tokio::task::spawn_blocking(move || {
             let mut credentials = state
                 .credentials()?
                 .ok_or_else(|| Error::new(ErrorKind::Io, "this node has no credentials"))?;
-            credentials.node_token = params.node_token;
+            if let Some(node_token) = update.node_token {
+                credentials.node_token = node_token;
+            }
+            if let Some(endpoint) = update.endpoint {
+                credentials.endpoint = endpoint;
+            }
             state.store_credentials(&credentials)
         })
         .await
-        .map_err(|err| Error::new(ErrorKind::Io, format!("credential rotation failed: {err}")))?
+        .map_err(|err| Error::new(ErrorKind::Io, format!("node.update failed: {err}")))?
     }
 
     async fn fs(&self, request: FsRequest, access: Access) -> Result<Value> {
@@ -127,75 +125,77 @@ impl Node {
     }
 }
 
-/// Answers one request. The result is the JSON-RPC `result` or `error`.
-pub async fn dispatch(node: &Node, method: &str, params: Value) -> Result<Value> {
-    let method = Method::from_name(method).ok_or_else(|| {
+/// Handles one command message. The result is the reply's `ok` or `error`. A kind that is not a
+/// command (including an event the node does not know) is `unknown_kind` (api.md, Errors).
+pub async fn dispatch(node: &Node, kind: &str, body: Value) -> Result<Value> {
+    let kind = CommandKind::from_name(kind).ok_or_else(|| {
         Error::new(
-            ErrorKind::MethodNotFound,
-            format!("unknown method `{method}`"),
+            ErrorKind::UnknownKind,
+            format!("unknown message kind `{kind}`"),
         )
     })?;
-    match method {
-        Method::NodeInfo => {
+    let params = body;
+    match kind {
+        CommandKind::NodeInfo => {
             let Empty {} = parse(params)?;
             to_value(node.info().await?)
         }
-        Method::NodeRotateCredential => {
-            node.rotate_credential(parse(params)?).await?;
+        CommandKind::NodeUpdate => {
+            node.update(parse(params)?).await?;
             to_value(Empty {})
         }
-        Method::ExecStart => {
+        CommandKind::ExecStart => {
             let WithAccess { params, access } = parse::<WithAccess<ExecStartParams>>(params)?;
             let confinement = node.confine(access).await?;
             to_value(node.exec.start(params, confinement).await?)
         }
-        Method::ExecWrite => {
+        CommandKind::ExecWrite => {
             node.exec.write(parse::<ExecWriteParams>(params)?).await?;
             to_value(Empty {})
         }
-        Method::ExecKill => {
+        CommandKind::ExecKill => {
             let ExecKillParams { exec_id, signal } = parse(params)?;
             node.exec.kill(&exec_id, signal)?;
             to_value(Empty {})
         }
-        Method::ExecList => {
+        CommandKind::ExecList => {
             let Empty {} = parse(params)?;
             to_value(ExecListResult {
                 execs: node.exec.list(),
             })
         }
-        Method::ExecLog => to_value(node.exec.log(parse::<ExecLogParams>(params)?).await?),
-        Method::FsStat => {
+        CommandKind::ExecLog => to_value(node.exec.log(parse::<ExecLogParams>(params)?).await?),
+        CommandKind::FsStat => {
             let WithAccess { params, access } = parse::<WithAccess<FsPathParams>>(params)?;
             node.fs(FsRequest::Stat(params), access).await
         }
-        Method::FsList => {
+        CommandKind::FsList => {
             let WithAccess { params, access } = parse::<WithAccess<FsPathParams>>(params)?;
             node.fs(FsRequest::List(params), access).await
         }
-        Method::FsRead => {
+        CommandKind::FsRead => {
             let WithAccess { params, access } = parse::<WithAccess<FsReadParams>>(params)?;
             node.fs(FsRequest::Read(params), access).await
         }
-        Method::FsWrite => {
+        CommandKind::FsWrite => {
             let WithAccess { params, access } = parse::<WithAccess<FsWriteParams>>(params)?;
             node.fs(FsRequest::Write(params), access).await
         }
-        Method::FsMkdir => {
+        CommandKind::FsMkdir => {
             let WithAccess { params, access } = parse::<WithAccess<FsMkdirParams>>(params)?;
             node.fs(FsRequest::Mkdir(params), access).await
         }
-        Method::FsRemove => {
+        CommandKind::FsRemove => {
             let WithAccess { params, access } = parse::<WithAccess<FsRemoveParams>>(params)?;
             node.fs(FsRequest::Remove(params), access).await
         }
-        Method::WatchStart => {
+        CommandKind::WatchStart => {
             let WithAccess { params, access } = parse::<WithAccess<WatchStartParams>>(params)?;
             let confinement = node.confine(access).await?;
             node.watch.start(params, confinement).await?;
             to_value(Empty {})
         }
-        Method::WatchStop => {
+        CommandKind::WatchStop => {
             let WatchStopParams { watch_id } = parse(params)?;
             node.watch.stop(&watch_id)?;
             to_value(Empty {})
@@ -203,7 +203,7 @@ pub async fn dispatch(node: &Node, method: &str, params: Value) -> Result<Value>
     }
 }
 
-/// Absent params (`null`) parse as `{}`.
+/// An absent body (`null`) parses as `{}`.
 fn parse<T: DeserializeOwned>(params: Value) -> Result<T> {
     let params = match params {
         Value::Null => Value::Object(Default::default()),
@@ -221,6 +221,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::link::{ManualClock, NodeIdentity, Role, Session};
     use crate::protocol::{Mechanism, SandboxStatus};
 
     fn node() -> Node {
@@ -232,7 +233,13 @@ mod tests {
             baseline_read: vec![],
         };
         let state = StateDir::at("/nonexistent-state".into());
-        Node::new(state, "tz4a98xxat96iws9zmbrgj3a".to_string(), None, sandbox).0
+        let identity = NodeIdentity {
+            node_id: "n_1".to_string(),
+            installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
+        };
+        let (_session, outbox) = Session::new(Role::Node(identity), ManualClock::new(0));
+        let installation_id = "tz4a98xxat96iws9zmbrgj3a".to_string();
+        Node::new(state, installation_id, None, sandbox, outbox)
     }
 
     async fn call(method: &str, params: Value) -> Result<Value> {
@@ -240,18 +247,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_method() {
+    async fn unknown_kind() {
         assert_eq!(
             call("exec.nope", json!({})).await,
             Err(Error::new(
-                ErrorKind::MethodNotFound,
-                "unknown method `exec.nope`"
+                ErrorKind::UnknownKind,
+                "unknown message kind `exec.nope`"
             ))
+        );
+        assert_eq!(
+            call("reply", json!({})).await.unwrap_err().kind,
+            ErrorKind::UnknownKind
         );
     }
 
     #[tokio::test]
-    async fn params_are_parsed_at_the_boundary() {
+    async fn bodies_are_parsed_at_the_boundary() {
         let err = call("exec.kill", json!({ "execId": "bad id", "signal": "kill" }))
             .await
             .unwrap_err();
@@ -262,6 +273,11 @@ mod tests {
         );
         let err = call("fs.stat", json!({ "path": "/x" })).await.unwrap_err();
         assert_eq!(err, Error::invalid_params("missing field `access`"));
+        let err = call("node.update", json!({})).await.unwrap_err();
+        assert_eq!(
+            err,
+            Error::invalid_params("node.update needs nodeToken, endpoint or both")
+        );
     }
 
     #[tokio::test]

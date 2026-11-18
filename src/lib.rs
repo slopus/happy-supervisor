@@ -5,10 +5,10 @@ pub mod client;
 pub mod dispatch;
 pub mod enroll;
 pub mod error;
-pub mod events;
 pub mod exec;
 pub mod fs;
 pub mod helper;
+pub mod link;
 pub mod node_info;
 pub mod policy;
 mod process;
@@ -21,5 +21,5 @@ pub mod watch;
 
 pub use error::{Error, ErrorKind, Result};
 
-/// The crate version, reported as `supervisorVersion` and in `node.hello`.
+/// The crate version, reported as `supervisorVersion` and in `hello`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

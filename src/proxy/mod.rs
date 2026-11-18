@@ -4,7 +4,6 @@
 
 mod ca;
 mod server;
-mod streams;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -13,24 +12,11 @@ use base64::Engine;
 use rustls::crypto::CryptoProvider;
 
 use crate::protocol::{ExecId, ProxyMessage, ProxySpec};
+use crate::streams::{Streams, Upstream};
 pub use ca::NodeCa;
 use server::{Proxy, Tasks};
-use streams::Streams;
 
 use crate::error::{Error, ErrorKind, Result};
-use crate::link::Outbox;
-
-/// Where streams go: the link in the supervisor, an in-memory control plane in tests. Called
-/// with internal locks held, so it must not block or call back into the proxy.
-pub trait Upstream: Send + Sync + 'static {
-    fn send(&self, message: ProxyMessage);
-}
-
-impl Upstream for Outbox {
-    fn send(&self, message: ProxyMessage) {
-        self.proxy(message);
-    }
-}
 
 /// Every command's proxy on this node, and the streams they share. Cheap to clone.
 #[derive(Clone)]
@@ -90,12 +76,17 @@ impl ProxyManager {
 
     /// A `proxy.*` message from the control plane. Never blocks.
     pub fn on_event(&self, message: ProxyMessage) {
-        self.streams.on_message(message);
+        self.streams.on_proxy(message);
     }
 
     /// The session was lost: every open stream ends (proxy.md, Limits and failure).
     pub fn session_lost(&self) {
         self.streams.session_lost();
+    }
+
+    /// The node's stream table, which tunnels share.
+    pub(crate) fn streams(&self) -> &Arc<Streams> {
+        &self.streams
     }
 }
 

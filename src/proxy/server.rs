@@ -24,11 +24,11 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use super::ca::NodeCa;
-use super::streams::{Piece, Reserve, StreamGuard, Streams};
 use crate::error::Result;
 use crate::protocol::{
     Bytes, ExecId, HostPattern, ProxyRequest, ProxyResponse, ProxyToken, Scheme, StreamId,
 };
+use crate::streams::{Piece, StreamGuard, Streams};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Body = BoxBody<bytes::Bytes, BoxError>;
@@ -242,7 +242,7 @@ impl Proxy {
                 .map(|(name, value)| (name, Bytes(value)))
                 .collect(),
         };
-        let Ok((guard, head)) = self.streams.open(request) else {
+        let Ok((guard, head)) = self.streams.open_http(request) else {
             return status(StatusCode::SERVICE_UNAVAILABLE);
         };
         self.tasks
@@ -353,32 +353,17 @@ fn is_upgrade<B>(req: &Request<B>) -> bool {
 async fn pump(streams: Arc<Streams>, id: StreamId, mut body: Incoming) {
     loop {
         match body.frame().await {
-            None => return streams.end_request(id),
+            None => return streams.end_outbound(id),
             Some(Err(_)) => return streams.reset(id, "the client's request body failed"),
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data()
-                    && !send_all(&streams, id, &data).await
+                    && !streams.send_all(id, &data).await
                 {
                     return;
                 }
             }
         }
     }
-}
-
-/// `false` once the stream is gone.
-async fn send_all(streams: &Streams, id: StreamId, mut data: &[u8]) -> bool {
-    while !data.is_empty() {
-        let changed = streams.changed().notified();
-        tokio::pin!(changed);
-        changed.as_mut().enable();
-        match streams.send_body(id, data) {
-            Reserve::Sent(n) => data = &data[n..],
-            Reserve::Blocked => changed.await,
-            Reserve::Gone => return false,
-        }
-    }
-    true
 }
 
 fn respond(
@@ -434,9 +419,7 @@ impl hyper::body::Body for ResponseBody {
     ) -> Poll<Option<Result<Frame<bytes::Bytes>, BoxError>>> {
         Poll::Ready(match ready!(self.pieces.poll_recv(cx)) {
             Some(Piece::Data(data)) => {
-                self.guard
-                    .streams()
-                    .client_took(self.guard.id(), data.len());
+                self.guard.streams().consumed(self.guard.id(), data.len());
                 Some(Ok(Frame::data(data.into())))
             }
             Some(Piece::Abort) => Some(Err("the response was abandoned".into())),

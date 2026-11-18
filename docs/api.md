@@ -545,10 +545,20 @@ removed, never followed. Result `{}`.
 { "watchId": "w-1", "path": "/home/me/repo", "recursive": true, "access": { … } }
 ```
 
-Starts reporting changes under `path`, which must exist. Under a sandbox, `path` must be
-readable by the policy, and changes to paths the policy cannot read are never reported. The
-control plane chooses `watchId`, with the same rules as `execId`. A node holds at most 64
-watches. Result `{}`.
+Starts reporting changes under `path`, which must exist (else `not_found`). `path` may be a
+directory or a file. `recursive: false` reports only `path` and its direct children. Under a
+sandbox, `path` must be readable by the policy (else `permission_denied`), and changes to paths
+the policy cannot read, such as the supervisor's state directory, are never reported. The
+control plane chooses `watchId`, with the same rules as `execId`. An ID in use is
+`already_exists`. A node holds at most 64 watches, and a 65th is `too_large`. Result `{}`.
+
+Symlinks inside the watched tree are reported as themselves and never followed, so changes
+behind them are not reported. Changed paths are reported under `path` as written, even when it
+runs through a symlink (on macOS, `/tmp/x` is reported as `/tmp/x/…`, not `/private/tmp/x/…`).
+
+On Linux each watch holds one inotify instance and, when recursive, one inotify watch per
+directory. The OS caps both per user (`fs.inotify.max_user_instances`, by default 128, and
+`fs.inotify.max_user_watches`). A start that hits a cap replies `io`.
 
 ### `watch.stop`
 
@@ -561,8 +571,16 @@ Params `{ "watchId" }`. Result `{}`. Stopping an unknown watch is `not_found`.
 ```
 
 `kind` is `created`, `modified`, `removed` or `renamed`. A rename reports `renamed` for the old
-path and `created` for the new one when the OS gives both. Changes are batched for up to
-100 ms. At most 256 changes go in one event.
+path and `created` for the new one when the OS gives both. macOS does not say which side of a
+rename a path was on, so the node reports `created` if the path exists afterwards and `renamed`
+if it does not. Changes are batched for up to 100 ms. At most 256 changes go in one event.
+Within a batch, a change identical to the previous change of the same path is left out, so a
+file written in many pieces reports `modified` once.
+
+When a directory appears under a recursive watch, by creation or by moving in, each entry
+already in it is reported `created` too, since the OS reports nothing for entries made before
+it watched the directory. A path can therefore be reported `created` twice. A directory with
+more than 10 000 entries is reported as `overflow` instead.
 
 ```json
 { "watchId": "w-1", "overflow": true }
@@ -572,7 +590,8 @@ path and `created` for the new one when the OS gives both. Changes are batched f
 control plane should rescan what it cares about.
 
 If the watched path itself is removed, the node sends a final event with that `removed` change,
-then stops the watch.
+then stops the watch. Moving it away, or replacing it with a new file or directory, counts as
+removing it. The watch's ID is free again after that.
 
 ## Event delivery
 

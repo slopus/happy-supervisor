@@ -110,8 +110,8 @@ Default: Linux `$XDG_STATE_HOME/happy-supervisor` (else `~/.local/state/happy-su
 `~/Library/Application Support/happy-supervisor`. Windows `%LOCALAPPDATA%\happy-supervisor`.
 `--state-dir` overrides it. Created `0700`. Two parts:
 
-* `private/` (`0700`): `installation-id`, `credentials.json` (`0600`), and the proxy CA key
-  `proxy-ca.key` (`0600`). It is the `hidden` path of every job: no sandboxed operation can read
+* `private/` (`0700`): `installation-id`, `credentials.json` (`0600`), and the proxy CA's key
+  `proxy-ca.key` (`0600`) and certificate `proxy-ca.crt`. It is the `hidden` path of every job: no sandboxed operation can read
   or write it, whatever its policy grants.
 * `public/`: `ca-bundle.pem`, rewritten at each start (proxy.md). Sandboxed commands with a
   `proxy` get read access to that one file.

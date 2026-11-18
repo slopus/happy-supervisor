@@ -56,6 +56,8 @@ pub struct Options {
     /// Accept the node's permessage-deflate offer. A control plane that declines it is refused
     /// by the node (api.md, Compression); `false` exists to test that.
     pub deflate: bool,
+    /// The DEFLATE level of what the control plane sends.
+    pub deflate_level: u32,
     /// The `resumeWindowMs` of `welcome`.
     pub resume_window_ms: u64,
 }
@@ -64,6 +66,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             deflate: true,
+            deflate_level: crate::ws::DEFLATE_LEVEL,
             resume_window_ms: 300_000,
         }
     }
@@ -402,8 +405,10 @@ async fn connect(
         .get(header::SEC_WEBSOCKET_EXTENSIONS)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (mut response, upgraded) = match upgrade.upgrade(crate::ws::options(shared.options.deflate))
-    {
+    let (mut response, upgraded) = match upgrade.upgrade(crate::ws::options(
+        shared.options.deflate,
+        shared.options.deflate_level,
+    )) {
         Ok(upgrade) => upgrade,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };

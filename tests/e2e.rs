@@ -23,6 +23,7 @@ struct Node {
     dir: tempfile::TempDir,
     node_id: String,
     single_lane: bool,
+    deflate_level: u32,
     child: Option<Child>,
     /// Events read while waiting for another one, oldest first.
     seen: Vec<Event>,
@@ -54,6 +55,7 @@ impl Node {
 
     /// Joins and starts `run`, without waiting for it to connect.
     async fn spawn(options: Options, single_lane: bool) -> Node {
+        let deflate_level = options.deflate_level;
         let cp = ControlPlane::start_with(options).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let token = cp.issue_join_token();
@@ -65,6 +67,7 @@ impl Node {
             dir,
             node_id,
             single_lane,
+            deflate_level,
             child: None,
             seen: Vec::new(),
         };
@@ -87,6 +90,10 @@ impl Node {
         if self.single_lane {
             command.env(happy_supervisor::client::SINGLE_LANE_ENV, "1");
         }
+        command.env(
+            happy_supervisor::ws::DEFLATE_LEVEL_ENV,
+            self.deflate_level.to_string(),
+        );
         let child = command
             .arg("run")
             .arg("--state-dir")
@@ -526,41 +533,56 @@ fn report(what: &str, t: Traffic) {
     );
 }
 
-/// permessage-deflate is offered, accepted, and shrinks small frames and large ones. Prints the
-/// byte counts against the raw frame sizes.
+/// permessage-deflate is offered, accepted, and shrinks small frames and large ones, at
+/// DEFLATE levels 1 and 6. Prints the byte counts against the raw frame sizes.
 #[tokio::test]
 async fn the_link_is_compressed_with_permessage_deflate() {
-    let mut node = Node::start().await;
-    assert_eq!(
-        node.cp.offered_extensions().as_deref(),
-        Some(happy_supervisor::ws::DEFLATE_OFFER)
-    );
-    let accepted = node.cp.accepted_extensions().unwrap();
-    assert!(accepted.starts_with("permessage-deflate"), "{accepted}");
-    assert!(node.log().contains("permessage-deflate"), "{}", node.log());
-
-    // Build output, one line per write: a run of small frames.
-    let before = node.cp.received();
-    let script = "i=0; while [ $i -lt 3000 ]; do \
-        echo \"   Compiling crate-$i v0.1.$i (/home/me/repo/crates/crate-$i)\"; i=$((i+1)); done";
-    node.ok("exec.start", sh("build", script, Path::new("/"), raw()))
+    for level in [1, 2, 6] {
+        let mut node = Node::start_with(Options {
+            deflate_level: level,
+            ..Options::default()
+        })
         .await;
-    let (_, stdout, _) = node.exit("build").await;
-    assert_eq!(stdout.lines().count(), 3000);
-    let build = since(before, node.cp.received());
-    report("build output, node -> control plane", build);
+        assert_eq!(
+            node.cp.offered_extensions().as_deref(),
+            Some(happy_supervisor::ws::DEFLATE_OFFER)
+        );
+        let accepted = node.cp.accepted_extensions().unwrap();
+        assert_eq!(accepted, "permessage-deflate; client_max_window_bits=15");
+        assert!(node.log().contains(&accepted), "{}", node.log());
 
-    let before = node.cp.received();
-    for _ in 0..5 {
-        node.ok("node.info", json!({})).await;
+        // Build output, one line per write: a run of small frames.
+        let before = node.cp.received();
+        let script = "i=0; while [ $i -lt 3000 ]; do \
+            echo \"   Compiling crate-$i v0.1.$i (/home/me/repo/crates/crate-$i)\"; i=$((i+1)); done";
+        node.ok("exec.start", sh("build", script, Path::new("/"), raw()))
+            .await;
+        let (_, stdout, _) = node.exit("build").await;
+        assert_eq!(stdout.lines().count(), 3000);
+        let build = since(before, node.cp.received());
+        report(
+            &format!("level {level}, build output, node -> control plane"),
+            build,
+        );
+
+        let before = node.cp.received();
+        for _ in 0..5 {
+            node.ok("node.info", json!({})).await;
+        }
+        let info = since(before, node.cp.received());
+        report(
+            &format!("level {level}, 5 node.info replies, node -> control plane"),
+            info,
+        );
+        report(
+            &format!("level {level}, everything, control plane -> node"),
+            node.cp.sent(),
+        );
+
+        assert!(build.frames > 100, "{build:?}");
+        assert!(build.wire_bytes * 10 < build.frame_bytes * 3, "{build:?}");
+        assert!(info.wire_bytes * 10 < info.frame_bytes * 3, "{info:?}");
     }
-    let info = since(before, node.cp.received());
-    report("5 node.info replies, node -> control plane", info);
-    report("everything, control plane -> node", node.cp.sent());
-
-    assert!(build.frames > 100, "{build:?}");
-    assert!(build.wire_bytes * 10 < build.frame_bytes * 5, "{build:?}");
-    assert!(info.wire_bytes * 10 < info.frame_bytes * 6, "{info:?}");
 }
 
 #[tokio::test]

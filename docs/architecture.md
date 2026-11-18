@@ -112,12 +112,13 @@ The frame gets its ID then, and a message over 64 KiB goes as consecutive parts.
 frames are kept, byte for byte, until an `ack` covers them. Budgets are released part by part as
 they are confirmed.
 
-`ws` is the WebSocket, on yawc. Compression is yawc's permessage-deflate with context takeover,
-level 1, below the link: a `Session` produces and consumes uncompressed frames. `ws::Socket::next`
-polls reading and writing together, alternating which goes first, and reports either a message
-or that the socket can take the next frame. A driver writes one frame, then waits for that, and
-keeps reading meanwhile. A driver that stopped reading while it wrote would deadlock against a
-peer doing the same once both socket buffers fill.
+`ws` is the WebSocket, on yawc. Compression is yawc's permessage-deflate with context takeover
+at DEFLATE level 2 (zlib-rs, pure Rust), below the link: a `Session` produces and consumes
+uncompressed frames. `ws::Socket::next` polls reading and writing together, alternating which
+goes first, and reports either a message or that the socket can take the next frame. A driver
+writes one frame, then waits for that, and keeps reading meanwhile. A driver that stopped
+reading while it wrote would deadlock against a peer doing the same once both socket buffers
+fill.
 
 The driver loop is: on connect call `connected`; on each binary message call `receive` (a text
 message is `reject`); whenever the socket can take a frame and `poll_transmit` has one, write it;

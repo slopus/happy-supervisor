@@ -32,21 +32,42 @@ pub const SUBPROTOCOL: &str = "happy-supervisor.v1";
 /// The node's `Sec-WebSocket-Extensions` offer.
 pub const DEFLATE_OFFER: &str = "permessage-deflate; client_max_window_bits";
 
-/// The DEFLATE level of what this side sends.
-pub const DEFLATE_LEVEL: u32 = 1;
+/// The DEFLATE level of what this side sends. Measured with zlib-rs on the e2e traffic, level 2
+/// compresses small frames as well as the default 6 and plaintext nearly as well, at 1.6 times its
+/// speed. Level 1 is faster still but sends a fifth more on small frames and expands random bytes
+/// by 5 % (docs/architecture.md, The link).
+pub const DEFLATE_LEVEL: u32 = 2;
+
+/// With the `testing` feature, the node compresses at the level in this variable instead, to
+/// measure levels against each other.
+#[cfg(feature = "testing")]
+pub const DEFLATE_LEVEL_ENV: &str = "HAPPY_SUPERVISOR_DEFLATE_LEVEL";
+
+/// The level the node compresses at: [`DEFLATE_LEVEL`], or with the `testing` feature the
+/// [`DEFLATE_LEVEL_ENV`] override.
+pub fn node_level() -> u32 {
+    #[cfg(feature = "testing")]
+    if let Some(level) = std::env::var(DEFLATE_LEVEL_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return level;
+    }
+    DEFLATE_LEVEL
+}
 
 /// yawc's settings for one side of a link connection: frames up to the frame limit, before and
 /// after inflating, and, with `deflate`, permessage-deflate with context takeover. As a server
 /// it answers the node's bare `client_max_window_bits` with 15, the full 32 KiB window; yawc
 /// would otherwise pick 9, too small for one message to compress against the last.
-pub fn options(deflate: bool) -> Options {
+pub fn options(deflate: bool, level: u32) -> Options {
     let options = Options::default()
         .with_max_payload_read(MAX_FRAME_BYTES)
         .with_max_read_buffer(MAX_FRAME_BYTES)
         .with_no_delay();
     if deflate {
         options
-            .with_compression_level(yawc::CompressionLevel::new(DEFLATE_LEVEL))
+            .with_compression_level(yawc::CompressionLevel::new(level))
             .with_client_max_window_bits(15)
     } else {
         options.without_compression()
@@ -280,7 +301,7 @@ pub async fn dial(endpoint: &Url, node_token: &str) -> Result<Dialed, String> {
         HttpStream::from(TokioIo::new(upgraded)),
         Role::Client,
         Some(&extensions),
-        options(true),
+        options(true, node_level()),
     )
     .map_err(|err| format!("WebSocket: {err}"))?;
     Ok(Dialed::Open(Box::new(Socket::new(ws, Some(extensions)))))
@@ -365,12 +386,12 @@ mod tests {
         let (a, b) = tokio::io::duplex(4096);
         let offer = "permessage-deflate";
         let mut node_ws = Socket::new(
-            WebSocket::from_stream_with_extensions(a, Role::Client, Some(offer), options(true))
+            WebSocket::from_stream_with_extensions(a, Role::Client, Some(offer), options(true, 1))
                 .unwrap(),
             Some(offer.to_string()),
         );
         let mut cp_ws = Socket::new(
-            WebSocket::from_stream_with_extensions(b, Role::Server, Some(offer), options(true))
+            WebSocket::from_stream_with_extensions(b, Role::Server, Some(offer), options(true, 1))
                 .unwrap(),
             Some(offer.to_string()),
         );

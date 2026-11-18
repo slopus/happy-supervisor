@@ -87,6 +87,10 @@ impl Node {
         assert!(joined.status.success(), "join failed: {joined:?}");
         let log = std::fs::File::create(dir.path().join("run.log")).unwrap();
         let child = Command::new(BIN)
+            .env(
+                happy_supervisor::ws::DEFLATE_LEVEL_ENV,
+                options.deflate_level.to_string(),
+            )
             .arg("run")
             .arg("--state-dir")
             .arg(&state)
@@ -438,27 +442,77 @@ async fn a_lost_session_resets_every_tunnel() {
     node.kill("echo").await;
 }
 
+/// What a dev server serves, as plaintext: this repository's sources, tests, docs and lockfile,
+/// repeated to `len` bytes.
+fn plaintext(len: usize) -> Vec<u8> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<u8>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.extend(std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut corpus = Vec::new();
+    for dir in ["src", "tests", "docs"] {
+        walk(&root.join(dir), &mut corpus);
+    }
+    for file in ["Cargo.toml", "Cargo.lock"] {
+        corpus.extend(std::fs::read(root.join(file)).unwrap());
+    }
+    corpus.iter().copied().cycle().take(len).collect()
+}
+
+/// One tunnel echoing plaintext, then random bytes as the worst case, at DEFLATE levels 1 and 6.
+/// Prints the throughput and the bytes on the wire against the frames' own size.
 #[tokio::test]
-async fn throughput_of_one_tunnel_with_and_without_deflate() {
-    const SIZE: usize = 32 << 20;
-    for deflate in [true, false] {
-        let mut node = Node::start_with(Options {
-            deflate,
-            ..Options::default()
-        })
-        .await;
-        let port = node.server("echo", "echo").await;
-        let mut pipes = [Pipe::new(node.open(port).await, noise(7, SIZE))];
-        let started = Instant::now();
-        node.carry(&mut pipes, |_, _| {}).await;
-        let elapsed = started.elapsed().as_secs_f64();
-        assert!(pipes[0].received == pipes[0].outgoing);
-        println!(
-            "tunnel throughput, deflate {}: {:.1} MiB/s each way ({} MiB echoed in {elapsed:.2} s)",
-            if deflate { "on" } else { "off" },
-            (SIZE >> 20) as f64 / elapsed,
-            SIZE >> 20,
-        );
-        node.kill("echo").await;
+async fn throughput_of_one_tunnel() {
+    let payloads = [
+        ("plaintext (sources, docs, lockfile)", plaintext(16 << 20)),
+        ("random bytes (worst case)", noise(7, 16 << 20)),
+    ];
+    for (what, data) in &payloads {
+        for level in [1, 2, 6] {
+            let mut node = Node::start_with(Options {
+                deflate_level: level,
+                ..Options::default()
+            })
+            .await;
+            let port = node.server("echo", "echo").await;
+            let mut pipes = [Pipe::new(node.open(port).await, data.clone())];
+            let (sent, received) = (node.cp.sent(), node.cp.received());
+            let started = Instant::now();
+            node.carry(&mut pipes, |_, _| {}).await;
+            let elapsed = started.elapsed().as_secs_f64();
+            assert!(pipes[0].received == pipes[0].outgoing);
+            let (sent_now, received_now) = (node.cp.sent(), node.cp.received());
+            let ratio = |wire: u64, frames: u64| wire as f64 / frames as f64;
+            println!(
+                "tunnel, {what}, level {level}: {:.1} MiB/s each way ({} MiB echoed in {elapsed:.2} s); \
+                 to the node {} wire / {} frame bytes ({:.3}), from the node {} / {} ({:.3})",
+                (data.len() >> 20) as f64 / elapsed,
+                data.len() >> 20,
+                sent_now.wire_bytes - sent.wire_bytes,
+                sent_now.frame_bytes - sent.frame_bytes,
+                ratio(
+                    sent_now.wire_bytes - sent.wire_bytes,
+                    sent_now.frame_bytes - sent.frame_bytes
+                ),
+                received_now.wire_bytes - received.wire_bytes,
+                received_now.frame_bytes - received.frame_bytes,
+                ratio(
+                    received_now.wire_bytes - received.wire_bytes,
+                    received_now.frame_bytes - received.frame_bytes
+                ),
+            );
+            node.kill("echo").await;
+        }
     }
 }

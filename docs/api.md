@@ -12,7 +12,8 @@ where it left off. When resuming is impossible, both sides find out, and they st
 knowingly rather than silently losing messages.
 
 This document is the wire contract. The policy carried by sandboxed commands is in
-[policy.md](policy.md). The node description is in [node-info.md](node-info.md).
+[policy.md](policy.md). The node description is in [node-info.md](node-info.md). Proxying a command's HTTP traffic
+through the control plane is in [proxy.md](proxy.md).
 
 ## Joining and credentials
 
@@ -44,7 +45,7 @@ The supervisor does not derive any path from it.
    `endpoint` is the full WebSocket URL the node connects to from now on. It may be on another
    host than the join URL. Any other status is a failed join. `401`/`403` mean the token is
    invalid, expired or spent. The body may carry `{ "error": "…" }`, which the CLI prints.
-4. The supervisor writes `credentials.json` atomically (a temp file in the state directory,
+4. The supervisor writes `private/credentials.json` in its state directory atomically (a temp file beside it,
    then rename), owner-only (`0600` on Unix). It holds `endpoint`, `nodeId`, `nodeToken` and
    `name`.
 
@@ -76,9 +77,48 @@ redials.
 
 ## Link protocol
 
-Every WebSocket frame is one UTF-8 JSON text message with a `t` field naming the frame type.
-Binary payloads inside message bodies (file contents, process output, stdin) are standard
-base64 with padding, in fields named `data`.
+### Encoding
+
+Every WebSocket frame is a **binary** frame holding one [CBOR](https://www.rfc-editor.org/rfc/rfc8949)
+map with a `t` field naming the frame type. Text frames are a protocol error. The shapes in this
+document are written as JSON for readability. On the wire:
+
+* maps have text keys, the field names shown here;
+* `data` fields, and header values in proxy.md, are CBOR byte strings (major type 2), not base64
+  (examples write them as `h'…'`, CBOR diagnostic notation for bytes);
+* UUIDs (message IDs, session IDs, stream IDs) are 16-byte byte strings;
+* integers are CBOR integers, and absent optional fields are omitted rather than `null`, except
+  where a field is shown as `null` (`hello.session`, `hello.cursor`).
+
+The receiver ignores map keys it does not know, so either side can add fields. The one
+exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
+runs a command while ignoring a restriction it does not understand.
+
+### Compression
+
+The node offers two WebSocket subprotocols on the upgrade, in this order:
+
+```
+Sec-WebSocket-Protocol: happy-supervisor.v1.deflate, happy-supervisor.v1
+```
+
+The control plane picks one in its response. With `happy-supervisor.v1`, each frame's payload is
+the CBOR map itself. With `happy-supervisor.v1.deflate`, each frame's payload starts with one
+byte:
+
+* `0x00`: the rest is the CBOR map, uncompressed;
+* `0x01`: the rest is the CBOR map compressed as raw DEFLATE ([RFC 1951](https://www.rfc-editor.org/rfc/rfc1951)),
+  no zlib or gzip header.
+
+Each frame is compressed on its own, with no dictionary shared between frames. A resent message
+then decodes with no history, and one corrupt frame cannot spoil the ones after it. The sender
+compresses frames of 256 bytes or more and sends smaller ones as `0x00`. It also sends a frame
+as `0x00` when compression did not make it smaller. A decompressed frame larger than the frame
+limit (Limits) is a protocol error. A control plane that selects neither subprotocol, or none,
+gets the connection closed: the node requires one of the two.
+
+The join request (`POST <join url>`) is a single HTTPS exchange and stays JSON, so it can be
+issued and debugged with ordinary HTTP tools.
 
 ### Sessions
 
@@ -263,6 +303,7 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
   "stdin": false,
   "timeout": { "ms": 600000, "action": { "kind": "background" } },
   "log": { "kind": "file", "path": "/home/me/repo/.logs/build-1.log", "limitBytes": 67108864 },
+  "proxy": { "token": "pt_8f1c…", "hosts": ["api.github.com"] },
   "access": { "mode": "sandboxed", "policy": { … } }
 }
 ```
@@ -281,6 +322,8 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
   * `{ "kind": "background" }`. The process keeps running. The node sends `exec.timedOut`, stops
     streaming `exec.output` for it, and from then on its output goes only to its log, which
     the control plane reads with `exec.log`. `exec.exit` still arrives when it ends.
+* `proxy` is optional: `{ "token", "hosts" }`. HTTP(S) requests the process makes to those hosts
+  go through the control plane, which can add credentials. See [proxy.md](proxy.md).
 * `log` is optional and defaults to `{ "kind": "memory" }`. Every process's combined output
   (stdout and stderr, in arrival order) is recorded in its log from the start, whether or not
   it ever times out, so `exec.log` works for every process. See Output logs.
@@ -302,7 +345,7 @@ the whole tree. A sandboxed process and everything it starts stay inside the san
 
 ### `exec.write`
 
-Params `{ "execId": "…", "data": "<base64>", "eof": false }`. Writes to stdin. `eof: true`
+Params `{ "execId": "…", "data": h'…', "eof": false }`. Writes to stdin. `eof: true`
 closes stdin after the data. `data` may be empty. Writing to a process started with
 `stdin: false`, or after `eof`, is `invalid_params`. At most 1 MiB of data per call.
 
@@ -323,7 +366,7 @@ may be reused.
 ### `exec.output` (event)
 
 ```json
-{ "execId": "build-1", "stream": "stdout", "data": "<base64>", "droppedBytes": 0 }
+{ "execId": "build-1", "stream": "stdout", "data": h'…', "droppedBytes": 0 }
 ```
 
 Chunks are at most 64 KiB. Chunks of one stream arrive in order. `droppedBytes` counts output of
@@ -367,7 +410,7 @@ Result:
 
 ```json
 {
-  "data": "<base64>",
+  "data": h'…',
   "offset": 0,
   "totalBytes": 183022,
   "retained": [ { "start": 0, "end": 16384 }, { "start": 120000, "end": 183022 } ]
@@ -444,12 +487,12 @@ A larger directory replies `too_large`.
 
 Params `{ "path", "access", "offset": 0, "length": 1048576 }`. `offset` defaults to 0.
 `length` defaults to the rest of the file, and at most 16 MiB is read per call (more is
-`too_large`). Result `{ "data": "<base64>", "size": 1234 }`, where `size` is the whole file's
+`too_large`). Result `{ "data": h'…', "size": 1234 }`, where `size` is the whole file's
 size.
 
 ### `fs.write`
 
-Params `{ "path", "access", "data": "<base64>", "mode": "overwrite" }`. `mode` is:
+Params `{ "path", "access", "data": h'…', "mode": "overwrite" }`. `mode` is:
 
 * `create`. Fail with `already_exists` if the path exists.
 * `overwrite`. Create or truncate, then write.
@@ -530,7 +573,7 @@ session, `node.ready` goes first.
 
 | What | Limit |
 |---|---|
-| WebSocket frame | 32 MiB |
+| WebSocket frame | 32 MiB, after decompression |
 | Ack delay | 200 ms or 64 messages |
 | Session resume window | set by `welcome.resumeWindowMs` |
 | `fs.read` / `fs.write` data | 16 MiB per call |

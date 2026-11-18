@@ -38,7 +38,12 @@ the rest of the collection, and each is cut off at 3 seconds.
     "available": true,
     "reason": null,
     "landlockAbi": 6,
-    "baselineRead": ["/usr", "/bin", "/lib", "/lib64", "/etc"]
+    "baselineRead": ["/usr", "/bin", "/lib", "/lib64", "/etc"],
+    "gaps": [
+      "with localBind false and unixSockets true, UDP ports can still be bound, and a TCP socket can listen on an ephemeral port without bind",
+      "with localBind true and unixSockets false, abstract-namespace Unix sockets can still be bound",
+      "ioctl on an opened device and connecting to a Unix socket are not restricted"
+    ]
   },
   "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
   "collectedAtMs": 1763496000000
@@ -150,6 +155,7 @@ What this node can enforce for `{ "mode": "sandboxed" }` commands (policy.md).
 | `reason` | string \| null | Why it is unavailable, in one sentence (for example "Landlock is not in the kernel's active LSM list"). |
 | `landlockAbi` | integer \| null | Linux only. The Landlock ABI version the kernel supports. It determines the gaps listed in policy.md. |
 | `baselineRead` | array of paths | Existing system paths that ordinary programs need to read on this machine. The supervisor never adds these to a policy itself. |
+| `gaps` | array of strings | What this node's sandbox does not enforce, one sentence each, so the control plane can see it without knowing kernels. The Linux list depends on `landlockAbi` (policy.md, Gaps the node reports). Empty when `available` is false. |
 
 `baselineRead` by platform, keeping only paths that exist:
 

@@ -113,7 +113,8 @@ The seccomp filter only allows system calls of the native architecture. A 32-bit
 program is killed at its first system call when the filter applies, because its socket calls
 cannot be filtered reliably.
 
-Gaps the node reports:
+Gaps the node reports, as one sentence each in NodeInfo's `sandbox.gaps` (node-info.md), for
+its own kernel's ABI:
 
 * With `localBind: false, unixSockets: true`, UDP ports can still be bound, and a TCP socket can
   still listen on an ephemeral port by calling `listen` without `bind`. Landlock controls only
@@ -124,6 +125,7 @@ Gaps the node reports:
   seccomp path). Other combinations reply `sandbox_unavailable`.
 * On ABI 1 and 2, `truncate(2)` on a readable file is not restricted by Landlock. File
   permissions still apply.
+* `ioctl` on an opened device and connecting to a Unix socket are not restricted (above).
 
 ### macOS: Seatbelt
 
@@ -160,7 +162,10 @@ macOS 27 without each of the first five.
   ordinary programs make.
 * `network-outbound`, to any address and to any Unix socket (Outbound network, above).
 
-Gap: a grant applies to the real path only. Opening a granted file through a symlink fails
+The node reports one gap in `sandbox.gaps`: the directory metadata above every grant is
+readable (above).
+
+A grant applies to the real path only. Opening a granted file through a symlink fails
 unless the symlink itself is readable, because Seatbelt checks reading the link. Linux follows
 the link without checking it. The system symlinks listed above are the exception.
 

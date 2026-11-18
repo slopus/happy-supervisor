@@ -8,6 +8,7 @@ fn unavailable_sandbox() -> SandboxInfo {
             reason: "no sandbox in this test".to_string(),
         },
         baseline_read: vec!["/usr".to_string()],
+        gaps: vec![],
     }
 }
 

@@ -32,13 +32,38 @@ pub fn probe() -> SandboxInfo {
             reason: err.message,
         },
     };
+    let abi = kernel_abi().ok();
+    let gaps = match (&status, abi) {
+        (SandboxStatus::Available, Some(abi)) => gaps(abi),
+        _ => Vec::new(),
+    };
     SandboxInfo {
-        mechanism: Mechanism::Landlock {
-            abi: kernel_abi().ok(),
-        },
+        mechanism: Mechanism::Landlock { abi },
         status,
         baseline_read: super::baseline_read(),
+        gaps,
     }
+}
+
+/// What a kernel with Landlock ABI `abi` leaves unenforced (policy.md, Gaps the node reports).
+pub fn gaps(abi: u32) -> Vec<String> {
+    let mut gaps = vec![
+        "with localBind false and unixSockets true, UDP ports can still be bound, and a TCP \
+         socket can listen on an ephemeral port without bind",
+        "with localBind true and unixSockets false, abstract-namespace Unix sockets can still be \
+         bound",
+    ];
+    if abi < 4 {
+        gaps.push(
+            "localBind false is enforced only together with unixSockets false; other \
+             combinations reply sandbox_unavailable",
+        );
+    }
+    if abi < 3 {
+        gaps.push("truncate on a readable file is not restricted");
+    }
+    gaps.push("ioctl on an opened device and connecting to a Unix socket are not restricted");
+    gaps.into_iter().map(str::to_string).collect()
 }
 
 pub fn prepare(job: &Job) -> Result<Command> {
@@ -315,6 +340,19 @@ fn run_true() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gaps_depend_on_the_abi() {
+        let six = gaps(6);
+        assert_eq!(six.len(), 3);
+        assert!(six[0].contains("listen on an ephemeral port without bind"));
+        assert_eq!(
+            six[2],
+            "ioctl on an opened device and connecting to a Unix socket are not restricted"
+        );
+        assert_eq!(gaps(3).len(), 4);
+        assert_eq!(gaps(2)[3], "truncate on a readable file is not restricted");
+    }
     use crate::error::ErrorKind;
     use std::path::PathBuf;
 

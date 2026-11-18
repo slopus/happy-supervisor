@@ -1393,6 +1393,8 @@ pub struct SandboxInfo {
     pub mechanism: Mechanism,
     pub status: SandboxStatus,
     pub baseline_read: Vec<String>,
+    /// What the sandbox does not enforce here, one sentence each. Empty when unavailable.
+    pub gaps: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1428,6 +1430,8 @@ struct SandboxInfoWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     landlock_abi: Option<u32>,
     baseline_read: Vec<String>,
+    #[serde(default)]
+    gaps: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1455,6 +1459,7 @@ impl From<SandboxInfo> for SandboxInfoWire {
             reason,
             landlock_abi,
             baseline_read: info.baseline_read,
+            gaps: info.gaps,
         }
     }
 }
@@ -1492,6 +1497,7 @@ impl TryFrom<SandboxInfoWire> for SandboxInfo {
             mechanism,
             status,
             baseline_read: wire.baseline_read,
+            gaps: wire.gaps,
         })
     }
 }
@@ -1574,7 +1580,12 @@ mod tests {
             "available": true,
             "reason": null,
             "landlockAbi": 6,
-            "baselineRead": ["/usr", "/bin", "/lib", "/lib64", "/etc"]
+            "baselineRead": ["/usr", "/bin", "/lib", "/lib64", "/etc"],
+            "gaps": [
+              "with localBind false and unixSockets true, UDP ports can still be bound, and a TCP socket can listen on an ephemeral port without bind",
+              "with localBind true and unixSockets false, abstract-namespace Unix sockets can still be bound",
+              "ioctl on an opened device and connecting to a Unix socket are not restricted"
+            ]
           },
           "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
           "collectedAtMs": 1763496000000u64
@@ -1776,14 +1787,14 @@ mod tests {
     #[test]
     fn sandbox_info_shapes() {
         let mac: SandboxInfo = round_trip(
-            json!({ "mechanism": "seatbelt", "available": false, "reason": "sandbox-exec is missing", "landlockAbi": null, "baselineRead": [] }),
+            json!({ "mechanism": "seatbelt", "available": false, "reason": "sandbox-exec is missing", "landlockAbi": null, "baselineRead": [], "gaps": [] }),
         );
         assert_eq!(
             mac.require_available(),
             Err(Error::sandbox_unavailable("sandbox-exec is missing"))
         );
         let windows: SandboxInfo = round_trip(
-            json!({ "mechanism": "none", "available": false, "reason": "Windows has no sandbox backend", "landlockAbi": null, "baselineRead": [] }),
+            json!({ "mechanism": "none", "available": false, "reason": "Windows has no sandbox backend", "landlockAbi": null, "baselineRead": [], "gaps": [] }),
         );
         assert_eq!(windows.mechanism, Mechanism::None);
         assert!(rejects::<SandboxInfo>(json!({ "mechanism": "seatbelt", "available": true, "reason": null, "landlockAbi": 3, "baselineRead": [] })).contains("landlockAbi is set for a non-landlock mechanism"));

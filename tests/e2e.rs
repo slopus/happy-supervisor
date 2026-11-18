@@ -242,6 +242,14 @@ async fn node_info_is_collected_fresh() {
     assert_eq!(info["name"], "e2e-node");
     assert_eq!(info["installationId"], node.cp.joins()[0].installation_id);
     assert_eq!(info["supervisorVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(info["sandbox"]["available"], true, "{}", info["sandbox"]);
+    let gaps = info["sandbox"]["gaps"].to_string();
+    let expected = if cfg!(target_os = "macos") {
+        "the metadata (not the listing or contents) of every directory above a grant is readable"
+    } else {
+        "a TCP socket can listen on an ephemeral port without bind"
+    };
+    assert!(gaps.contains(expected), "{gaps}");
     let unknown = node.call("node.nope", json!({})).await.unwrap_err();
     assert_eq!(unknown.message, "unknown message kind `node.nope`");
 }

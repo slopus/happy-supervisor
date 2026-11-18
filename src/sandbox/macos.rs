@@ -37,15 +37,26 @@ const SYSTEM_SYMLINKS: [&str; 6] = [
 #[cfg(target_os = "macos")]
 pub fn probe() -> crate::protocol::SandboxInfo {
     use crate::protocol::{Mechanism, SandboxInfo, SandboxStatus};
+    let status = match run_true() {
+        Ok(()) => SandboxStatus::Available,
+        Err(reason) => SandboxStatus::Unavailable { reason },
+    };
+    let gaps = match status {
+        SandboxStatus::Available => GAPS.iter().map(|gap| gap.to_string()).collect(),
+        SandboxStatus::Unavailable { .. } => Vec::new(),
+    };
     SandboxInfo {
         mechanism: Mechanism::Seatbelt,
-        status: match run_true() {
-            Ok(()) => SandboxStatus::Available,
-            Err(reason) => SandboxStatus::Unavailable { reason },
-        },
+        status,
         baseline_read: super::baseline_read(),
+        gaps,
     }
 }
+
+/// What every profile allows whatever the policy says (policy.md, macOS: Seatbelt).
+#[cfg(target_os = "macos")]
+const GAPS: [&str; 1] =
+    ["the metadata (not the listing or contents) of every directory above a grant is readable"];
 
 /// Runs `/usr/bin/true` through `sandbox-exec` and the helper, granted only that file.
 #[cfg(target_os = "macos")]

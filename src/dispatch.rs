@@ -283,6 +283,7 @@ mod tests {
                 reason: "no sandbox in this test".to_string(),
             },
             baseline_read: vec![],
+            gaps: vec![],
         };
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::at(dir.path().to_path_buf());

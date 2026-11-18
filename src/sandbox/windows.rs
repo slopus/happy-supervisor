@@ -15,6 +15,7 @@ pub fn probe() -> SandboxInfo {
             reason: REASON.to_string(),
         },
         baseline_read: super::baseline_read(),
+        gaps: Vec::new(),
     }
 }
 

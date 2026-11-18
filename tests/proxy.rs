@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use happy_supervisor::protocol::{
     Bytes, ExecId, HostPattern, ProxyBody, ProxyCredit, ProxyEnd, ProxyMessage, ProxyRequest,
-    ProxyReset, ProxyResponse, ProxySpec, ProxyToken, Scheme, StreamId,
+    ProxyReset, ProxyResponse, ProxySpec, ProxyToken, Scheme, StreamId, TcpMessage,
 };
-use happy_supervisor::proxy::{NodeCa, ProxyLease, ProxyManager, Upstream};
+use happy_supervisor::proxy::{NodeCa, ProxyLease, ProxyManager};
+use happy_supervisor::streams::Upstream;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
@@ -21,8 +22,12 @@ const WINDOW: usize = 1 << 20;
 struct Channel(mpsc::UnboundedSender<ProxyMessage>);
 
 impl Upstream for Channel {
-    fn send(&self, message: ProxyMessage) {
+    fn proxy(&self, message: ProxyMessage) {
         let _ = self.0.send(message);
+    }
+
+    fn tcp(&self, message: TcpMessage) {
+        panic!("a proxy sent {message:?}");
     }
 }
 

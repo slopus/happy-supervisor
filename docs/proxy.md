@@ -55,6 +55,10 @@ every start the node writes `public/ca-bundle.pem` in the state directory: the p
 roots followed by the node's CA certificate. Sandboxed commands with a `proxy` may read exactly
 that file, as if their policy granted it.
 
+For each intercepted host the node mints a leaf certificate signed by its CA: the host as its
+only DNS name, server authentication only, valid for 30 days. Leaves live only in memory. The
+node keeps the 256 most recently used and mints a new one when a cached leaf is a week old.
+
 ## How requests travel
 
 The proxy handles three kinds of client requests:
@@ -100,7 +104,8 @@ Both directions:
 `headers` is a list of `[name, value]` pairs in order, names lowercase, values bytes. Repeated
 headers stay repeated. The node removes hop-by-hop headers before forwarding and after receiving:
 `connection`, `keep-alive`, `proxy-authorization`, `proxy-authenticate`, `proxy-connection`, `te`,
-`trailer`, `transfer-encoding`, `upgrade`, and any header named in `connection`. Body framing is
+`trailer`, `transfer-encoding`, `upgrade`, and any header named in `connection`. It also removes
+`expect` from requests, since it answers `100 Continue` to the client itself. Body framing is
 the stream itself. The node de-chunks request bodies, and frames responses to the client with
 `content-length` when the control plane sent one, or chunked encoding otherwise.
 
@@ -120,11 +125,21 @@ until credit arrives. So one slow client or upstream never fills the link's queu
 ### Limits and failure
 
 * At most 64 open streams per command and 1024 per node. Past that the client gets `503`.
+* At most 32 MiB of request body, summed over every stream of the node, may be sent and not yet
+  credited. Past that every request body pauses until credit arrives. Each `proxy.body` waits in
+  the link's queue of messages it must not drop until it is acknowledged, and that queue ends
+  the session at 64 MiB (api.md, Lost sessions), so 1024 full windows could not fit.
 * When the session is lost (api.md, Lost sessions), every open stream ends. A client still
   waiting for a response head gets `502`. A client in the middle of a response sees its
   connection closed.
 * `proxy.reset` from the control plane before a response head gives the client `502`, after
   one closes the client connection.
+* A control plane that breaks the stream rules resets the stream: a `proxy.body` over 64 KiB, or
+  past the window, or before `proxy.response`; a second `proxy.response`; `proxy.end` before
+  `proxy.response`; or a response head the node cannot use (an informational `1xx` status, or an
+  invalid header). The node sends `proxy.reset` and the client gets `502` before a response head
+  or sees its connection closed after one. Messages for a stream the node no longer has are
+  ignored.
 * A control plane that does not support proxying answers the first `proxy.request` of any stream
   with `proxy.reset`, and the client gets `502`.
 * When the command exits, its proxy stops, and its open streams are reset.

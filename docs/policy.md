@@ -117,15 +117,42 @@ Gaps the node reports:
 
 ### macOS: Seatbelt
 
-The operation runs under `/usr/bin/sandbox-exec` with a profile generated from the policy:
-`(deny default)`, `file-read*` for `read`, `file-read*` and `file-write*` for `write`
-(`subpath` for directories, `literal` for files), `network-bind` and `network-inbound` for
-loopback and local addresses only when `localBind`, and Unix socket binding only when
-`unixSockets`. Outbound network, process fork and exec, and the Mach services the C library
-needs (directory lookups, logging, notifications, DNS) are allowed. Seatbelt applies the last
-matching rule, and the state directory's deny comes after every grant, so it overrides any
-containing grant. Signals
-and process inspection are limited to the same sandbox.
+The parent spawns the helper as `/usr/bin/sandbox-exec -p <profile> <helper> __sandbox`, so the
+helper starts already confined. The profile is generated from the resolved policy and starts
+with `(deny default)`. Seatbelt applies the last matching rule.
+
+| Policy | Mechanism |
+|---|---|
+| `read` | `file-read*`, `file-map-executable` and `process-exec` on each grant: `subpath` for a directory, `literal` for a file. |
+| `write` | The same, plus `file-write*`. |
+| state directory | `file-read*`, `file-write*`, `file-map-executable` and `process-exec` denied on its `subpath`, after every grant, so it overrides any grant that contains it. |
+| `localBind: true` | `network-bind` and `network-inbound` on any local IP address, TCP and UDP. |
+| `unixSockets: true` | `network-bind` of Unix sockets inside each `write` grant. A `read` grant cannot hold a socket. |
+| processes | `process-fork`. Executing needs a grant (`process-exec` comes with `read`). Signals and process inspection reach only processes in the same sandbox. |
+
+Every profile also allows these, whatever the policy says. `tests/sandbox_macos.rs` fails on
+macOS 27 without each of the first five.
+
+* The helper binary, read and executed by its canonical path, because `sandbox-exec` runs it
+  after the profile is applied.
+* `/` itself, its metadata and listing (not what is below it). dyld reads it before any program
+  starts.
+* The metadata (`stat`, not the listing or the contents) of every directory above a grant, and of
+  the system symlinks `/etc`, `/tmp`, `/var`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`.
+  `realpath`, `pwd -P` and the `git` and `python3` shims stat each component, and DNS goes
+  through `/var/run/mDNSResponder`. This exposes those directories' existence, owner, mode, size
+  and times.
+* `sysctl-read`. The Rust runtime and the C library read kernel parameters at startup.
+* The Mach service `com.apple.system.opendirectoryd.libinfo`, for user and group names.
+* The Mach services the C library looks up for logging, notifications and DNS:
+  `com.apple.system.logger`, `com.apple.logd`, `com.apple.system.notification_center` and
+  `com.apple.dnssd.service`. The tests pass without them, but they are read-only lookups that
+  ordinary programs make.
+* `network-outbound`, to any address and to any Unix socket (Outbound network, above).
+
+Gap: a grant applies to the real path only. Opening a granted file through a symlink fails
+unless the symlink itself is readable, because Seatbelt checks reading the link. Linux follows
+the link without checking it. The system symlinks listed above are the exception.
 
 ### Windows
 

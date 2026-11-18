@@ -16,7 +16,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{enter, prepare, probe};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{prepare, probe};

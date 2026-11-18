@@ -490,18 +490,25 @@ Params `{ "path", "access" }`. Result:
 `kind` is `file`, `directory`, `symlink` or `other`. `stat` follows symlinks. `symlink` appears
 only from `fs.list`.
 
+Under a sandbox the supervisor also checks the path, with symlinks resolved, against the
+policy's read set before the helper runs, because Landlock governs opening files but not
+reading their metadata.
+
 ### `fs.list`
 
 Params `{ "path", "access" }`. Result `{ "entries": [ { "name": "src", "kind": "directory", "size": 4096 } ] }`,
-sorted by name. Entries are not followed, so a symlink lists as `symlink`. At most 10 000 entries.
-A larger directory replies `too_large`.
+sorted by name. Entries are not followed, so a symlink lists as `symlink`, and its `size` is the
+length of its target path. A name that is not valid UTF-8 is reported with U+FFFD in place of
+the invalid bytes. At most 10 000 entries. A larger directory replies `too_large`.
 
 ### `fs.read`
 
 Params `{ "path", "access", "offset": 0, "length": 1048576 }`. `offset` defaults to 0.
 `length` defaults to the rest of the file, and at most 16 MiB is read per call (more is
-`too_large`). Result `{ "data": h'…', "size": 1234 }`, where `size` is the whole file's
-size.
+`too_large`). Without `length`, a rest longer than 16 MiB is `too_large` too. The rest is found by
+reading, not from the size, so files that report size 0 (such as Linux's `/proc`) read fully.
+Result `{ "data": h'…', "size": 1234 }`, where `size` is the whole file's size. An
+`offset` at or past the end reads no data.
 
 ### `fs.write`
 
@@ -513,7 +520,11 @@ Params `{ "path", "access", "data": h'…', "mode": "overwrite" }`. `mode` is:
 
 The parent directory must exist. `fs.write` never creates directories. At most 16 MiB per call.
 `overwrite` writes a temp file beside the target and renames it over, so readers never see a
-half-written file. Result `{}`.
+half-written file. The replacement keeps the target's permissions. Through a symlink, the file
+it points to is replaced and the link stays. `overwrite` refuses what writing the file in place
+would refuse, such as a read-only file. When the directory does not allow the temp file but the
+file itself is writable (a sandbox policy that grants only the file), the file is truncated and
+written in place instead, and readers can then see it half-written. Result `{}`.
 
 ### `fs.mkdir`
 
@@ -523,7 +534,8 @@ Params `{ "path", "access", "recursive": false }`. `recursive` creates missing p
 ### `fs.remove`
 
 Params `{ "path", "access", "recursive": false }`. Removes a file, a symlink (not its target)
-or an empty directory. `recursive: true` removes a directory tree. Result `{}`.
+or an empty directory. `recursive: true` removes a directory tree. Symlinks inside the tree are
+removed, never followed. Result `{}`.
 
 ## Watching
 

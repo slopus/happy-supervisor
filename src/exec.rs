@@ -107,6 +107,8 @@ struct Output {
     streaming: bool,
     /// Set once the exit is reported. Later output is neither logged nor streamed.
     closed: bool,
+    /// Chunks the log failed to record. The first failure is logged, the rest only counted.
+    failed_appends: u64,
 }
 
 /// A spawned child before it is registered.
@@ -406,6 +408,7 @@ impl Inner {
             log,
             streaming: true,
             closed: false,
+            failed_appends: 0,
         }));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let pipes = [
@@ -547,7 +550,10 @@ impl Reader {
                 continue;
             }
             if let Err(err) = output.log.append(&buf[..n]) {
-                tracing::warn!("writing the log of {} failed: {err}", self.exec_id);
+                if output.failed_appends == 0 {
+                    tracing::warn!("writing the log of {} failed: {err}", self.exec_id);
+                }
+                output.failed_appends += 1;
             }
             if output.streaming {
                 self.outbox
@@ -599,6 +605,13 @@ impl Waiter {
         {
             let mut output = lock(&self.output);
             output.closed = true;
+            if output.failed_appends > 1 {
+                tracing::warn!(
+                    "{} chunks of {} output were not logged",
+                    output.failed_appends,
+                    self.exec_id
+                );
+            }
             if let Log::Memory(log) = &mut output.log {
                 log.shrink();
             }

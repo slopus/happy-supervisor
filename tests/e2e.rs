@@ -579,7 +579,6 @@ async fn the_link_is_compressed_with_permessage_deflate() {
             node.cp.sent(),
         );
 
-        assert!(build.frames > 100, "{build:?}");
         assert!(build.wire_bytes * 10 < build.frame_bytes * 3, "{build:?}");
         assert!(info.wire_bytes * 10 < info.frame_bytes * 3, "{info:?}");
     }

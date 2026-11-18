@@ -346,8 +346,8 @@ process for retention, so its ID frees up once 256 later processes have ended.
 
 Each command runs in its own session and process group (Unix, `setsid`) or Job Object
 (Windows). Killing it kills the whole tree. A sandboxed process and everything it starts stay
-inside the sandbox. On Windows the process joins its Job Object right after it is created, so a
-child it starts in that first instant can escape the tree.
+inside the sandbox. On Windows the process is created suspended and runs only once it is in its
+Job Object, so nothing it starts escapes the tree.
 
 ### `exec.write`
 

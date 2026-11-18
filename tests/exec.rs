@@ -90,7 +90,7 @@ impl Node {
 
     async fn start_with(&self, params: Value, confinement: Confinement) -> Result<u32, Error> {
         let params: ExecStartParams = serde_json::from_value(params).unwrap();
-        Ok(self.exec.start(params, confinement).await?.pid)
+        Ok(self.exec.start(params, confinement, None).await?.pid)
     }
 
     /// Waits for the process's `exec.exit`.
@@ -578,7 +578,7 @@ async fn a_sandboxed_command_runs_through_the_helper() {
     params["stdin"] = json!(true);
     params["log"] = json!({ "kind": "file", "path": format!("{work_path}/sb.log") });
     let params: ExecStartParams = serde_json::from_value(params).unwrap();
-    let started = node.exec.start(params, confinement()).await.unwrap();
+    let started = node.exec.start(params, confinement(), None).await.unwrap();
     assert_eq!(started.ignored_paths, ["/nonexistent-grant"]);
     node.write("sb", b"from stdin", true).await.unwrap();
     assert_eq!(node.exit("sb").await.exit, ExitStatus::Exited { code: 0 });

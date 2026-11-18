@@ -26,6 +26,7 @@ use crate::protocol::{
     MAX_EXEC_LOG_READ_BYTES, MAX_EXEC_WRITE_BYTES, MAX_OUTPUT_CHUNK_BYTES, MEMORY_LOG_BUDGET_BYTES,
     RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction,
 };
+use crate::proxy::ProxyLease;
 
 /// After a process exits, how long its output may stay silent before the exit is reported
 /// without waiting for the pipes to close. Processes it left behind can hold them open forever.
@@ -81,6 +82,8 @@ struct Running {
     timed_out: bool,
     /// The process exited and is being reaped. Its group may no longer be signalled.
     reaping: bool,
+    /// The command's credential proxy. Dropped with this phase, so the proxy stops at the exit.
+    _proxy: Option<ProxyLease>,
 }
 
 impl Phase {
@@ -133,10 +136,15 @@ impl ExecManager {
     }
 
     /// Starts a command. Sandboxed ones go through `sandbox::prepare` and the helper.
+    ///
+    /// `proxy` is the command's running credential proxy when `exec.start` asked for one
+    /// (`params.proxy` is then taken). Its `env()` replaces the same names in `params.env`. The
+    /// command holds it until it exits, and a failed start drops it, which stops the proxy.
     pub async fn start(
         &self,
         params: ExecStartParams,
         confinement: Confinement,
+        proxy: Option<ProxyLease>,
     ) -> Result<ExecStartResult> {
         let exec_id = params.exec_id.clone();
         let memory_reserved = match params.log {
@@ -149,7 +157,7 @@ impl ExecManager {
         // Spawning and registering run to completion on a blocking thread, so a cancelled
         // caller cannot leave a process running unregistered.
         let started = tokio::task::spawn_blocking(move || {
-            let result = inner.launch(params, &confinement, &runtime);
+            let result = inner.launch(params, &confinement, proxy, &runtime);
             if result.is_err() {
                 inner.fail(&exec_id);
             }
@@ -384,17 +392,22 @@ impl Inner {
         self: &Arc<Self>,
         params: ExecStartParams,
         confinement: &Confinement,
+        proxy: Option<ProxyLease>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<u32> {
         let ExecStartParams {
             exec_id,
             argv,
             cwd,
-            env,
+            mut env,
             stdin,
             timeout,
             log,
+            proxy: _,
         } = params;
+        if let Some(lease) = &proxy {
+            env.extend(lease.env().iter().cloned());
+        }
         let program = resolve_program(argv.program(), &env)?;
         let log = open_log(&log, confinement)?;
         let Spawned { mut child, tree } = match confinement {
@@ -475,6 +488,7 @@ impl Inner {
             timer,
             timed_out: false,
             reaping: false,
+            _proxy: proxy,
         });
         Ok(pid)
     }
@@ -927,29 +941,35 @@ mod tests {
     async fn memory_logs_share_a_budget_and_the_oldest_exited_ones_go_first() {
         let manager = manager(45);
         let raw = || Confinement::Raw;
-        manager.start(sh("a", "sleep 30", 16), raw()).await.unwrap();
         manager
-            .start(sh("d", "printf 0123456789", 16), raw())
+            .start(sh("a", "sleep 30", 16), raw(), None)
+            .await
+            .unwrap();
+        manager
+            .start(sh("d", "printf 0123456789", 16), raw(), None)
             .await
             .unwrap();
         exited(&manager, "d").await;
         manager
-            .start(sh("e", "printf abcdefghij", 16), raw())
+            .start(sh("e", "printf abcdefghij", 16), raw(), None)
             .await
             .unwrap();
         exited(&manager, "e").await;
 
         let err = manager
-            .start(sh("big", "true", 30), raw())
+            .start(sh("big", "true", 30), raw(), None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::TooLarge);
-        manager.start(sh("f", "true", 16), raw()).await.unwrap();
+        manager
+            .start(sh("f", "true", 16), raw(), None)
+            .await
+            .unwrap();
         assert_eq!(log_of(&manager, "d").await, (vec![], 10, 0));
         assert_eq!(log_of(&manager, "e").await, (b"abcdefghij".to_vec(), 10, 1));
 
         let err = manager
-            .start(sh("big", "true", 1), raw())
+            .start(sh("big", "true", 1), raw(), None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::AlreadyExists);

@@ -28,6 +28,9 @@ pub const DEFAULT_FILE_LOG_BYTES: u64 = 64 << 20;
 pub const MAX_FILE_LOG_BYTES: u64 = 1 << 30;
 pub const MAX_WATCHES: usize = 64;
 pub const MAX_LIST_ENTRIES: usize = 10_000;
+pub const MAX_PROXY_TOKEN_BYTES: usize = 4096;
+pub const MAX_PROXY_HOSTS: usize = 256;
+pub const MAX_PROXY_BODY_BYTES: usize = 64 << 10;
 pub const MAX_CHANGES_PER_EVENT: usize = 256;
 pub const ACK_DELAY_MS: u64 = 200;
 pub const ACK_EVERY_MSGS: u32 = 64;
@@ -219,6 +222,9 @@ pub enum Event {
     ExecTimedOut(ExecTimedOut),
     #[serde(rename = "watch.event")]
     WatchEvent(WatchEvent),
+    /// A `proxy.*` stream message (proxy.md), which carries its own `kind`.
+    #[serde(untagged)]
+    Proxy(ProxyMessage),
 }
 
 impl Event {
@@ -232,15 +238,22 @@ impl Event {
 
     /// Parses a received message as an event. `None` for a kind that is not an event.
     pub fn parse(kind: &str, body: Value) -> Option<Result<Event, String>> {
+        if ProxyMessage::KINDS.contains(&kind) {
+            return Some(ProxyMessage::parse(kind, body).map(Event::Proxy));
+        }
         if !Event::KINDS.contains(&kind) {
             return None;
         }
-        let tagged = Value::Map(vec![
-            (Value::Text("kind".into()), Value::Text(kind.into())),
-            (Value::Text("body".into()), body),
-        ]);
-        Some(crate::wire::from_value(tagged))
+        Some(crate::wire::from_value(tagged(kind, body)))
     }
+}
+
+/// `{"kind": kind, "body": body}`, the shape the event enums deserialize from.
+fn tagged(kind: &str, body: Value) -> Value {
+    Value::Map(vec![
+        (Value::Text("kind".into()), Value::Text(kind.into())),
+        (Value::Text("body".into()), body),
+    ])
 }
 
 /// The commands the node serves.
@@ -604,6 +617,8 @@ pub struct ExecStartParams {
     pub timeout: Option<Timeout>,
     #[serde(default)]
     pub log: LogSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxySpec>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,6 +851,288 @@ pub struct ExecLogResult {
 pub struct ByteRange {
     pub start: u64,
     pub end: u64,
+}
+
+// ---------------------------------------------------------------------------------------------
+// The credential proxy (docs/proxy.md)
+
+/// `exec.start`'s `proxy`: the hosts whose HTTP(S) requests go through the control plane, and the
+/// token the node attaches to each.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ProxySpecWire")]
+pub struct ProxySpec {
+    pub token: ProxyToken,
+    pub hosts: Vec<HostPattern>,
+}
+
+#[derive(Deserialize)]
+struct ProxySpecWire {
+    token: ProxyToken,
+    hosts: Vec<HostPattern>,
+}
+
+impl TryFrom<ProxySpecWire> for ProxySpec {
+    type Error = Error;
+
+    fn try_from(wire: ProxySpecWire) -> Result<Self, Error> {
+        if wire.hosts.len() > MAX_PROXY_HOSTS {
+            return Err(Error::invalid_params(format!(
+                "proxy hosts has {} entries, at most {MAX_PROXY_HOSTS} are allowed",
+                wire.hosts.len()
+            )));
+        }
+        Ok(ProxySpec {
+            token: wire.token,
+            hosts: wire.hosts,
+        })
+    }
+}
+
+/// The opaque proxy token: 1 to 4096 bytes. Never logged, so `Debug` hides it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProxyToken(String);
+
+impl ProxyToken {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ProxyToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProxyToken(<redacted>)")
+    }
+}
+
+impl TryFrom<String> for ProxyToken {
+    type Error = Error;
+
+    fn try_from(token: String) -> Result<Self, Error> {
+        if (1..=MAX_PROXY_TOKEN_BYTES).contains(&token.len()) {
+            Ok(ProxyToken(token))
+        } else {
+            Err(Error::invalid_params(format!(
+                "a proxy token is 1 to {MAX_PROXY_TOKEN_BYTES} bytes, got {}",
+                token.len()
+            )))
+        }
+    }
+}
+
+impl TryFrom<&str> for ProxyToken {
+    type Error = Error;
+
+    fn try_from(token: &str) -> Result<Self, Error> {
+        ProxyToken::try_from(token.to_owned())
+    }
+}
+
+impl From<ProxyToken> for String {
+    fn from(token: ProxyToken) -> String {
+        token.0
+    }
+}
+
+/// One `hosts` entry, lowercase and without a trailing dot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum HostPattern {
+    /// Exactly this name.
+    Exact(String),
+    /// `*.suffix`: every name under `suffix`, not `suffix` itself.
+    Suffix(String),
+}
+
+impl HostPattern {
+    /// Whether `host` (any case, a trailing dot allowed) is covered.
+    pub fn matches(&self, host: &str) -> bool {
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        match self {
+            HostPattern::Exact(name) => host == *name,
+            HostPattern::Suffix(suffix) => host
+                .strip_suffix(suffix.as_str())
+                .is_some_and(|rest| rest.len() > 1 && rest.ends_with('.')),
+        }
+    }
+}
+
+impl TryFrom<String> for HostPattern {
+    type Error = Error;
+
+    fn try_from(pattern: String) -> Result<Self, Error> {
+        let name = pattern
+            .strip_suffix('.')
+            .unwrap_or(&pattern)
+            .to_ascii_lowercase();
+        let (wildcard, name) = match name.strip_prefix("*.") {
+            Some(suffix) => (true, suffix.to_owned()),
+            None => (false, name),
+        };
+        let bad = |why: &str| Error::invalid_params(format!("proxy host {pattern:?} {why}"));
+        if name.parse::<std::net::IpAddr>().is_ok() || name.starts_with('[') {
+            return Err(bad("is an IP address, and only DNS names are allowed"));
+        }
+        let valid = (1..=253).contains(&name.len())
+            && name.split('.').all(|label| {
+                (1..=63).contains(&label.len())
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            });
+        if !valid {
+            return Err(bad("is not a DNS name or `*.` and a DNS name"));
+        }
+        Ok(if wildcard {
+            HostPattern::Suffix(name)
+        } else {
+            HostPattern::Exact(name)
+        })
+    }
+}
+
+impl TryFrom<&str> for HostPattern {
+    type Error = Error;
+
+    fn try_from(pattern: &str) -> Result<Self, Error> {
+        HostPattern::try_from(pattern.to_owned())
+    }
+}
+
+impl From<HostPattern> for String {
+    fn from(pattern: HostPattern) -> String {
+        match pattern {
+            HostPattern::Exact(name) => name,
+            HostPattern::Suffix(suffix) => format!("*.{suffix}"),
+        }
+    }
+}
+
+uuid_type!(
+    /// A proxy stream: a UUIDv7 the node chooses for each forwarded request.
+    StreamId
+);
+
+impl StreamId {
+    pub fn generate() -> StreamId {
+        StreamId(Uuid::now_v7())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scheme {
+    Http,
+    Https,
+}
+
+/// A `[name, value]` pair: the name lowercase, the value bytes.
+pub type Header = (String, Bytes);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRequest {
+    pub stream_id: StreamId,
+    pub exec_id: ExecId,
+    pub token: ProxyToken,
+    pub method: String,
+    pub scheme: Scheme,
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    pub headers: Vec<Header>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResponse {
+    pub stream_id: StreamId,
+    pub status: u16,
+    pub headers: Vec<Header>,
+}
+
+/// A piece of a request or response body, at most [`MAX_PROXY_BODY_BYTES`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyBody {
+    pub stream_id: StreamId,
+    pub data: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyEnd {
+    pub stream_id: StreamId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyReset {
+    pub stream_id: StreamId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyCredit {
+    pub stream_id: StreamId,
+    pub bytes: u64,
+}
+
+/// One `proxy.*` stream message, in either direction, as `{"kind": …, "body": …}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "body")]
+pub enum ProxyMessage {
+    #[serde(rename = "proxy.request")]
+    Request(ProxyRequest),
+    #[serde(rename = "proxy.response")]
+    Response(ProxyResponse),
+    #[serde(rename = "proxy.body")]
+    Body(ProxyBody),
+    #[serde(rename = "proxy.end")]
+    End(ProxyEnd),
+    #[serde(rename = "proxy.reset")]
+    Reset(ProxyReset),
+    #[serde(rename = "proxy.credit")]
+    Credit(ProxyCredit),
+}
+
+impl ProxyMessage {
+    pub const KINDS: [&str; 6] = [
+        "proxy.request",
+        "proxy.response",
+        "proxy.body",
+        "proxy.end",
+        "proxy.reset",
+        "proxy.credit",
+    ];
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ProxyMessage::Request(_) => "proxy.request",
+            ProxyMessage::Response(_) => "proxy.response",
+            ProxyMessage::Body(_) => "proxy.body",
+            ProxyMessage::End(_) => "proxy.end",
+            ProxyMessage::Reset(_) => "proxy.reset",
+            ProxyMessage::Credit(_) => "proxy.credit",
+        }
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        match self {
+            ProxyMessage::Request(m) => m.stream_id,
+            ProxyMessage::Response(m) => m.stream_id,
+            ProxyMessage::Body(m) => m.stream_id,
+            ProxyMessage::End(m) => m.stream_id,
+            ProxyMessage::Reset(m) => m.stream_id,
+            ProxyMessage::Credit(m) => m.stream_id,
+        }
+    }
+
+    /// Parses a received message of one of [`ProxyMessage::KINDS`] as a stream message.
+    pub fn parse(kind: &str, body: Value) -> Result<ProxyMessage, String> {
+        crate::wire::from_value(tagged(kind, body))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1527,9 +1824,17 @@ mod tests {
           "stdin": false,
           "timeout": { "ms": 600000, "action": { "kind": "background" } },
           "log": { "kind": "file", "path": "/home/me/repo/.logs/build-1.log", "limitBytes": 67108864 },
+          "proxy": { "token": "pt_8f1c…", "hosts": ["api.github.com"] },
           "access": { "mode": "sandboxed", "policy": policy_json() }
         });
         let start: WithAccess<ExecStartParams> = round_trip(params);
+        assert_eq!(
+            start.params.proxy,
+            Some(ProxySpec {
+                token: ProxyToken::try_from("pt_8f1c…").unwrap(),
+                hosts: vec![HostPattern::Exact("api.github.com".to_string())],
+            })
+        );
         assert_eq!(start.params.argv.program(), "/usr/bin/make");
         assert_eq!(start.params.argv.args(), ["-j8"]);
         assert_eq!(
@@ -1579,6 +1884,138 @@ mod tests {
             json!({ "execId": "build-1", "pid": 4242, "ignoredPaths": ["/home/me/.cache/nonexistent"] }),
         );
         assert_eq!(result.pid, 4242);
+    }
+
+    #[test]
+    fn proxy_specs() {
+        let spec: ProxySpec = parse(json!({ "token": "pt_1",
+            "hosts": ["api.github.com", "*.openai.com", "Registry.NPMJS.org."] }));
+        assert_eq!(
+            spec.hosts,
+            [
+                HostPattern::Exact("api.github.com".to_string()),
+                HostPattern::Suffix("openai.com".to_string()),
+                HostPattern::Exact("registry.npmjs.org".to_string()),
+            ]
+        );
+        assert_eq!(format!("{:?}", spec.token), "ProxyToken(<redacted>)");
+        assert_eq!(spec.token.as_str(), "pt_1");
+
+        assert!(
+            rejects::<ProxySpec>(json!({ "token": "", "hosts": [] }))
+                .contains("a proxy token is 1 to 4096 bytes, got 0")
+        );
+        assert!(ProxyToken::try_from("x".repeat(4096)).is_ok());
+        assert!(ProxyToken::try_from("x".repeat(4097)).is_err());
+        let hosts: Vec<String> = (0..257).map(|i| format!("h{i}.example.com")).collect();
+        assert!(
+            rejects::<ProxySpec>(json!({ "token": "t", "hosts": hosts }))
+                .contains("proxy hosts has 257 entries, at most 256 are allowed")
+        );
+        for bad in ["127.0.0.1", "::1", "[::1]", "*.10.0.0.1"] {
+            assert!(
+                HostPattern::try_from(bad)
+                    .unwrap_err()
+                    .message
+                    .contains("is an IP address"),
+                "{bad}"
+            );
+        }
+        for bad in [
+            "",
+            "*",
+            "*.",
+            "a..b",
+            "*.*.example.com",
+            "ex ample.com",
+            "a.com:443",
+        ] {
+            assert!(
+                HostPattern::try_from(bad)
+                    .unwrap_err()
+                    .message
+                    .contains("is not a DNS name"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_patterns_match() {
+        let exact = HostPattern::try_from("api.github.com").unwrap();
+        assert!(exact.matches("api.github.com"));
+        assert!(exact.matches("API.GitHub.com."));
+        assert!(!exact.matches("x.api.github.com"));
+        assert!(!exact.matches("github.com"));
+        let suffix = HostPattern::try_from("*.openai.com").unwrap();
+        assert!(suffix.matches("api.openai.com"));
+        assert!(suffix.matches("a.b.OpenAI.com."));
+        assert!(!suffix.matches("openai.com"));
+        assert!(!suffix.matches("notopenai.com"));
+        assert!(!suffix.matches(".openai.com"));
+        assert_eq!(String::from(suffix), "*.openai.com");
+    }
+
+    #[test]
+    fn proxy_messages() {
+        let request = Event::parse(
+            "proxy.request",
+            cbor(json!({ "streamId": u(ID_A), "execId": "build-1", "token": "pt_8f1c",
+              "method": "POST", "scheme": "https", "host": "api.openai.com", "port": 443,
+              "path": "/v1/responses",
+              "headers": [["content-type", "h'6170706c69636174696f6e2f6a736f6e'"], ["x-a", "h''"]] })),
+        )
+        .unwrap()
+        .unwrap();
+        let Event::Proxy(ProxyMessage::Request(request)) = request else {
+            panic!("{request:?}");
+        };
+        assert_eq!(request.stream_id.to_string(), ID_A);
+        assert_eq!((request.scheme, request.port), (Scheme::Https, 443));
+        assert_eq!(
+            request.headers,
+            [
+                (
+                    "content-type".to_string(),
+                    Bytes(b"application/json".to_vec())
+                ),
+                ("x-a".to_string(), Bytes(vec![])),
+            ]
+        );
+
+        let response: ProxyMessage = round_trip(json!({ "kind": "proxy.response",
+            "body": { "streamId": u(ID_A), "status": 200, "headers": [["content-type", "h'6869'"]] } }));
+        assert_eq!(response.kind(), "proxy.response");
+        let body: ProxyMessage = round_trip(
+            json!({ "kind": "proxy.body", "body": { "streamId": u(ID_B), "data": "h'000102'" } }),
+        );
+        assert_eq!(body.stream_id().to_string(), ID_B);
+        round_trip::<ProxyMessage>(json!({ "kind": "proxy.end", "body": { "streamId": u(ID_A) } }));
+        round_trip::<ProxyMessage>(
+            json!({ "kind": "proxy.reset", "body": { "streamId": u(ID_A), "reason": "upstream timeout" } }),
+        );
+        let credit: Event = round_trip(
+            json!({ "kind": "proxy.credit", "body": { "streamId": u(ID_A), "bytes": 65536 } }),
+        );
+        assert_eq!(
+            credit,
+            Event::Proxy(ProxyMessage::Credit(ProxyCredit {
+                stream_id: StreamId(Uuid::parse_str(ID_A).unwrap()),
+                bytes: 65536,
+            }))
+        );
+
+        assert!(
+            Event::parse(
+                "proxy.body",
+                cbor(json!({ "streamId": u(ID_A), "data": "text" }))
+            )
+            .unwrap()
+            .unwrap_err()
+            .contains("invalid type: string")
+        );
+        assert!(Event::parse("proxy.stream", cbor(json!({}))).is_none());
+        assert_eq!(StreamId::generate().0.get_version_num(), 7);
     }
 
     #[test]

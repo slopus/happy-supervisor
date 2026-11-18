@@ -250,6 +250,25 @@ impl ResolvedPolicy {
         self.unix_sockets
     }
 
+    /// Adds read access to one existing file the policy did not list: the CA bundle of a command
+    /// with a proxy (proxy.md). A missing file, or one inside `hidden`, is not granted.
+    pub fn grant_read_file(&mut self, path: &Path) {
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return;
+        };
+        if canonical.starts_with(&self.hidden) || !canonical.is_file() {
+            return;
+        }
+        if let Err(at) = self.grants.binary_search_by(|g| g.path.cmp(&canonical)) {
+            let grant = Grant {
+                path: canonical,
+                kind: GrantKind::File,
+                rights: Rights::Read,
+            };
+            self.grants.insert(at, grant);
+        }
+    }
+
     /// Whether the policy lets an operation read `path`, a canonical path.
     pub fn can_read(&self, path: &Path) -> bool {
         !path.starts_with(&self.hidden) && self.grants.iter().any(|g| g.covers(path))
@@ -409,6 +428,36 @@ mod tests {
                 .to_string()
                 .contains(r#"policy path "rel" is not absolute"#)
         );
+    }
+
+    #[test]
+    fn one_file_can_be_granted_for_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (private, public) = (root.join("private"), root.join("public"));
+        std::fs::create_dir(&private).unwrap();
+        std::fs::create_dir(&public).unwrap();
+        let bundle = public.join("ca-bundle.pem");
+        std::fs::write(&bundle, b"pem").unwrap();
+        std::fs::write(private.join("proxy-ca.key"), b"key").unwrap();
+        let policy = Policy::new(vec![], vec![], false, false).unwrap();
+        let mut resolved = ResolvedPolicy::resolve(&policy, &private);
+        let before = resolved.grants().len();
+
+        resolved.grant_read_file(&bundle);
+        resolved.grant_read_file(&bundle);
+        resolved.grant_read_file(&private.join("proxy-ca.key"));
+        resolved.grant_read_file(&public.join("missing.pem"));
+        resolved.grant_read_file(&public);
+        assert_eq!(resolved.grants().len(), before + 1);
+        assert!(resolved.can_read(&bundle));
+        assert!(!resolved.can_write(&bundle));
+        assert!(!resolved.can_read(&public.join("other.pem")));
+        assert!(!resolved.can_read(&private.join("proxy-ca.key")));
+        let paths: Vec<&Path> = resolved.grants().iter().map(|g| g.path.as_path()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
     }
 
     #[cfg(unix)]

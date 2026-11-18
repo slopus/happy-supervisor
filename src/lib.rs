@@ -21,8 +21,9 @@ pub mod testing;
 pub mod watch;
 pub mod wire;
 
-#[cfg(test)]
-mod testkit;
+/// JSON literals for CBOR values, for this crate's tests and for tests of a control plane.
+#[cfg(any(test, feature = "testing"))]
+pub mod testkit;
 
 pub use error::{Error, ErrorKind, Result};
 

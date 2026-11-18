@@ -119,6 +119,9 @@ impl Node {
     }
 
     async fn update(&self, update: NodeUpdate) -> Result<()> {
+        if let Some(endpoint) = &update.endpoint {
+            crate::enroll::check_url(endpoint, "wss", "ws")?;
+        }
         let state = self.state.clone();
         tokio::task::spawn_blocking(move || {
             let mut credentials = state

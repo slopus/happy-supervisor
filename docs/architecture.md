@@ -87,14 +87,21 @@ keeps every protocol rule in one place, testable with literal frames and a fake 
 the test control plane reuse it rather than reimplementing the protocol.
 
 The driver loop is: on connect call `connected` with the negotiated `Wire`, write every
-`poll_transmit` as a binary frame; on each binary frame call `receive`; after any call drain `poll_transmit` to the socket and `poll_incoming` to the
-handlers; sleep until `deadline` and call `tick`; wake on `changed` (an `Outbox` call) and
-drain again; close the socket when `is_closing` and nothing is left to transmit; call
-`disconnected` when the socket is gone. On the node, after `Incoming::Opened`, if
-`needs_ready()` collect `Node::ready_state` and call `ready`. Every `Incoming::Message` goes to
-`dispatch`, and its result, when there is one, to `Outbox::reply`. On `Incoming::Lost` call
-`Node::session_lost`. The clock is injected (`link::Clock`), so tests
-use `link::ManualClock`.
+`poll_transmit` as a binary frame; on each binary frame call `receive` (a text frame is
+`reject`); after any call drain `poll_transmit` to the socket and `poll_incoming` to the
+handlers; sleep until `deadline` and call `tick`; wake on `changed` (an `Outbox` call) and drain
+again; close the socket when `is_closing` and nothing is left to transmit; call `disconnected`
+when the socket is gone. On the node, after `Incoming::Opened`, if `needs_ready()` collect
+`Node::ready_state` and call `ready`. Every `Incoming::Message` goes to `dispatch`, and its
+result, when there is one, to `Outbox::reply`. On `Incoming::Lost` call `Node::session_lost`. The
+clock is injected (`link::Clock`), so tests use `link::ManualClock`.
+
+In `client::run` the handlers are one task holding a `FuturesUnordered` of `dispatch` futures.
+Messages are pushed in arrival order, which is ID order, so each command starts in order (its
+synchronous prefix, such as an `exec.write` taking its process's stdin, runs in order) and then
+runs concurrently with the others. Stream messages complete on their first poll, so a
+stream's pieces reach the proxy in order. The session outlives connections; handlers and
+running commands outlive both. `run_until(state, stop)` is `run` with a test-controlled stop.
 
 ## Process lifetime
 
@@ -120,12 +127,18 @@ Default: Linux `$XDG_STATE_HOME/happy-supervisor` (else `~/.local/state/happy-su
 
 `happy_supervisor::testing::ControlPlane` (feature `testing`) is an in-process axum server
 implementing api.md's join endpoint and the connect endpoint, speaking the link protocol through
-the same `link::Session` the node uses. It issues join tokens, records joins, and exposes
-`command(kind, body) -> Result<Value>` and a stream of events for one connected node. For network
-tests it can drop the connection, stall acks, forget a session (so the next `welcome` is
-`resumed: false`), revoke the node, and change `resumeWindowMs`. Integration tests start it on `127.0.0.1:0`, run `join` and `run` against it
-(in-process via the library, and as the real binary), and assert on the wire. They run on
-Linux and macOS natively.
+the same `link::Session` the node uses, for one node at a time. It issues single-use join tokens,
+records joins, and exposes `command(kind, body) -> Result<Value>`, `send_proxy`, and a stream of
+events (`proxy.*` included). `Options` chooses whether it selects the deflate subprotocol and its
+`resumeWindowMs`. For network tests it can drop the connection, stall acks, forget a session (so
+the next `welcome` is `resumed: false`), revoke the node (`bye` with `revoked`, then `401`), and
+change `resumeWindowMs`. It counts the frames and bytes each way, on the wire and as CBOR, and the
+replies that answered no waiting command, which would mean a command ran twice.
+`happy_supervisor::testkit` (same feature) writes CBOR values as JSON literals, `h'…'` for bytes.
+
+`tests/e2e.rs` runs the real binary: `happy-supervisor join` against the control plane, then
+`happy-supervisor run` as a child process, and drives it over the link. Other integration tests
+use the library in-process. They run on Linux and macOS natively.
 
 An in-process test runs as the test harness, not as `happy-supervisor`, so before any sandboxed
 operation it calls `helper::set_exe(env!("CARGO_BIN_EXE_happy-supervisor").into())` to point the

@@ -382,6 +382,12 @@ impl Session {
         }
     }
 
+    /// The peer broke the protocol outside any frame's contents, such as with a text frame:
+    /// sends `bye` with `protocol_error` and loses the session.
+    pub fn reject(&mut self, why: &str) {
+        self.shared.lock().protocol_error(why.to_string());
+    }
+
     /// Runs the timers that are due: the ack delay and the resume window.
     pub fn tick(&mut self) {
         let mut s = self.shared.lock();
@@ -1498,6 +1504,14 @@ mod tests {
                 .unwrap()
                 .starts_with("bad frame: ")
         );
+
+        let (mut session, _outbox, _clock) = open_node(Limits::default());
+        session.reject("a text frame");
+        assert_eq!(
+            drain(&mut session),
+            [json!({ "t": "bye", "reason": "protocol_error", "message": "a text frame" })]
+        );
+        assert!(session.is_closing());
     }
 
     #[test]

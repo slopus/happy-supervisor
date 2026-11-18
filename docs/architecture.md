@@ -22,14 +22,15 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 
 | Type | Module | Owner |
 |---|---|---|
-| Link frames (`hello`, `welcome`, `msg`, `ack`, `bye`), every message kind's body type (commands, replies, events), `Access`, `Policy` wire shape, `NodeInfo`, the proxy types (`ProxySpec`, `ProxyToken`, `HostPattern`, `StreamId`, `ProxyMessage` and its bodies) | `protocol` | scaffold, frozen |
-| `Wire::{Plain, Deflate}` (subprotocol ↔ frame codec: 1-byte prefix, raw deflate, 32 MiB inflate bound), `to_cbor`/`from_cbor`/`to_value`/`from_value`, the dynamic body `Value` | `wire` | scaffold |
+| Link frame bodies (`hello`, `welcome`, `msg`, `part`, `ack`, `bye`), every message kind's body type (commands, replies, events), `Access`, `Policy` wire shape, `NodeInfo`, the proxy types (`ProxySpec`, `ProxyToken`, `HostPattern`, `StreamId`, `ProxyMessage` and its bodies) | `protocol` | scaffold, frozen |
+| Frame layout (`frame`/`split`: 16-byte ID prefix, then the body, 1 MiB bound), the key registry, `to_cbor`/`from_cbor` (compact) and `to_value`/`from_value`, the dynamic body `Value` | `wire` | scaffold |
+| `ws::dial` (the node's upgrade: bearer token, subprotocol, permessage-deflate offer, platform roots), `ws::Socket` (one frame written at a time while reading, over yawc), `ws::options` | `ws` | scaffold |
 | `Error { kind: ErrorKind, message }`, `ErrorKind` ↔ `kind` string table | `error` | scaffold |
 | `Policy` (validated when built or parsed: path rules, list sizes), `ResolvedPolicy` (canonical grants, `ignored`, hidden state dir, `can_read`/`can_write`, `grant_read_file` for the CA bundle), `Confinement::{Raw, Sandboxed(ResolvedPolicy)}` | `policy` | scaffold |
 | `Job { policy: ResolvedPolicy, op: JobOp }`, `JobOp::{Exec, Fs}`, the length-prefixed job framing on the helper's stdin, the exec status pipe, `helper::main` | `helper` | scaffold |
 | `sandbox::prepare(&Job) -> Result<std::process::Command>`, `sandbox::probe() -> SandboxInfo`, `sandbox::baseline_read()`, `sandbox::enter(&ResolvedPolicy)` (Linux, inside helper) | `sandbox/{mod,linux,macos,windows}` | Linux / macOS tracks |
 | `StateDir` (paths, `private_dir`/`public_dir`, installation ID, credentials load/store) | `state` | transport track |
-| `link::Session`: the sans-IO session state machine (outgoing queue with droppable/retained budgets and drop accounting, UUIDv7 IDs, cursor acks, dedup, resend on resume, lost-session detection). Used unchanged by the node and `testing::ControlPlane`; `Role` is the only difference | `link` | scaffold |
+| `link::Session`: the sans-IO session state machine (lanes with deficit round robin, parts and their reassembly, droppable/retained budgets and drop accounting, UUIDv7 frame IDs assigned as frames are written, kept frames and resend on resume, cursor acks, dedup by frame ID, lost-session detection). `link::lane_of` derives a message's lane. Used unchanged by the node and `testing::ControlPlane`; `Role` is the only difference | `link` | scaffold |
 | `Outbox`: the cloneable handle exec, watch and the driver use to send events, commands and replies into the session | `link` | scaffold |
 | `enroll::join`, `client::run` (WebSocket, reconnect loop, driving the `Session`), `testing::ControlPlane` | `enroll`, `client`, `testing` | transport track |
 | `ExecManager` (processes, timeouts, output logs, `exec.log`) | `exec`, `process/{unix,windows}` | exec track |
@@ -101,22 +102,37 @@ messages to deliver. `client.rs` owns the WebSocket and the reconnect loop and d
 keeps every protocol rule in one place, testable with literal frames and a fake clock, and lets
 the test control plane reuse it rather than reimplementing the protocol.
 
-The driver loop is: on connect call `connected` with the negotiated `Wire`, write every
-`poll_transmit` as a binary frame; on each binary frame call `receive` (a text frame is
-`reject`); after any call drain `poll_transmit` to the socket and `poll_incoming` to the
-handlers; sleep until `deadline` and call `tick`; wake on `changed` (an `Outbox` call) and drain
-again; close the socket when `is_closing` and nothing is left to transmit; call `disconnected`
-when the socket is gone. On the node, after `Incoming::Opened`, if `needs_ready()` collect
-`Node::ready_state` and call `ready`. Every `Incoming::Message` goes to `dispatch`, and its
-result, when there is one, to `Outbox::reply`. On `Incoming::Lost` call `Node::session_lost`. The
-clock is injected (`link::Clock`), so tests use `link::ManualClock`.
+Each message waits in its lane (api.md, Lanes): one queue per process, watch or stream, one per
+other command or reply, and the control lane. `poll_transmit` picks the next frame when it is
+called: control frames (`hello`, `welcome`, `ack`, `bye`), then kept frames to resend after a
+resume, then the control lane, then the other lanes in deficit round robin with a 64 KiB quantum.
+The frame gets its ID then, and a message over 64 KiB goes as consecutive parts. Written data
+frames are kept, byte for byte, until an `ack` covers them. Budgets are released part by part as
+they are confirmed.
 
-In `client::run` the handlers are one task holding a `FuturesUnordered` of `dispatch` futures.
-Messages are pushed in arrival order, which is ID order, so each command starts in order (its
-synchronous prefix, such as an `exec.write` taking its process's stdin, runs in order) and then
-runs concurrently with the others. Stream messages complete on their first poll, so a
-stream's pieces reach the proxy in order. The session outlives connections; handlers and
-running commands outlive both. `run_until(state, stop)` is `run` with a test-controlled stop.
+`ws` is the WebSocket, on yawc. Compression is yawc's permessage-deflate with context takeover,
+level 1, below the link: a `Session` produces and consumes uncompressed frames. `ws::Socket::next`
+polls reading and writing together, alternating which goes first, and reports either a message
+or that the socket can take the next frame. A driver writes one frame, then waits for that, and
+keeps reading meanwhile. A driver that stopped reading while it wrote would deadlock against a
+peer doing the same once both socket buffers fill.
+
+The driver loop is: on connect call `connected`; on each binary message call `receive` (a text
+message is `reject`); whenever the socket can take a frame and `poll_transmit` has one, write it;
+drain `poll_incoming` to the handlers; sleep until `deadline` and call `tick`; wake on `changed`
+(an `Outbox` call); close the socket when `is_closing` and nothing is left to transmit; call
+`disconnected` when the socket is gone. On the node, after `Incoming::Opened`, if
+`needs_ready()` collect `Node::ready_state` and call `ready`. Every `Incoming::Message` goes to
+`dispatch`, and its result, when there is one, to `Outbox::reply`. On `Incoming::Lost` call
+`Node::session_lost`. The clock is injected (`link::Clock`), so tests use `link::ManualClock`.
+
+In `client::run` every handler is a task of its own, so a large reply's encoding never holds up
+another. The messages of one process, watch or stream wait for the previous one's handler to
+finish, so they are handled in delivery order (an `exec.write` reaches stdin in order, a stream's
+pieces reach the proxy in order). Other messages start at once. The session outlives
+connections; handlers and running commands outlive both. `run_until(state, stop)` is `run` with a
+test-controlled stop. With the `testing` feature, `HAPPY_SUPERVISOR_SINGLE_LANE` puts every
+message in one lane, to measure what lanes are worth.
 
 ## Process lifetime
 
@@ -141,14 +157,17 @@ Default: Linux `$XDG_STATE_HOME/happy-supervisor` (else `~/.local/state/happy-su
 ## Testing
 
 `happy_supervisor::testing::ControlPlane` (feature `testing`) is an in-process axum server
-implementing api.md's join endpoint and the connect endpoint, speaking the link protocol through
+implementing api.md's join endpoint and the connect endpoint (yawc's axum upgrade), speaking the
+link protocol through
 the same `link::Session` the node uses, for one node at a time. It issues single-use join tokens,
 records joins, and exposes `command(kind, body) -> Result<Value>`, `send_proxy`, and a stream of
-events (`proxy.*` included). `Options` chooses whether it selects the deflate subprotocol and its
-`resumeWindowMs`. For network tests it can drop the connection, stall acks, forget a session (so
+events (`proxy.*` included). `Options` sets its `resumeWindowMs`, and can make it decline compression, which the node
+refuses. For network tests it can drop the connection, stall acks, forget a session (so
 the next `welcome` is `resumed: false`), revoke the node (`bye` with `revoked`, then `401`), and
-change `resumeWindowMs`. It counts the frames and bytes each way, on the wire and as CBOR, and the
-replies that answered no waiting command, which would mean a command ran twice.
+change `resumeWindowMs`. It counts the frames each way, their bytes as frames, and the bytes its
+WebSocket connections carried over TCP, so tests can report compression against raw frame sizes.
+It records the extensions offered and accepted, and the replies that answered no waiting command,
+which would mean a command ran twice.
 `happy_supervisor::testkit` (same feature) writes CBOR values as JSON literals, `h'…'` for bytes.
 
 `tests/e2e.rs` runs the real binary: `happy-supervisor join` against the control plane, then

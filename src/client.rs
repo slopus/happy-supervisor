@@ -9,21 +9,22 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+
+use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header};
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::dispatch::{Node, dispatch};
 use crate::error::{Error, ErrorKind, Result};
-use crate::link::{Clock, Incoming, LostReason, NodeIdentity, Outbox, Role, Session, SystemClock};
-use crate::protocol::{ByeReason, MAX_FRAME_BYTES, MsgId, SessionId, Value};
+use crate::link::{
+    Clock, Incoming, Lane, LostReason, NodeIdentity, Outbox, Role, Session, SystemClock, lane_of,
+};
+use crate::protocol::{ByeReason, MsgId, SessionId, Value};
 use crate::state::StateDir;
-use crate::wire::Wire;
+use crate::ws::{Dialed, Event, Socket};
 
 pub const PING_EVERY: Duration = Duration::from_secs(15);
 pub const DEAD_AFTER: Duration = Duration::from_secs(45);
@@ -34,6 +35,11 @@ pub const STABLE_AFTER: Duration = Duration::from_secs(60);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a failed `node.ready` collection waits before it is tried again.
 const READY_RETRY: Duration = Duration::from_secs(1);
+
+/// With the `testing` feature, setting this variable makes the node send every message through
+/// one lane, as a link without lanes would, to measure what lanes are worth.
+#[cfg(feature = "testing")]
+pub const SINGLE_LANE_ENV: &str = "HAPPY_SUPERVISOR_SINGLE_LANE";
 
 /// Why [`run`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +79,13 @@ pub async fn run_until(
         installation_id,
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let (session, outbox) = Session::new(Role::Node(identity), clock.clone());
+    #[allow(unused_mut)]
+    let (mut session, outbox) = Session::new(Role::Node(identity), clock.clone());
+    #[cfg(feature = "testing")]
+    if std::env::var_os(SINGLE_LANE_ENV).is_some() {
+        tracing::warn!("{SINGLE_LANE_ENV} is set: sending through a single lane");
+        session.set_single_lane(true);
+    }
     let node = {
         let (state, outbox) = (state.clone(), outbox.clone());
         Arc::new(blocking(move || Node::open(state, outbox)).await?)
@@ -123,25 +135,57 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Runs every received message through `dispatch` and queues the replies. Messages start in
-/// arrival order (ID order) on this one task, and then run concurrently, so replies may come
-/// back in any order (api.md, Commands and replies).
-async fn serve(
-    node: Arc<Node>,
-    outbox: Outbox,
-    mut messages: mpsc::UnboundedReceiver<(MsgId, String, Value)>,
-) {
-    let mut running = FuturesUnordered::new();
+type Handler = Pin<Box<dyn Future<Output = Option<Lane>> + Send>>;
+type Received = (MsgId, String, Value);
+
+/// Runs every received message through `dispatch` and queues the replies. Each handler is a
+/// task of its own, so handlers run in parallel and replies may come back in any order (api.md,
+/// Commands and replies), except that the messages of one process, watch or stream are handled
+/// one at a time, in delivery order (api.md, Lanes).
+async fn serve(node: Arc<Node>, outbox: Outbox, mut messages: mpsc::UnboundedReceiver<Received>) {
+    let mut running: FuturesUnordered<Handler> = FuturesUnordered::new();
+    // Entities with a handler running, and their messages waiting behind it.
+    let mut busy: HashMap<Lane, VecDeque<Received>> = HashMap::new();
+    let start = |lane: Option<Lane>, (id, kind, body): Received| -> Handler {
+        let (node, outbox) = (node.clone(), outbox.clone());
+        let handler = tokio::spawn(async move {
+            if let Some(result) = dispatch(&node, &kind, body).await {
+                outbox.reply(id, result);
+            }
+        });
+        Box::pin(async move {
+            if let Err(err) = handler.await {
+                tracing::error!("a handler failed: {err}");
+            }
+            lane
+        })
+    };
     loop {
         tokio::select! {
             message = messages.recv() => {
-                let Some((id, kind, body)) = message else { return };
-                let node = node.clone();
-                running.push(async move { (id, dispatch(&node, &kind, body).await) });
+                let Some(message) = message else { return };
+                let lane = match lane_of(&message.1, &message.2) {
+                    lane @ (Lane::Exec(_) | Lane::Watch(_) | Lane::Stream(_)) => lane,
+                    Lane::Control | Lane::Own => {
+                        running.push(start(None, message));
+                        continue;
+                    }
+                };
+                match busy.get_mut(&lane) {
+                    Some(waiting) => waiting.push_back(message),
+                    None => {
+                        busy.insert(lane.clone(), VecDeque::new());
+                        running.push(start(Some(lane), message));
+                    }
+                }
             }
-            Some((id, result)) = running.next(), if !running.is_empty() => {
-                if let Some(result) = result {
-                    outbox.reply(id, result);
+            Some(lane) = running.next(), if !running.is_empty() => {
+                let Some(lane) = lane else { continue };
+                match busy.get_mut(&lane).and_then(VecDeque::pop_front) {
+                    Some(next) => running.push(start(Some(lane), next)),
+                    None => {
+                        busy.remove(&lane);
+                    }
                 }
             }
         }
@@ -153,7 +197,7 @@ struct Driver {
     session: Session,
     node: Arc<Node>,
     clock: Arc<dyn Clock>,
-    handlers: mpsc::UnboundedSender<(MsgId, String, Value)>,
+    handlers: mpsc::UnboundedSender<Received>,
     stop: watch::Receiver<bool>,
     /// The `node.ready` collection in progress, and the session it is for.
     ready: Option<(SessionId, tokio::task::JoinHandle<Result<Ready>>)>,
@@ -206,68 +250,39 @@ impl Driver {
             .await?
             .ok_or_else(|| Error::new(ErrorKind::Io, "the stored credentials are gone"))?;
         let endpoint = crate::enroll::check_url(&credentials.endpoint, "wss", "ws")?;
-        let mut request = endpoint
-            .as_str()
-            .into_client_request()
-            .map_err(|err| Error::invalid_params(format!("bad endpoint {endpoint}: {err}")))?;
-        let bearer = HeaderValue::from_str(&format!("Bearer {}", credentials.node_token))
-            .map_err(|_| Error::invalid_params("the node token is not a valid header value"))?;
-        request.headers_mut().insert(header::AUTHORIZATION, bearer);
-        request.headers_mut().insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_str(&Wire::OFFERED.join(", ")).expect("subprotocols are ASCII"),
-        );
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_FRAME_BYTES + 1))
-            .max_frame_size(Some(MAX_FRAME_BYTES + 1));
         let dial = tokio::time::timeout(
             DIAL_TIMEOUT,
-            tokio_tungstenite::connect_async_with_config(request, Some(config), true),
+            crate::ws::dial(&endpoint, &credentials.node_token),
         );
         let dialed = tokio::select! {
             dialed = dial => dialed,
             _ = self.stop.wait_for(|stopped| *stopped) => return Ok(Ended::Stopped),
         };
         let retry = Ok(Ended::Retry { up: Duration::ZERO });
-        let (socket, response) = match dialed {
+        let socket = match dialed {
             Err(_) => {
                 tracing::warn!("connecting to {endpoint} timed out");
                 return retry;
             }
-            Ok(Err(tungstenite::Error::Http(response)))
-                if matches!(
-                    response.status(),
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-                ) =>
-            {
-                tracing::error!(
-                    "{endpoint} refused this node's credential ({})",
-                    response.status()
-                );
+            Ok(Ok(Dialed::Refused(status))) => {
+                tracing::error!("{endpoint} refused this node's credential ({status})");
                 return Ok(Ended::Revoked);
             }
             Ok(Err(err)) => {
                 tracing::warn!("connecting to {endpoint} failed: {err}");
                 return retry;
             }
-            Ok(Ok(dialed)) => dialed,
+            Ok(Ok(Dialed::Open(socket))) => socket,
         };
-        let wire = response
-            .headers()
-            .get(header::SEC_WEBSOCKET_PROTOCOL)
-            .and_then(|v| v.to_str().ok())
-            .and_then(Wire::from_subprotocol);
-        let Some(wire) = wire else {
-            tracing::warn!("{endpoint} chose neither link subprotocol; closing");
-            let (mut sink, _) = socket.split();
-            let _ = sink.close().await;
-            return retry;
-        };
-        tracing::info!("connected to {endpoint} ({})", wire.subprotocol());
+        tracing::info!(
+            "connected to {endpoint} ({}; {})",
+            crate::ws::SUBPROTOCOL,
+            socket.extensions().unwrap_or("uncompressed")
+        );
 
         let opened = Instant::now();
-        self.session.connected(wire);
-        let ended = self.serve_connection(socket).await;
+        self.session.connected();
+        let ended = self.serve_connection(*socket).await;
         self.session.disconnected();
         Ok(match ended {
             Served::Revoked => Ended::Revoked,
@@ -278,52 +293,48 @@ impl Driver {
         })
     }
 
-    async fn serve_connection<S>(&mut self, socket: S) -> Served
-    where
-        S: futures_util::Stream<Item = tungstenite::Result<Message>>
-            + futures_util::Sink<Message, Error = tungstenite::Error>
-            + Unpin,
-    {
-        let (mut sink, mut stream) = socket.split();
+    /// Moves frames until the connection ends. One frame is written at a time, and the socket
+    /// is read while it is written, so neither side can block the other with a full buffer.
+    async fn serve_connection(&mut self, mut socket: Socket) -> Served {
         let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
+        let mut ping_due = false;
         let mut last_frame = Instant::now();
         let mut revoked = false;
         let mut stopping = false;
         loop {
-            // Drain until nothing moves: handling incoming can queue frames, and the reverse.
-            loop {
-                let mut moved = false;
-                while let Some(payload) = self.session.poll_transmit() {
-                    moved = true;
-                    if let Err(err) = sink.feed(Message::Binary(payload.into())).await {
+            while let Some(incoming) = self.session.poll_incoming() {
+                revoked |= self.handle(incoming);
+            }
+            if self.ready.is_none() && self.session.needs_ready() {
+                self.collect_ready(Duration::ZERO);
+            }
+            if socket.is_writable() {
+                let sent = if let Some(frame) = self.session.poll_transmit() {
+                    Some(socket.send(frame))
+                } else if ping_due {
+                    ping_due = false;
+                    Some(socket.ping())
+                } else {
+                    None
+                };
+                match sent {
+                    Some(Ok(())) => continue,
+                    Some(Err(err)) => {
                         tracing::warn!("writing to the control plane failed: {err}");
                         return Served::Closed;
                     }
+                    None if self.session.is_closing() => {
+                        socket.close().await;
+                        return if revoked {
+                            Served::Revoked
+                        } else if stopping {
+                            Served::Stopped
+                        } else {
+                            Served::Closed
+                        };
+                    }
+                    None => {}
                 }
-                while let Some(incoming) = self.session.poll_incoming() {
-                    moved = true;
-                    revoked |= self.handle(incoming);
-                }
-                if self.ready.is_none() && self.session.needs_ready() {
-                    self.collect_ready(Duration::ZERO);
-                }
-                if !moved {
-                    break;
-                }
-            }
-            if let Err(err) = sink.flush().await {
-                tracing::warn!("writing to the control plane failed: {err}");
-                return Served::Closed;
-            }
-            if self.session.is_closing() {
-                let _ = sink.close().await;
-                return if revoked {
-                    Served::Revoked
-                } else if stopping {
-                    Served::Stopped
-                } else {
-                    Served::Closed
-                };
             }
 
             let deadline = self.session.deadline().map(|at| {
@@ -338,7 +349,7 @@ impl Driver {
                 }
             };
             let wake = tokio::select! {
-                frame = stream.next() => Wake::Frame(frame),
+                event = socket.next() => Wake::Socket(event),
                 _ = self.session.changed() => Wake::Changed,
                 _ = sleep_until(deadline) => Wake::Tick,
                 _ = ping.tick() => Wake::Ping,
@@ -347,26 +358,22 @@ impl Driver {
                 _ = self.stop.wait_for(|stopped| *stopped), if !stopping => Wake::Stop,
             };
             match wake {
-                Wake::Frame(frame) => {
+                Wake::Socket(Ok(Event::Writable)) => {}
+                Wake::Socket(Ok(event)) => {
                     last_frame = Instant::now();
-                    match frame {
-                        Some(Ok(Message::Binary(payload))) => self.session.receive(&payload),
-                        Some(Ok(Message::Text(_))) => self.session.reject("a text frame"),
-                        Some(Ok(Message::Close(_))) | None => return Served::Closed,
-                        Some(Ok(_)) => {}
-                        Some(Err(err)) => {
-                            tracing::warn!("reading from the control plane failed: {err}");
-                            return Served::Closed;
-                        }
+                    match event {
+                        Event::Binary(payload) => self.session.receive(&payload),
+                        Event::Text => self.session.reject("a text frame"),
+                        Event::Writable | Event::Control => {}
                     }
+                }
+                Wake::Socket(Err(err)) => {
+                    tracing::warn!("the connection to the control plane ended: {err}");
+                    return Served::Closed;
                 }
                 Wake::Changed => {}
                 Wake::Tick => self.session.tick(),
-                Wake::Ping => {
-                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        return Served::Closed;
-                    }
-                }
+                Wake::Ping => ping_due = true,
                 Wake::Dead => {
                     tracing::warn!(
                         "no frame from the control plane for {} s; redialing",
@@ -464,7 +471,7 @@ enum Served {
 
 /// What woke the connection loop.
 enum Wake {
-    Frame(Option<tungstenite::Result<Message>>),
+    Socket(std::result::Result<Event, yawc::WebSocketError>),
     Changed,
     Tick,
     Ping,

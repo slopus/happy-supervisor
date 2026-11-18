@@ -8,28 +8,32 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::serve::{IncomingStream, Listener};
 use axum::{Json, Router};
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::link::{Clock, Incoming, Outbox, Role, Session, SystemClock};
 use crate::protocol::{
-    ByeReason, Event, Frame, JoinError, JoinRequest, JoinResponse, MAX_FRAME_BYTES, MsgId,
-    NodeInfo, ProxyMessage, SessionId, TcpMessage, Value,
+    ByeReason, Event, Frame, JoinError, JoinRequest, JoinResponse, MsgId, NodeInfo, ProxyMessage,
+    SessionId, TcpMessage, Value,
 };
-use crate::wire::{Wire, from_cbor};
+use crate::wire::from_cbor;
+use crate::ws::{SUBPROTOCOL, Socket};
 
 const JOIN_PATH: &str = "/api/nodes/join";
 const CONNECT_PATH: &str = "/nodes/connect";
@@ -49,8 +53,8 @@ pub struct ControlPlane {
 /// How the control plane is set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
-    /// Select `happy-supervisor.v1.deflate` when the node offers it. Otherwise
-    /// `happy-supervisor.v1`.
+    /// Accept the node's permessage-deflate offer. A control plane that declines it is refused
+    /// by the node (api.md, Compression); `false` exists to test that.
     pub deflate: bool,
     /// The `resumeWindowMs` of `welcome`.
     pub resume_window_ms: u64,
@@ -76,21 +80,14 @@ pub struct JoinRecord {
     pub node_token: String,
 }
 
-/// Frames in one direction since the control plane started: their count, their size on the
-/// wire, and their size as CBOR before compression.
+/// Frames in one direction since the control plane started: their count, their bytes as frames
+/// (ID and CBOR body, before compression), and the bytes their WebSocket connections carried
+/// over TCP, upgrade requests and WebSocket framing included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Traffic {
     pub frames: u64,
+    pub frame_bytes: u64,
     pub wire_bytes: u64,
-    pub cbor_bytes: u64,
-}
-
-impl Traffic {
-    fn add(&mut self, wire: Wire, payload: &[u8]) {
-        self.frames += 1;
-        self.wire_bytes += payload.len() as u64;
-        self.cbor_bytes += wire.decode(payload).map_or(0, |cbor| cbor.len() as u64);
-    }
 }
 
 struct Shared {
@@ -99,10 +96,16 @@ struct Shared {
     join_tokens: Mutex<HashSet<String>>,
     joins: Mutex<Vec<JoinRecord>>,
     revoked: Mutex<HashSet<String>>,
-    received: Mutex<Traffic>,
-    sent: Mutex<Traffic>,
+    /// Frames and their bytes, by direction. Wire bytes come from `meters`.
+    received: Mutex<(u64, u64)>,
+    sent: Mutex<(u64, u64)>,
+    /// The TCP byte counts of every WebSocket connection so far.
+    meters: Mutex<Vec<Meter>>,
+    /// The node's last `Sec-WebSocket-Extensions` offer, and this side's answer.
+    offered: Mutex<Option<String>>,
+    accepted: Mutex<Option<String>>,
     stray_replies: AtomicUsize,
-    sockets: mpsc::UnboundedSender<(WebSocket, Wire)>,
+    sockets: mpsc::UnboundedSender<Box<Socket>>,
 }
 
 enum Control {
@@ -126,8 +129,9 @@ impl ControlPlane {
     }
 
     pub async fn start_with(options: Options) -> Result<ControlPlane> {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
+        let listener = Metered(listener);
         let (sockets_tx, sockets_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             port: addr.port(),
@@ -137,6 +141,9 @@ impl ControlPlane {
             revoked: Mutex::default(),
             received: Mutex::default(),
             sent: Mutex::default(),
+            meters: Mutex::default(),
+            offered: Mutex::default(),
+            accepted: Mutex::default(),
             stray_replies: AtomicUsize::new(0),
             sockets: sockets_tx,
         });
@@ -145,6 +152,7 @@ impl ControlPlane {
             .route(CONNECT_PATH, get(connect))
             .with_state(shared.clone());
         let server = tokio::spawn(async move {
+            let app = app.into_make_service_with_connect_info::<Meter>();
             if let Err(err) = axum::serve(listener, app).await {
                 tracing::error!("the test control plane stopped serving: {err}");
             }
@@ -272,12 +280,41 @@ impl ControlPlane {
 
     /// Frames received from the node.
     pub fn received(&self) -> Traffic {
-        *lock(&self.shared.received)
+        let (frames, frame_bytes) = *lock(&self.shared.received);
+        let wire_bytes = lock(&self.shared.meters)
+            .iter()
+            .map(|m| m.0.read.load(Ordering::SeqCst))
+            .sum();
+        Traffic {
+            frames,
+            frame_bytes,
+            wire_bytes,
+        }
     }
 
     /// Frames sent to the node.
     pub fn sent(&self) -> Traffic {
-        *lock(&self.shared.sent)
+        let (frames, frame_bytes) = *lock(&self.shared.sent);
+        let wire_bytes = lock(&self.shared.meters)
+            .iter()
+            .map(|m| m.0.written.load(Ordering::SeqCst))
+            .sum();
+        Traffic {
+            frames,
+            frame_bytes,
+            wire_bytes,
+        }
+    }
+
+    /// The `Sec-WebSocket-Extensions` the node offered on its last upgrade.
+    pub fn offered_extensions(&self) -> Option<String> {
+        lock(&self.shared.offered).clone()
+    }
+
+    /// The `Sec-WebSocket-Extensions` this side answered on the last upgrade, `None` when it
+    /// declined compression.
+    pub fn accepted_extensions(&self) -> Option<String> {
+        lock(&self.shared.accepted).clone()
     }
 
     /// Replies whose `to` was no command waiting for one: a command the node handled twice, or
@@ -339,8 +376,9 @@ async fn join(
 
 async fn connect(
     State(shared): State<Arc<Shared>>,
+    ConnectInfo(meter): ConnectInfo<Meter>,
     headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
+    upgrade: yawc::IncomingUpgrade,
 ) -> Response {
     let token = headers
         .get(header::AUTHORIZATION)
@@ -353,23 +391,143 @@ async fn connect(
     if !known {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let offered: &[&str] = if shared.options.deflate {
-        &Wire::OFFERED
-    } else {
-        &[crate::wire::SUBPROTOCOL_PLAIN]
-    };
-    let upgrade = upgrade
-        .protocols(offered.iter().copied())
-        .max_message_size(MAX_FRAME_BYTES + 1)
-        .max_frame_size(MAX_FRAME_BYTES + 1);
-    let wire = upgrade
-        .selected_protocol()
+    let offers_link = headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
-        .and_then(Wire::from_subprotocol)
-        .unwrap_or(Wire::Plain);
-    upgrade.on_upgrade(move |socket| async move {
-        let _ = shared.sockets.send((socket, wire));
-    })
+        .is_some_and(|v| v.split(',').any(|p| p.trim() == SUBPROTOCOL));
+    if !offers_link {
+        return (StatusCode::BAD_REQUEST, "offer happy-supervisor.v1").into_response();
+    }
+    *lock(&shared.offered) = headers
+        .get(header::SEC_WEBSOCKET_EXTENSIONS)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let (mut response, upgraded) = match upgrade.upgrade(crate::ws::options(shared.options.deflate))
+    {
+        Ok(upgrade) => upgrade,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    response.headers_mut().insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static(SUBPROTOCOL),
+    );
+    let extensions = response
+        .headers()
+        .get(header::SEC_WEBSOCKET_EXTENSIONS)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    *lock(&shared.accepted) = extensions.clone();
+    tokio::spawn(async move {
+        match upgraded.await {
+            Ok(ws) => {
+                lock(&shared.meters).push(meter);
+                let _ = shared.sockets.send(Box::new(Socket::new(ws, extensions)));
+            }
+            Err(err) => tracing::warn!("the test control plane's upgrade failed: {err}"),
+        }
+    });
+    response.map(axum::body::Body::new)
+}
+
+/// A TCP listener whose connections count the bytes they carry.
+struct Metered(TcpListener);
+
+#[derive(Default)]
+struct Counters {
+    read: AtomicU64,
+    written: AtomicU64,
+}
+
+/// One connection's byte counts, handed to handlers as its connect info.
+#[derive(Clone)]
+struct Meter(Arc<Counters>);
+
+struct MeteredStream {
+    io: TcpStream,
+    meter: Meter,
+}
+
+impl Listener for Metered {
+    type Io = MeteredStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (MeteredStream, SocketAddr) {
+        loop {
+            match self.0.accept().await {
+                Ok((io, addr)) => {
+                    let _ = io.set_nodelay(true);
+                    let meter = Meter(Arc::default());
+                    return (MeteredStream { io, meter }, addr);
+                }
+                Err(err) => {
+                    tracing::warn!("the test control plane failed to accept: {err}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+}
+
+impl Connected<IncomingStream<'_, Metered>> for Meter {
+    fn connect_info(stream: IncomingStream<'_, Metered>) -> Meter {
+        stream.io().meter.clone()
+    }
+}
+
+impl AsyncRead for MeteredStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.io).poll_read(cx, buf);
+        let read = (buf.filled().len() - before) as u64;
+        self.meter.0.read.fetch_add(read, Ordering::SeqCst);
+        polled
+    }
+}
+
+impl AsyncWrite for MeteredStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.io).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = polled {
+            self.meter.0.written.fetch_add(n as u64, Ordering::SeqCst);
+        }
+        polled
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.io).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = polled {
+            self.meter.0.written.fetch_add(n as u64, Ordering::SeqCst);
+        }
+        polled
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 /// Owns the session and the current WebSocket. Runs until the control plane is dropped.
@@ -378,23 +536,21 @@ struct Actor {
     session: Session,
     outbox: Outbox,
     clock: Arc<dyn Clock>,
-    socket: Option<Socket>,
+    socket: Option<Connection>,
     stall_acks: bool,
     pending: HashMap<MsgId, oneshot::Sender<Result<Value>>>,
     events: mpsc::UnboundedSender<Event>,
     opened: watch::Sender<Option<SessionId>>,
 }
 
-struct Socket {
-    sink: SplitSink<WebSocket, Message>,
-    stream: SplitStream<WebSocket>,
-    wire: Wire,
+struct Connection {
+    socket: Socket,
     last_frame: Instant,
 }
 
 enum Wake {
-    Socket(Option<(WebSocket, Wire)>),
-    Frame(Option<std::result::Result<Message, axum::Error>>),
+    Socket(Option<Box<Socket>>),
+    Event(std::result::Result<crate::ws::Event, yawc::WebSocketError>),
     Control(Option<Control>),
     Changed,
     Tick,
@@ -405,27 +561,65 @@ enum Wake {
 impl Actor {
     async fn run(
         mut self,
-        mut sockets: mpsc::UnboundedReceiver<(WebSocket, Wire)>,
+        mut sockets: mpsc::UnboundedReceiver<Box<Socket>>,
         mut control: mpsc::UnboundedReceiver<Control>,
     ) {
         let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
+        let mut ping_due = false;
         loop {
-            self.drain().await;
+            while let Some(incoming) = self.session.poll_incoming() {
+                self.incoming(incoming);
+            }
+            match &mut self.socket {
+                // Nothing reaches a peer while there is no connection.
+                None => while self.session.poll_transmit().is_some() {},
+                Some(conn) if conn.socket.is_writable() => {
+                    if let Some(frame) = self.session.poll_transmit() {
+                        if self.stall_acks && is_ack(&frame) {
+                            continue;
+                        }
+                        let mut sent = lock(&self.shared.sent);
+                        sent.0 += 1;
+                        sent.1 += frame.len() as u64;
+                        drop(sent);
+                        if conn.socket.send(frame).is_err() {
+                            self.disconnect();
+                        }
+                        continue;
+                    }
+                    if ping_due {
+                        ping_due = false;
+                        if conn.socket.ping().is_err() {
+                            self.disconnect();
+                        }
+                        continue;
+                    }
+                    if self.session.is_closing() {
+                        if let Some(conn) = self.socket.take() {
+                            conn.socket.close().await;
+                        }
+                        self.session.disconnected();
+                        continue;
+                    }
+                }
+                Some(_) => {}
+            }
+
             let deadline = self.session.deadline().map(|at| {
                 let wait = at.saturating_sub(self.clock.now_ms());
                 Instant::now() + Duration::from_millis(wait)
             });
-            let last_frame = self.socket.as_ref().map(|s| s.last_frame);
+            let last_frame = self.socket.as_ref().map(|c| c.last_frame);
             let socket = &mut self.socket;
-            let frame = async {
+            let event = async {
                 match socket {
-                    Some(socket) => socket.stream.next().await,
+                    Some(conn) => conn.socket.next().await,
                     None => std::future::pending().await,
                 }
             };
             let wake = tokio::select! {
                 socket = sockets.recv() => Wake::Socket(socket),
-                frame = frame => Wake::Frame(frame),
+                event = event => Wake::Event(event),
                 c = control.recv() => Wake::Control(c),
                 _ = self.session.changed() => Wake::Changed,
                 _ = sleep_until(deadline) => Wake::Tick,
@@ -434,89 +628,44 @@ impl Actor {
             };
             match wake {
                 Wake::Socket(None) | Wake::Control(None) => return,
-                Wake::Socket(Some((ws, wire))) => {
+                Wake::Socket(Some(socket)) => {
                     self.disconnect();
-                    let (sink, stream) = ws.split();
-                    self.socket = Some(Socket {
-                        sink,
-                        stream,
-                        wire,
+                    self.socket = Some(Connection {
+                        socket: *socket,
                         last_frame: Instant::now(),
                     });
-                    self.session.connected(wire);
+                    self.session.connected();
                 }
-                Wake::Frame(frame) => self.frame(frame),
+                Wake::Event(event) => self.event(event),
                 Wake::Control(Some(c)) => self.control(c),
                 Wake::Changed => {}
                 Wake::Tick => self.session.tick(),
-                Wake::Ping => {
-                    if let Some(socket) = &mut self.socket
-                        && socket
-                            .sink
-                            .send(Message::Ping(Vec::new().into()))
-                            .await
-                            .is_err()
-                    {
-                        self.disconnect();
-                    }
-                }
+                Wake::Ping => ping_due = self.socket.is_some(),
                 Wake::Dead => self.disconnect(),
             }
         }
     }
 
-    /// Writes what the session has to send and routes what it delivered, until nothing moves.
-    async fn drain(&mut self) {
-        loop {
-            let mut moved = false;
-            while let Some(payload) = self.session.poll_transmit() {
-                moved = true;
-                let Some(socket) = &mut self.socket else {
-                    continue;
-                };
-                let wire = socket.wire;
-                if self.stall_acks && is_ack(wire, &payload) {
-                    continue;
-                }
-                lock(&self.shared.sent).add(wire, &payload);
-                if socket
-                    .sink
-                    .send(Message::Binary(payload.into()))
-                    .await
-                    .is_err()
-                {
-                    self.disconnect();
-                }
-            }
-            while let Some(incoming) = self.session.poll_incoming() {
-                moved = true;
-                self.incoming(incoming);
-            }
-            if !moved {
-                break;
-            }
-        }
-        if self.socket.is_some() && self.session.is_closing() {
-            if let Some(mut socket) = self.socket.take() {
-                let _ = socket.sink.close().await;
-            }
-            self.session.disconnected();
-        }
-    }
-
-    fn frame(&mut self, frame: Option<std::result::Result<Message, axum::Error>>) {
-        let Some(socket) = &mut self.socket else {
+    fn event(&mut self, event: std::result::Result<crate::ws::Event, yawc::WebSocketError>) {
+        use crate::ws::Event;
+        let Some(conn) = &mut self.socket else {
             return;
         };
-        socket.last_frame = Instant::now();
-        match frame {
-            Some(Ok(Message::Binary(payload))) => {
-                lock(&self.shared.received).add(socket.wire, &payload);
+        match event {
+            Ok(Event::Writable) => return,
+            Err(_) => return self.disconnect(),
+            Ok(_) => conn.last_frame = Instant::now(),
+        }
+        match event {
+            Ok(Event::Binary(payload)) => {
+                let mut received = lock(&self.shared.received);
+                received.0 += 1;
+                received.1 += payload.len() as u64;
+                drop(received);
                 self.session.receive(&payload);
             }
-            Some(Ok(Message::Text(_))) => self.session.reject("a text frame"),
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => self.disconnect(),
-            Some(Ok(_)) => {}
+            Ok(Event::Text) => self.session.reject("a text frame"),
+            _ => {}
         }
     }
 
@@ -585,10 +734,10 @@ impl Actor {
     }
 }
 
-fn is_ack(wire: Wire, payload: &[u8]) -> bool {
-    wire.decode(payload)
+fn is_ack(frame: &[u8]) -> bool {
+    crate::wire::split(frame)
         .ok()
-        .and_then(|cbor| from_cbor::<Frame>(&cbor).ok())
+        .and_then(|(_, body)| from_cbor::<Frame>(body).ok())
         .is_some_and(|frame| matches!(frame, Frame::Ack(_)))
 }
 

@@ -15,7 +15,14 @@ use crate::error::Error;
 pub use crate::policy::Policy;
 pub use crate::wire::Value;
 
-pub const MAX_FRAME_BYTES: usize = 32 << 20;
+/// The largest WebSocket message, after decompression (api.md, Limits).
+pub const MAX_FRAME_BYTES: usize = 1 << 20;
+/// The most of a message's CBOR body one `part` carries, and the largest body sent as one `msg`.
+pub const MAX_PART_BYTES: usize = 64 << 10;
+/// The largest reassembled message.
+pub const MAX_MESSAGE_BYTES: usize = 32 << 20;
+/// The incomplete messages a receiver holds per session.
+pub const MAX_PARTIAL_BYTES: usize = 64 << 20;
 pub const MAX_FS_DATA_BYTES: usize = 16 << 20;
 pub const MAX_EXEC_WRITE_BYTES: usize = 1 << 20;
 pub const MAX_OUTPUT_CHUNK_BYTES: usize = 64 << 10;
@@ -112,13 +119,14 @@ uuid_type!(
     SessionId
 );
 
-/// One WebSocket text frame.
+/// The body of one frame (api.md, Frame layout). The frame ID is the prefix before it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum Frame {
     Hello(Hello),
     Welcome(Welcome),
     Msg(Msg),
+    Part(Part),
     Ack(Ack),
     Bye(Bye),
 }
@@ -145,9 +153,9 @@ pub struct Welcome {
     pub resume_window_ms: u64,
 }
 
+/// A message. Its ID is the frame's.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Msg {
-    pub id: MsgId,
     pub kind: String,
     #[serde(default = "null")]
     pub body: Value,
@@ -155,6 +163,16 @@ pub struct Msg {
 
 fn null() -> Value {
     Value::Null
+}
+
+/// One piece of a message whose body is over [`MAX_PART_BYTES`] (api.md, Lanes).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Part {
+    /// The ID of the message's first part, which is the message's ID.
+    pub of: MsgId,
+    pub last: bool,
+    /// The next piece of the `msg` frame's CBOR body.
+    pub data: Bytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +275,14 @@ impl Event {
             return None;
         }
         Some(crate::wire::from_value(tagged(kind, body)))
+    }
+
+    /// Whether `kind` is an event, which gets no reply. Every other kind is a command, and one
+    /// the receiver does not know gets `unknown_kind`.
+    pub fn is_event(kind: &str) -> bool {
+        Event::KINDS.contains(&kind)
+            || ProxyMessage::KINDS.contains(&kind)
+            || TcpMessage::KINDS.contains(&kind)
     }
 }
 
@@ -1831,14 +1857,23 @@ mod tests {
             })
         );
         let msg: Frame = round_trip(
-            json!({ "t": "msg", "id": u(ID_A), "kind": "exec.start", "body": { "execId": "build-1" } }),
+            json!({ "t": "msg", "kind": "exec.start", "body": { "execId": "build-1" } }),
         );
         assert_eq!(
             msg,
             Frame::Msg(Msg {
-                id: MsgId(id(ID_A)),
                 kind: "exec.start".to_string(),
                 body: cbor(json!({ "execId": "build-1" })),
+            })
+        );
+        let part: Frame =
+            round_trip(json!({ "t": "part", "of": u(ID_A), "last": false, "data": "h'a3'" }));
+        assert_eq!(
+            part,
+            Frame::Part(Part {
+                of: MsgId(id(ID_A)),
+                last: false,
+                data: Bytes(vec![0xa3]),
             })
         );
         let ack: Frame = round_trip(json!({ "t": "ack", "cursor": u(ID_A) }));

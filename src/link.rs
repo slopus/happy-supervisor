@@ -2,12 +2,12 @@
 //!
 //! A [`Session`] holds no socket and starts no task. Its driver (the node's `client`, or the test
 //! control plane) owns the WebSocket and feeds the session what happens to it:
-//! [`connected`](Session::connected) with the negotiated [`Wire`],
-//! [`receive`](Session::receive) for each binary frame,
+//! [`connected`](Session::connected), [`receive`](Session::receive) for each binary message,
 //! [`disconnected`](Session::disconnected), and [`tick`](Session::tick) at
-//! [`deadline`](Session::deadline). After each call it drains
-//! [`poll_transmit`](Session::poll_transmit) into the socket and
-//! [`poll_incoming`](Session::poll_incoming) into its handlers, and closes the socket once
+//! [`deadline`](Session::deadline). Whenever the socket can take a frame and
+//! [`wants_transmit`](Session::wants_transmit) is set, it writes one
+//! [`poll_transmit`](Session::poll_transmit), and it drains
+//! [`poll_incoming`](Session::poll_incoming) into its handlers. It closes the socket once
 //! [`is_closing`](Session::is_closing) is set and nothing is left to transmit. It also waits on
 //! [`changed`](Session::changed), which fires after each [`Outbox`] call.
 //!
@@ -15,13 +15,13 @@
 //! node has one. The control plane has one per node. [`Role`] is the only difference.
 //!
 //! Sending goes through [`Outbox`], a cloneable handle that exec, watch and the driver use from
-//! any task. Each message gets its UUIDv7 and its CBOR frame when it is queued, and the same
-//! bytes are resent after a reconnect. Compression, when the connection uses it, is applied per
-//! transmission.
+//! any task. A message waits in its lane ([`Lane`]) until the scheduler picks it, and gets its
+//! frame ID only then, as it is written. A body over 64 KiB goes as a run of parts. Written data
+//! frames are kept, byte for byte, until confirmed, and resent first after a resume.
 //!
-//! Messages queued while no session is live wait in the queue and go out once one is. On the
-//! node a new session goes live only after [`Session::ready`], whose `node.ready` takes an ID
-//! reserved before anything else was queued, so it is always the session's first message.
+//! Messages queued while no session is live wait in their lanes and go out once one is. On the
+//! node a new session goes live only after [`Session::ready`], whose `node.ready` goes to the
+//! front of the control lane, so it is always the session's first message.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,12 +32,16 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ACK_DELAY_MS, ACK_EVERY_MSGS, Ack, Bye, ByeReason, Bytes, Change, DROPPABLE_QUEUE_BYTES,
-    ExecExit, ExecId, ExecOutput, ExecSummary, ExecTimedOut, ExitStatus, Frame, Hello, MsgId,
-    NodeInfo, NodeReady, Outcome, ProxyMessage, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply, SessionId,
-    Stream, TcpMessage, TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
+    ACK_DELAY_MS, ACK_EVERY_MSGS, Ack, Bye, ByeReason, Bytes, Change, DROPPABLE_QUEUE_BYTES, Event,
+    ExecExit, ExecId, ExecOutput, ExecSummary, ExecTimedOut, ExitStatus, Frame, Hello,
+    MAX_MESSAGE_BYTES, MAX_PART_BYTES, MAX_PARTIAL_BYTES, MsgId, NodeInfo, NodeReady, Outcome,
+    Part, ProxyMessage, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply, SessionId, Stream, TcpMessage,
+    TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
 };
-use crate::wire::{Value, Wire, from_cbor, from_value, to_cbor};
+use crate::wire::{Value, from_cbor, from_value, msg_head, to_cbor, to_value};
+
+/// The deficit round robin quantum: what each busy lane may write per round.
+pub const QUANTUM_BYTES: usize = 64 << 10;
 
 /// Milliseconds since the Unix epoch. Message IDs carry it, and every timer reads it.
 pub trait Clock: Send + Sync {
@@ -89,13 +93,17 @@ pub struct NodeIdentity {
     pub installation_id: String,
 }
 
-/// Queue budgets (api.md, Event delivery).
+/// Queue budgets (api.md, Event delivery) and reassembly bounds (api.md, Lanes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// For `exec.output` and `watch.event` changes. Past it they are dropped and accounted.
     pub droppable_bytes: usize,
     /// For everything else. Past it the session is lost with `queue_overflow`.
     pub retained_bytes: usize,
+    /// The largest message reassembled from parts. Past it is a protocol error.
+    pub message_bytes: usize,
+    /// Incomplete messages held. Past it the session is lost with `queue_overflow`.
+    pub partial_bytes: usize,
 }
 
 impl Default for Limits {
@@ -103,7 +111,62 @@ impl Default for Limits {
         Limits {
             droppable_bytes: DROPPABLE_QUEUE_BYTES,
             retained_bytes: RETAINED_QUEUE_BYTES,
+            message_bytes: MAX_MESSAGE_BYTES,
+            partial_bytes: MAX_PARTIAL_BYTES,
         }
+    }
+}
+
+/// The lane a message travels in (api.md, Lanes). Messages of one lane are written in order.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// `node.*` commands, their replies, and `node.ready`. Written before every other lane.
+    Control,
+    Exec(String),
+    Watch(String),
+    Stream(Uuid),
+    /// A lane of its own: `msg:<id>` for a command without an entity, `reply:<commandId>` for
+    /// its reply.
+    Own,
+}
+
+impl std::fmt::Display for Lane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Lane::Control => f.write_str("control"),
+            Lane::Exec(id) => write!(f, "exec:{id}"),
+            Lane::Watch(id) => write!(f, "watch:{id}"),
+            Lane::Stream(id) => write!(f, "stream:{id}"),
+            Lane::Own => f.write_str("own"),
+        }
+    }
+}
+
+/// The lane of a message that is not a reply, from its kind and its (text-keyed) body. A reply
+/// travels in its command's lane, or in one of its own.
+pub fn lane_of(kind: &str, body: &Value) -> Lane {
+    let field = |name: &str| {
+        body.as_map()?
+            .iter()
+            .find(|(key, _)| key.as_text() == Some(name))
+            .map(|(_, value)| value)
+    };
+    let family = kind.split('.').next().unwrap_or_default();
+    match family {
+        "node" => Lane::Control,
+        "exec" => match field("execId") {
+            Some(Value::Text(id)) => Lane::Exec(id.clone()),
+            _ => Lane::Own,
+        },
+        "watch" => match field("watchId") {
+            Some(Value::Text(id)) => Lane::Watch(id.clone()),
+            _ => Lane::Own,
+        },
+        "proxy" | "tcp" => match field("streamId") {
+            Some(Value::Bytes(id)) => Uuid::from_slice(id).map_or(Lane::Own, Lane::Stream),
+            _ => Lane::Own,
+        },
+        _ => Lane::Own,
     }
 }
 
@@ -117,16 +180,15 @@ pub enum Incoming {
         resumed: bool,
         hello: Option<Hello>,
     },
-    /// A message to handle: a command, or an event. Delivered once per session, in ID order.
+    /// A message to handle: a command, or an event. Delivered once per session, when it is
+    /// complete. Messages of one lane are delivered in order.
     Message {
         id: MsgId,
         kind: String,
         body: Value,
     },
-    Reply {
-        to: MsgId,
-        result: Result<Value>,
-    },
+    /// The reply to a command; `to` is the ID [`Outbox::command`] returned.
+    Reply { to: MsgId, result: Result<Value> },
     /// The session cannot be recovered. Its queue was discarded, and commands it carried will
     /// never be answered.
     Lost {
@@ -145,7 +207,8 @@ pub enum LostReason {
     PeerBye(Bye),
     /// This side sent `bye`.
     SentBye(ByeReason),
-    /// Messages that must not be dropped passed [`Limits::retained_bytes`].
+    /// Messages that must not be dropped passed [`Limits::retained_bytes`], or incomplete
+    /// messages from the peer passed [`Limits::partial_bytes`].
     QueueOverflow,
     /// The peer sent something invalid. This side sent `bye` with `protocol_error`.
     ProtocolError(String),
@@ -223,11 +286,39 @@ enum Class {
     Overflow(WatchId),
 }
 
-struct Queued {
-    id: MsgId,
-    /// The CBOR frame. Budgets count its length.
-    cbor: Vec<u8>,
+/// A message waiting in its lane.
+struct Outgoing {
+    /// The `msg` frame's CBOR body. Budgets count its length.
+    body: Vec<u8>,
     class: Class,
+    /// How much of `body` went out as parts, and the ID of the first part.
+    written: usize,
+    of: Option<MsgId>,
+    /// For a command, the ID [`Outbox::command`] returned, which its reply is delivered under.
+    ticket: Option<MsgId>,
+}
+
+/// The key of a lane queue. Every [`Lane::Own`] message gets a key of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LaneKey {
+    Entity(Lane),
+    Own(u64),
+    /// Every message, in the order queued ([`Session::set_single_lane`]).
+    Single,
+}
+
+#[derive(Default)]
+struct LaneQueue {
+    messages: VecDeque<Outgoing>,
+    deficit: usize,
+}
+
+/// A written data frame, kept until the peer confirms it.
+struct Kept {
+    id: MsgId,
+    frame: Vec<u8>,
+    /// The budget this frame's share of its message releases once confirmed.
+    release: (Class, usize),
 }
 
 struct State {
@@ -238,35 +329,46 @@ struct State {
     limits: Limits,
     ids: IdGen,
     conn: Conn,
-    wire: Wire,
     closing: bool,
 
     session: Option<SessionId>,
-    /// Queued messages may be transmitted. On the node, only after `node.ready` is queued.
+    /// Lanes may be written. On the node, only after `node.ready` is queued.
     live: bool,
-    /// The node's reserved `node.ready` ID while a new session is not yet live.
-    ready_id: Option<MsgId>,
     /// The node's last lost session, for `node.ready`.
     previous: Option<SessionId>,
 
-    queue: VecDeque<Queued>,
-    /// `queue[..sent]` was written on the current connection.
-    sent: usize,
+    control_lane: VecDeque<Outgoing>,
+    lanes: HashMap<LaneKey, LaneQueue>,
+    /// The lanes with queued messages, in round robin order.
+    ring: VecDeque<LaneKey>,
+    next_own: u64,
+    single_lane: bool,
+    /// Written data frames not yet confirmed, in ID order.
+    kept: VecDeque<Kept>,
+    /// `kept[..resent]` was written on the current connection.
+    resent: usize,
     droppable_bytes: usize,
     retained_bytes: usize,
     dropped: HashMap<(ExecId, Stream), u64>,
-    /// Watches whose overflow marker is queued and not yet transmitted.
+    /// Watches whose overflow marker is queued and not yet written.
     overflowed: HashSet<WatchId>,
+    /// Written commands: message ID to the ID their reply is delivered under.
+    commands: HashMap<MsgId, MsgId>,
+    /// Received commands not yet replied to, and their lanes.
+    reply_lanes: HashMap<MsgId, Lane>,
 
-    /// The latest message received from the peer in this session.
+    /// The latest data frame received from the peer in this session.
     cursor: Option<MsgId>,
     /// The cursor last told to the peer, by `ack` or handshake.
     acked: Option<MsgId>,
     unacked: u32,
     unacked_since: Option<u64>,
     duplicate: bool,
+    /// Messages arriving as parts, by the ID of their first part.
+    partials: HashMap<MsgId, Vec<u8>>,
+    partial_bytes: usize,
 
-    /// Handshake, ack and bye frames, as CBOR, sent before queued messages.
+    /// Handshake, ack and bye bodies, written before any lane. They get their IDs as written.
     control: VecDeque<Vec<u8>>,
     incoming: VecDeque<Incoming>,
 }
@@ -288,32 +390,37 @@ impl Session {
             Role::Node(identity) => (Some(identity), None),
             Role::ControlPlane { resume_window_ms } => (None, Some(resume_window_ms)),
         };
-        let mut ids = IdGen::new(seed);
-        let ready_id = node.as_ref().map(|_| MsgId(ids.next(clock.now_ms())));
         let state = State {
             now: 0,
             node,
             resume_window_ms,
             limits,
-            ids,
+            ids: IdGen::new(seed),
             conn: Conn::Down { since: None },
-            wire: Wire::Plain,
             closing: false,
             session: None,
             live: false,
-            ready_id,
             previous: None,
-            queue: VecDeque::new(),
-            sent: 0,
+            control_lane: VecDeque::new(),
+            lanes: HashMap::new(),
+            ring: VecDeque::new(),
+            next_own: 0,
+            single_lane: false,
+            kept: VecDeque::new(),
+            resent: 0,
             droppable_bytes: 0,
             retained_bytes: 0,
             dropped: HashMap::new(),
             overflowed: HashSet::new(),
+            commands: HashMap::new(),
+            reply_lanes: HashMap::new(),
             cursor: None,
             acked: None,
             unacked: 0,
             unacked_since: None,
             duplicate: false,
+            partials: HashMap::new(),
+            partial_bytes: 0,
             control: VecDeque::new(),
             incoming: VecDeque::new(),
         };
@@ -336,15 +443,20 @@ impl Session {
         }
     }
 
-    /// A WebSocket is up, speaking `wire`. The node queues its `hello`; the control plane waits
-    /// for one.
-    pub fn connected(&mut self, wire: Wire) {
+    /// Puts every message, control lane included, into one lane in the order queued, as a link
+    /// without lanes would. For measuring what lanes are worth; messages already queued keep
+    /// their lanes.
+    pub fn set_single_lane(&mut self, single: bool) {
+        self.shared.lock().single_lane = single;
+    }
+
+    /// A WebSocket is up. The node queues its `hello`; the control plane waits for one.
+    pub fn connected(&mut self) {
         let mut s = self.shared.lock();
         let now = s.now;
         s.expire(now);
         s.conn = Conn::Handshake;
-        s.wire = wire;
-        s.sent = 0;
+        s.resent = 0;
         s.closing = false;
         s.control.clear();
         if let Some(node) = s.node.clone() {
@@ -364,20 +476,27 @@ impl Session {
         let mut s = self.shared.lock();
         let since = s.session.map(|_| s.now);
         s.conn = Conn::Down { since };
-        s.sent = 0;
+        s.resent = 0;
         s.closing = false;
         s.control.clear();
     }
 
-    /// Feeds the payload of one received binary frame.
+    /// Feeds one received binary message: a frame ID, then the body. A data frame at or below
+    /// the cursor is a resent duplicate and is dropped without decoding its body.
     pub fn receive(&mut self, payload: &[u8]) {
         let mut s = self.shared.lock();
-        let frame = s
-            .wire
-            .decode(payload)
-            .and_then(|cbor| from_cbor::<Frame>(&cbor));
-        match frame {
-            Ok(frame) => s.receive(frame),
+        let (id, body) = match crate::wire::split(payload) {
+            Ok((id, body)) => (MsgId(id), body),
+            Err(err) => return s.protocol_error(format!("bad frame: {err}")),
+        };
+        if matches!(s.conn, Conn::Open) && s.cursor.is_some_and(|cursor| id <= cursor) {
+            s.duplicate = true;
+            let now = s.now;
+            s.unacked_since.get_or_insert(now);
+            return;
+        }
+        match from_cbor::<Frame>(body) {
+            Ok(frame) => s.receive(id, frame),
             Err(err) => s.protocol_error(format!("bad frame: {err}")),
         }
     }
@@ -412,24 +531,38 @@ impl Session {
         [ack, expiry].into_iter().flatten().min()
     }
 
-    /// The payload of the next binary frame to write on the current connection.
+    /// [`poll_transmit`](Session::poll_transmit) has a frame.
+    pub fn wants_transmit(&self) -> bool {
+        let s = self.shared.lock();
+        !s.control.is_empty()
+            || (s.writable()
+                && (s.resent < s.kept.len() || !s.control_lane.is_empty() || !s.ring.is_empty()))
+    }
+
+    /// The next frame to write on the current connection, chosen now: a handshake, ack or bye
+    /// frame, then a kept frame to resend, then the control lane, then the other lanes in deficit
+    /// round robin. Call it when the socket can take a frame, not ahead of time.
     pub fn poll_transmit(&mut self) -> Option<Vec<u8>> {
         let mut s = self.shared.lock();
-        let wire = s.wire;
-        if let Some(frame) = s.control.pop_front() {
-            return Some(wire.encode(&frame));
+        if let Some(body) = s.control.pop_front() {
+            let id = s.next_id();
+            return Some(crate::wire::frame(id.0, &body));
         }
-        if !s.transmittable() {
+        if !s.writable() {
             return None;
         }
-        let index = s.sent;
-        s.sent += 1;
-        let queued = &s.queue[index];
-        let payload = wire.encode(&queued.cbor);
-        if let Class::Overflow(watch_id) = queued.class.clone() {
-            s.overflowed.remove(&watch_id);
+        if s.resent < s.kept.len() {
+            s.resent += 1;
+            return Some(s.kept[s.resent - 1].frame.clone());
         }
-        Some(payload)
+        if let Some(out) = s.control_lane.pop_front() {
+            let (frame, rest) = s.write(out);
+            if let Some(rest) = rest {
+                s.control_lane.push_front(rest);
+            }
+            return Some(frame);
+        }
+        s.write_lanes()
     }
 
     pub fn poll_incoming(&mut self) -> Option<Incoming> {
@@ -457,7 +590,7 @@ impl Session {
         s.node.is_some() && s.session.is_some() && !s.live
     }
 
-    /// Queues `node.ready` as the new session's first message and lets the queue flow.
+    /// Queues `node.ready` as the new session's first message and lets the lanes flow.
     pub fn ready(
         &mut self,
         info: NodeInfo,
@@ -465,28 +598,31 @@ impl Session {
         watches: Vec<WatchId>,
     ) -> Result<()> {
         let mut s = self.shared.lock();
-        let (true, Some(id)) = (
-            s.node.is_some() && s.session.is_some() && !s.live,
-            s.ready_id,
-        ) else {
+        if !(s.node.is_some() && s.session.is_some() && !s.live) {
             return Err(Error::invalid_params(
                 "no new session is waiting for node.ready",
             ));
-        };
+        }
         let body = NodeReady {
             info,
             previous_session: s.previous,
             execs,
             watches,
         };
-        let cbor = msg_cbor(id, "node.ready", &to_cbor(&body));
-        s.retained_bytes += cbor.len();
-        s.queue.push_front(Queued {
-            id,
-            cbor,
+        let body = msg_body("node.ready", &to_cbor(&body));
+        s.retained_bytes += body.len();
+        let ready = Outgoing {
+            body,
             class: Class::Retained,
-        });
-        s.ready_id = None;
+            written: 0,
+            of: None,
+            ticket: None,
+        };
+        if s.single_lane {
+            s.push(LaneKey::Single, ready, true);
+        } else {
+            s.control_lane.push_front(ready);
+        }
         s.live = true;
         s.check_retained();
         Ok(())
@@ -522,18 +658,32 @@ impl Outbox {
         }
     }
 
-    /// Queues a command. Its reply arrives as [`Incoming::Reply`] with this ID in `to`.
+    /// Queues a command in the lane [`lane_of`] gives it. Its reply arrives as
+    /// [`Incoming::Reply`] with the returned ID in `to`.
     pub fn command<T: Serialize + ?Sized>(&self, kind: &str, body: &T) -> MsgId {
-        self.lock().enqueue(kind, body, Class::Retained)
+        let body = to_value(body);
+        let lane = lane_of(kind, &body);
+        let body = msg_body(kind, &to_cbor(&body));
+        let mut s = self.lock();
+        let ticket = s.next_id();
+        s.enqueue(lane, body, Class::Retained, Some(ticket));
+        ticket
     }
 
-    /// Queues the reply to the command `to`.
+    /// Queues the reply to the received command `to`, in that command's lane, or in a lane of
+    /// its own. A command of a lost session gets no reply.
     pub fn reply(&self, to: MsgId, result: Result<Value>) {
         let reply = Reply {
             to,
             outcome: Outcome::from(result),
         };
-        self.lock().enqueue(REPLY_KIND, &reply, Class::Retained);
+        let body = msg_body(REPLY_KIND, &to_cbor(&reply));
+        let mut s = self.lock();
+        let Some(lane) = s.reply_lanes.remove(&to) else {
+            tracing::debug!(%to, "dropped the reply to a command of a lost session");
+            return;
+        };
+        s.enqueue(lane, body, Class::Retained, None);
     }
 
     /// Queues one chunk of output, at most
@@ -551,7 +701,8 @@ impl Outbox {
         let body = to_cbor(&output);
         if s.fits_droppable("exec.output", &body) {
             s.dropped.remove(&key);
-            s.enqueue_cbor("exec.output", &body, Class::Droppable);
+            let lane = Lane::Exec(key.0.to_string());
+            s.enqueue(lane, msg_body("exec.output", &body), Class::Droppable, None);
         } else {
             *s.dropped.entry(key).or_default() += output.data.0.len() as u64;
         }
@@ -562,30 +713,42 @@ impl Outbox {
     pub fn exec_timed_out(&self, exec_id: ExecId, action: TimeoutAction, log_bytes: u64) {
         let mut s = self.lock();
         s.flush_dropped(&exec_id);
+        let lane = Lane::Exec(exec_id.to_string());
         let event = ExecTimedOut {
             exec_id,
             action,
             log_bytes,
         };
-        s.enqueue("exec.timedOut", &event, Class::Retained);
+        s.enqueue(
+            lane,
+            msg_body("exec.timedOut", &to_cbor(&event)),
+            Class::Retained,
+            None,
+        );
     }
 
     /// Queues a process's exit, after a chunk carrying any dropped output count.
     pub fn exec_exit(&self, exec_id: ExecId, exit: ExitStatus, log_bytes: u64) {
         let mut s = self.lock();
         s.flush_dropped(&exec_id);
+        let lane = Lane::Exec(exec_id.to_string());
         let event = ExecExit {
             exec_id,
             exit,
             log_bytes,
         };
-        s.enqueue("exec.exit", &event, Class::Retained);
+        s.enqueue(
+            lane,
+            msg_body("exec.exit", &to_cbor(&event)),
+            Class::Retained,
+            None,
+        );
     }
 
     /// Queues a batch of at most
     /// [`MAX_CHANGES_PER_EVENT`](crate::protocol::MAX_CHANGES_PER_EVENT) changes. If the
     /// droppable budget is full, `overflow: true` is queued instead. Until that marker is
-    /// transmitted, further changes of the watch are discarded, since the rescan it asks for
+    /// written, further changes of the watch are discarded, since the rescan it asks for
     /// covers them.
     pub fn watch_changes(&self, watch_id: WatchId, changes: Vec<Change>) {
         let mut s = self.lock();
@@ -598,7 +761,8 @@ impl Outbox {
         };
         let body = to_cbor(&event);
         if s.fits_droppable("watch.event", &body) {
-            s.enqueue_cbor("watch.event", &body, Class::Droppable);
+            let lane = Lane::Watch(event.watch_id.to_string());
+            s.enqueue(lane, msg_body("watch.event", &body), Class::Droppable, None);
         } else {
             s.overflow(event.watch_id);
         }
@@ -612,57 +776,151 @@ impl Outbox {
         }
     }
 
-    /// Queues a `tcp.*` stream message (tunnels.md). Never dropped, like proxy messages.
+    /// Queues a `tcp.*` stream message (tunnels.md) in its stream's lane. Never dropped, like
+    /// proxy messages.
     pub fn tcp(&self, message: TcpMessage) {
         let kind = message.kind();
-        let mut s = self.lock();
-        match &message {
-            TcpMessage::Data(body) => s.enqueue(kind, body, Class::Retained),
-            TcpMessage::End(body) => s.enqueue(kind, body, Class::Retained),
-            TcpMessage::Reset(body) => s.enqueue(kind, body, Class::Retained),
-            TcpMessage::Credit(body) => s.enqueue(kind, body, Class::Retained),
+        let lane = Lane::Stream(message.stream_id().0);
+        let body = match &message {
+            TcpMessage::Data(body) => to_cbor(body),
+            TcpMessage::End(body) => to_cbor(body),
+            TcpMessage::Reset(body) => to_cbor(body),
+            TcpMessage::Credit(body) => to_cbor(body),
         };
+        let body = msg_body(kind, &body);
+        self.lock().enqueue(lane, body, Class::Retained, None);
     }
 
-    /// Queues a `proxy.*` stream message (proxy.md). Never dropped: the stream's flow-control
-    /// window, not the queue, bounds how much is in flight.
+    /// Queues a `proxy.*` stream message (proxy.md) in its stream's lane. Never dropped: the
+    /// stream's flow-control window, not the queue, bounds how much is in flight.
     pub fn proxy(&self, message: ProxyMessage) {
         let kind = message.kind();
-        let mut s = self.lock();
-        match &message {
-            ProxyMessage::Request(body) => s.enqueue(kind, body, Class::Retained),
-            ProxyMessage::Response(body) => s.enqueue(kind, body, Class::Retained),
-            ProxyMessage::Body(body) => s.enqueue(kind, body, Class::Retained),
-            ProxyMessage::End(body) => s.enqueue(kind, body, Class::Retained),
-            ProxyMessage::Reset(body) => s.enqueue(kind, body, Class::Retained),
-            ProxyMessage::Credit(body) => s.enqueue(kind, body, Class::Retained),
+        let lane = Lane::Stream(message.stream_id().0);
+        let body = match &message {
+            ProxyMessage::Request(body) => to_cbor(body),
+            ProxyMessage::Response(body) => to_cbor(body),
+            ProxyMessage::Body(body) => to_cbor(body),
+            ProxyMessage::End(body) => to_cbor(body),
+            ProxyMessage::Reset(body) => to_cbor(body),
+            ProxyMessage::Credit(body) => to_cbor(body),
         };
+        let body = msg_body(kind, &body);
+        self.lock().enqueue(lane, body, Class::Retained, None);
     }
 }
 
 impl State {
-    fn transmittable(&self) -> bool {
-        matches!(self.conn, Conn::Open)
-            && self.live
-            && !self.closing
-            && self.sent < self.queue.len()
+    fn next_id(&mut self) -> MsgId {
+        MsgId(self.ids.next(self.now))
+    }
+
+    /// Lanes and kept frames may be written.
+    fn writable(&self) -> bool {
+        matches!(self.conn, Conn::Open) && self.live && !self.closing
     }
 
     fn handshake_sent(&mut self, frame: Frame) {
-        self.control.push_back(frame_cbor(&frame));
+        self.control.push_back(to_cbor(&frame));
         self.acked = self.cursor;
         self.unacked = 0;
         self.unacked_since = None;
         self.duplicate = false;
     }
 
-    fn receive(&mut self, frame: Frame) {
+    /// Writes the next frame of `out`: the whole message, or its next part. Returns the frame,
+    /// and what is left of `out` to write.
+    fn write(&mut self, mut out: Outgoing) -> (Vec<u8>, Option<Outgoing>) {
+        let id = self.next_id();
+        let total = out.body.len();
+        let first = out.of.is_none();
+        let start = out.written;
+        let (frame, done) = if first && total <= MAX_PART_BYTES {
+            out.written = total;
+            (crate::wire::frame(id.0, &out.body), true)
+        } else {
+            let of = *out.of.get_or_insert(id);
+            let end = (start + MAX_PART_BYTES).min(total);
+            let part = Frame::Part(Part {
+                of,
+                last: end == total,
+                data: Bytes(out.body[start..end].to_vec()),
+            });
+            out.written = end;
+            (crate::wire::frame(id.0, &to_cbor(&part)), end == total)
+        };
+        if first {
+            if let Some(ticket) = out.ticket {
+                self.commands.insert(id, ticket);
+            }
+            if let Class::Overflow(watch_id) = &out.class {
+                self.overflowed.remove(watch_id);
+            }
+        }
+        self.kept.push_back(Kept {
+            id,
+            frame: frame.clone(),
+            release: (out.class.clone(), out.written - start),
+        });
+        self.resent = self.kept.len();
+        (frame, (!done).then_some(out))
+    }
+
+    /// The next frame from the lanes, in deficit round robin.
+    fn write_lanes(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let key = self.ring.front()?.clone();
+            let lane = self.lanes.get_mut(&key).expect("ring lanes are queued");
+            let front = lane.messages.front().expect("queued lanes are not empty");
+            let cost = (front.body.len() - front.written).min(MAX_PART_BYTES);
+            if lane.deficit < cost {
+                lane.deficit += QUANTUM_BYTES;
+                self.ring.rotate_left(1);
+                continue;
+            }
+            lane.deficit -= cost;
+            let out = lane.messages.pop_front().expect("checked");
+            let (frame, rest) = self.write(out);
+            let lane = self.lanes.get_mut(&key).expect("still queued");
+            if let Some(rest) = rest {
+                lane.messages.push_front(rest);
+            }
+            if lane.messages.is_empty() {
+                self.lanes.remove(&key);
+                self.ring.pop_front();
+            }
+            return Some(frame);
+        }
+    }
+
+    fn push(&mut self, key: LaneKey, out: Outgoing, front: bool) {
+        let ring = &mut self.ring;
+        let lane = self.lanes.entry(key.clone()).or_insert_with(|| {
+            ring.push_back(key);
+            LaneQueue::default()
+        });
+        if front {
+            lane.messages.push_front(out);
+        } else {
+            lane.messages.push_back(out);
+        }
+    }
+
+    fn receive(&mut self, id: MsgId, frame: Frame) {
         match (&self.conn, frame) {
             (Conn::Handshake, Frame::Hello(hello)) if self.node.is_none() => self.on_hello(hello),
             (Conn::Handshake, Frame::Welcome(welcome)) if self.node.is_some() => {
                 self.on_welcome(welcome)
             }
-            (Conn::Open, Frame::Msg(msg)) => self.on_msg(msg.id, msg.kind, msg.body),
+            (Conn::Open, Frame::Msg(msg)) => {
+                self.accepted(id);
+                self.deliver(id, msg.kind, msg.body);
+                self.ack_if_due();
+            }
+            (Conn::Open, Frame::Part(part)) => {
+                self.accepted(id);
+                self.on_part(id, part);
+                self.ack_if_due();
+            }
             (Conn::Open, Frame::Ack(Ack { cursor })) => self.confirmed(Some(cursor)),
             (Conn::Handshake | Conn::Open, Frame::Bye(bye)) => {
                 self.lose(LostReason::PeerBye(bye), None);
@@ -674,6 +932,7 @@ impl State {
                     Frame::Hello(_) => "hello",
                     Frame::Welcome(_) => "welcome",
                     Frame::Msg(_) => "msg",
+                    Frame::Part(_) => "part",
                     Frame::Ack(_) => "ack",
                     Frame::Bye(_) => "bye",
                 };
@@ -696,7 +955,7 @@ impl State {
         }
         let session = self.session.expect("set above");
         self.conn = Conn::Open;
-        self.sent = 0;
+        self.resent = 0;
         let welcome = Frame::Welcome(Welcome {
             session,
             resumed,
@@ -730,7 +989,7 @@ impl State {
             self.acked = None;
         }
         self.conn = Conn::Open;
-        self.sent = 0;
+        self.resent = 0;
         self.incoming.push_back(Incoming::Opened {
             session: welcome.session,
             resumed: welcome.resumed,
@@ -738,43 +997,92 @@ impl State {
         });
     }
 
-    fn on_msg(&mut self, id: MsgId, kind: String, body: Value) {
-        if self.cursor.is_some_and(|cursor| id <= cursor) {
-            self.duplicate = true;
-            self.unacked_since.get_or_insert(self.now);
-            return;
-        }
-        let incoming = if kind == REPLY_KIND {
-            match from_value::<Reply>(body) {
-                Ok(reply) => Incoming::Reply {
-                    to: reply.to,
-                    result: reply.outcome.into(),
-                },
-                Err(err) => return self.protocol_error(format!("bad reply: {err}")),
-            }
-        } else {
-            Incoming::Message { id, kind, body }
-        };
+    /// A data frame above the cursor arrived.
+    fn accepted(&mut self, id: MsgId) {
         self.cursor = Some(id);
         self.unacked += 1;
         self.unacked_since.get_or_insert(self.now);
-        self.incoming.push_back(incoming);
+    }
+
+    fn ack_if_due(&mut self) {
         if self.unacked >= ACK_EVERY_MSGS {
             self.ack_now();
         }
     }
 
+    fn on_part(&mut self, id: MsgId, part: Part) {
+        let partial = if part.of == id {
+            self.partials.entry(part.of).or_default()
+        } else {
+            match self.partials.get_mut(&part.of) {
+                Some(partial) => partial,
+                None => {
+                    return self.protocol_error(format!(
+                        "a part of message {}, whose first part never came",
+                        part.of
+                    ));
+                }
+            }
+        };
+        if partial.len() + part.data.0.len() > self.limits.message_bytes {
+            return self.protocol_error(format!(
+                "message {} is over {} bytes",
+                part.of, self.limits.message_bytes
+            ));
+        }
+        partial.extend_from_slice(&part.data.0);
+        self.partial_bytes += part.data.0.len();
+        if self.partial_bytes > self.limits.partial_bytes {
+            let bye = Bye {
+                reason: ByeReason::QueueOverflow,
+                message: Some(format!(
+                    "over {} bytes of incomplete messages",
+                    self.limits.partial_bytes
+                )),
+            };
+            return self.lose(LostReason::QueueOverflow, Some(bye));
+        }
+        if !part.last {
+            return;
+        }
+        let body = self.partials.remove(&part.of).expect("appended above");
+        self.partial_bytes -= body.len();
+        match from_cbor::<Frame>(&body) {
+            Ok(Frame::Msg(msg)) => self.deliver(part.of, msg.kind, msg.body),
+            Ok(_) => self.protocol_error(format!("message {} is not a `msg`", part.of)),
+            Err(err) => self.protocol_error(format!("bad message {}: {err}", part.of)),
+        }
+    }
+
+    fn deliver(&mut self, id: MsgId, kind: String, body: Value) {
+        let incoming = if kind == REPLY_KIND {
+            match from_value::<Reply>(body) {
+                Ok(reply) => Incoming::Reply {
+                    to: self.commands.remove(&reply.to).unwrap_or(reply.to),
+                    result: reply.outcome.into(),
+                },
+                Err(err) => return self.protocol_error(format!("bad reply: {err}")),
+            }
+        } else {
+            if !Event::is_event(&kind) {
+                self.reply_lanes.insert(id, lane_of(&kind, &body));
+            }
+            Incoming::Message { id, kind, body }
+        };
+        self.incoming.push_back(incoming);
+    }
+
     /// The peer confirmed everything up to `cursor`.
     fn confirmed(&mut self, cursor: Option<MsgId>) {
         let Some(cursor) = cursor else { return };
-        while self.queue.front().is_some_and(|q| q.id <= cursor) {
-            let queued = self.queue.pop_front().expect("checked");
-            self.sent = self.sent.saturating_sub(1);
-            match queued.class {
-                Class::Droppable => self.droppable_bytes -= queued.cbor.len(),
-                Class::Retained => self.retained_bytes -= queued.cbor.len(),
-                Class::Overflow(watch_id) => {
-                    self.retained_bytes -= queued.cbor.len();
+        while self.kept.front().is_some_and(|k| k.id <= cursor) {
+            let kept = self.kept.pop_front().expect("checked");
+            self.resent = self.resent.saturating_sub(1);
+            match kept.release {
+                (Class::Droppable, len) => self.droppable_bytes -= len,
+                (Class::Retained, len) => self.retained_bytes -= len,
+                (Class::Overflow(watch_id), len) => {
+                    self.retained_bytes -= len;
                     self.overflowed.remove(&watch_id);
                 }
             }
@@ -788,8 +1096,7 @@ impl State {
         if let Some(cursor) = self.cursor
             && (self.acked != Some(cursor) || self.duplicate)
         {
-            self.control
-                .push_back(frame_cbor(&Frame::Ack(Ack { cursor })));
+            self.control.push_back(to_cbor(&Frame::Ack(Ack { cursor })));
             self.acked = Some(cursor);
         }
         self.unacked = 0;
@@ -815,29 +1122,33 @@ impl State {
         self.lose(LostReason::ProtocolError(message), Some(bye));
     }
 
-    /// Discards the session and its queue. With `bye`, tells the peer and closes.
+    /// Discards the session, its lanes and kept frames. With `bye`, tells the peer and closes.
     fn lose(&mut self, reason: LostReason, bye: Option<Bye>) {
         if let Some(bye) = bye
             && !matches!(self.conn, Conn::Down { .. })
         {
-            self.control.push_back(frame_cbor(&Frame::Bye(bye)));
+            self.control.push_back(to_cbor(&Frame::Bye(bye)));
             self.closing = true;
         }
-        self.queue.clear();
-        self.sent = 0;
+        self.control_lane.clear();
+        self.lanes.clear();
+        self.ring.clear();
+        self.kept.clear();
+        self.resent = 0;
         self.droppable_bytes = 0;
         self.retained_bytes = 0;
         self.dropped.clear();
         self.overflowed.clear();
+        self.commands.clear();
+        self.reply_lanes.clear();
+        self.partials.clear();
+        self.partial_bytes = 0;
         self.cursor = None;
         self.acked = None;
         self.unacked = 0;
         self.unacked_since = None;
         self.duplicate = false;
         self.live = false;
-        if self.node.is_some() {
-            self.ready_id = Some(MsgId(self.ids.next(self.now)));
-        }
         if let Some(session) = self.session.take() {
             if self.node.is_some() {
                 self.previous = Some(session);
@@ -847,23 +1158,36 @@ impl State {
     }
 
     fn fits_droppable(&self, kind: &str, body: &[u8]) -> bool {
-        self.droppable_bytes + msg_cbor_len(kind, body) <= self.limits.droppable_bytes
+        self.droppable_bytes + msg_head(kind).len() + body.len() <= self.limits.droppable_bytes
     }
 
-    fn enqueue<T: Serialize + ?Sized>(&mut self, kind: &str, body: &T, class: Class) -> MsgId {
-        self.enqueue_cbor(kind, &to_cbor(body), class)
-    }
-
-    fn enqueue_cbor(&mut self, kind: &str, body: &[u8], class: Class) -> MsgId {
-        let id = MsgId(self.ids.next(self.now));
-        let cbor = msg_cbor(id, kind, body);
+    /// Queues the `msg` body `body` in `lane`.
+    fn enqueue(&mut self, lane: Lane, body: Vec<u8>, class: Class, ticket: Option<MsgId>) {
         match class {
-            Class::Droppable => self.droppable_bytes += cbor.len(),
-            Class::Retained | Class::Overflow(_) => self.retained_bytes += cbor.len(),
+            Class::Droppable => self.droppable_bytes += body.len(),
+            Class::Retained | Class::Overflow(_) => self.retained_bytes += body.len(),
         }
-        self.queue.push_back(Queued { id, cbor, class });
+        let out = Outgoing {
+            body,
+            class,
+            written: 0,
+            of: None,
+            ticket,
+        };
+        let key = match lane {
+            _ if self.single_lane => LaneKey::Single,
+            Lane::Control => {
+                self.control_lane.push_back(out);
+                return self.check_retained();
+            }
+            Lane::Own => {
+                self.next_own += 1;
+                LaneKey::Own(self.next_own)
+            }
+            entity => LaneKey::Entity(entity),
+        };
+        self.push(key, out, false);
         self.check_retained();
-        id
     }
 
     fn check_retained(&mut self) {
@@ -885,7 +1209,13 @@ impl State {
                     data: Bytes::default(),
                     dropped_bytes,
                 };
-                self.enqueue("exec.output", &output, Class::Retained);
+                let lane = Lane::Exec(exec_id.to_string());
+                self.enqueue(
+                    lane,
+                    msg_body("exec.output", &to_cbor(&output)),
+                    Class::Retained,
+                    None,
+                );
             }
         }
     }
@@ -896,28 +1226,21 @@ impl State {
             body: WatchEventBody::Overflow { overflow: True },
         };
         self.overflowed.insert(watch_id.clone());
-        self.enqueue("watch.event", &event, Class::Overflow(watch_id));
+        let lane = Lane::Watch(watch_id.to_string());
+        self.enqueue(
+            lane,
+            msg_body("watch.event", &to_cbor(&event)),
+            Class::Overflow(watch_id),
+            None,
+        );
     }
 }
 
-fn frame_cbor(frame: &Frame) -> Vec<u8> {
-    to_cbor(frame)
-}
-
-fn msg_prefix(id: MsgId, kind: &str) -> Vec<u8> {
-    crate::wire::msg_prefix(&id, kind)
-}
-
-fn msg_cbor(id: MsgId, kind: &str, body: &[u8]) -> Vec<u8> {
-    let mut out = msg_prefix(id, kind);
+/// A `msg` frame's body: `kind`, then `body`, already encoded.
+fn msg_body(kind: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = msg_head(kind);
     out.extend_from_slice(body);
     out
-}
-
-/// The length `msg_cbor` will produce, before an ID is spent on a message that may not fit.
-/// Every ID encodes to the same 17 bytes.
-fn msg_cbor_len(kind: &str, body: &[u8]) -> usize {
-    msg_prefix(MsgId(Uuid::nil()), kind).len() + body.len()
 }
 
 /// UUIDv7 generation with the RFC 9562 monotonic random method: within one millisecond, or when
@@ -982,12 +1305,15 @@ fn random_bits(uuid: u128) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use serde_json::{Value as Json, json};
 
     use super::*;
     use crate::error::ErrorKind;
     use crate::protocol::{ChangeKind, ExecState, ProxyBody, ProxyEnd, StreamId};
     use crate::testkit::cbor;
+    use crate::wire::split;
 
     const T0: u64 = 1_763_496_000_000;
     const S1: &str = "0193a3b4-0000-7000-8000-000000000001";
@@ -996,6 +1322,10 @@ mod tests {
 
     fn sid(text: &str) -> SessionId {
         SessionId(Uuid::parse_str(text).unwrap())
+    }
+
+    fn mid(text: &str) -> MsgId {
+        MsgId(Uuid::parse_str(text).unwrap())
     }
 
     fn exec(id: &str) -> ExecId {
@@ -1020,14 +1350,17 @@ mod tests {
         .unwrap()
     }
 
-    fn node_session(limits: Limits) -> (Session, Outbox, Arc<ManualClock>) {
-        let clock = ManualClock::new(T0);
-        let identity = NodeIdentity {
+    fn identity() -> NodeIdentity {
+        NodeIdentity {
             node_id: "n_1".to_string(),
             installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
-        };
+        }
+    }
+
+    fn node_session(limits: Limits) -> (Session, Outbox, Arc<ManualClock>) {
+        let clock = ManualClock::new(T0);
         let (session, outbox) =
-            Session::with_options(Role::Node(identity), clock.clone(), limits, 7);
+            Session::with_options(Role::Node(identity()), clock.clone(), limits, 7);
         (session, outbox, clock)
     }
 
@@ -1036,9 +1369,20 @@ mod tests {
         format!("u'{id}'")
     }
 
-    /// The CBOR frame a JSON test literal stands for.
-    fn frame(literal: Json) -> Vec<u8> {
-        to_cbor(&cbor(literal))
+    /// A frame ID above every earlier one, for frames the test plays the peer of.
+    fn peer_id() -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        format!("0193a3b5-0000-7000-8000-{n:012x}")
+    }
+
+    /// The frame with ID `id` and the body a JSON test literal stands for.
+    fn frame_with(id: &str, body: Json) -> Vec<u8> {
+        crate::wire::frame(Uuid::parse_str(id).unwrap(), &to_cbor(&cbor(body)))
+    }
+
+    fn frame(body: Json) -> Vec<u8> {
+        frame_with(&peer_id(), body)
     }
 
     /// The node's `hello`; an absent session or cursor is omitted, as on the wire.
@@ -1060,14 +1404,31 @@ mod tests {
         )
     }
 
+    /// A frame as its JSON test literal, with the prefix shown as `id`.
     fn literal(payload: &[u8]) -> Json {
-        crate::testkit::json(from_cbor(payload).unwrap())
+        let (id, body) = split(payload).unwrap();
+        let mut json = crate::testkit::json(from_cbor(body).unwrap());
+        json["id"] = json!(u(&id.to_string()));
+        json
+    }
+
+    /// The literal without its `id`, for frames whose ID the test does not know.
+    fn bare_literal(payload: &[u8]) -> Json {
+        let mut json = literal(payload);
+        json.as_object_mut().unwrap().remove("id");
+        json
+    }
+
+    fn drain_raw(session: &mut Session) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| session.poll_transmit()).collect()
     }
 
     fn drain(session: &mut Session) -> Vec<Json> {
-        std::iter::from_fn(|| session.poll_transmit())
-            .map(|payload| literal(&payload))
-            .collect()
+        drain_raw(session).iter().map(|p| literal(p)).collect()
+    }
+
+    fn drain_bare(session: &mut Session) -> Vec<Json> {
+        drain_raw(session).iter().map(|p| bare_literal(p)).collect()
     }
 
     fn incoming(session: &mut Session) -> Vec<Incoming> {
@@ -1099,7 +1460,7 @@ mod tests {
     /// A node in session S1 with `node.ready` sent and confirmed.
     fn open_node(limits: Limits) -> (Session, Outbox, Arc<ManualClock>) {
         let (mut session, outbox, clock) = node_session(limits);
-        session.connected(Wire::Plain);
+        session.connected();
         session.receive(&welcome(S1, false, None));
         session.ready(info(), vec![], vec![]).unwrap();
         let frames = drain(&mut session);
@@ -1108,11 +1469,90 @@ mod tests {
         (session, outbox, clock)
     }
 
+    /// The node receives the command `kind` with ID `id`, so it can reply.
+    fn command_at(session: &mut Session, id: &str, kind: &str, body: Json) {
+        session.receive(&frame_with(
+            id,
+            json!({ "t": "msg", "kind": kind, "body": body }),
+        ));
+        assert!(matches!(incoming(session)[..], [Incoming::Message { .. }]));
+    }
+
+    /// A node and a control plane, both open in one session with `node.ready` delivered.
+    fn pair() -> (Session, Outbox, Session, Outbox, Arc<ManualClock>) {
+        let clock = ManualClock::new(T0);
+        let (mut node, node_out) =
+            Session::with_options(Role::Node(identity()), clock.clone(), Limits::default(), 1);
+        let role = Role::ControlPlane {
+            resume_window_ms: 1000,
+        };
+        let (mut cp, cp_out) = Session::with_options(role, clock.clone(), Limits::default(), 2);
+        node.connected();
+        cp.connected();
+        pump(&mut node, &mut cp);
+        node.ready(info(), vec![], vec![]).unwrap();
+        pump(&mut node, &mut cp);
+        incoming(&mut node);
+        incoming(&mut cp);
+        (node, node_out, cp, cp_out, clock)
+    }
+
+    fn pump(node: &mut Session, cp: &mut Session) {
+        loop {
+            let mut moved = false;
+            while let Some(frame) = node.poll_transmit() {
+                cp.receive(&frame);
+                moved = true;
+            }
+            while let Some(frame) = cp.poll_transmit() {
+                node.receive(&frame);
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn lanes_come_from_the_kind_and_the_entity() {
+        let stream = "0193a3b4-0000-7000-8000-0000000000aa";
+        let rows = [
+            ("node.info", json!({}), "control"),
+            ("node.update", json!({ "endpoint": "wss://x" }), "control"),
+            ("node.ready", json!({}), "control"),
+            ("exec.start", json!({ "execId": "build-1" }), "exec:build-1"),
+            ("exec.write", json!({ "execId": "build-1" }), "exec:build-1"),
+            ("exec.output", json!({ "execId": "b" }), "exec:b"),
+            ("exec.log", json!({ "execId": "b" }), "exec:b"),
+            ("exec.list", json!({}), "own"),
+            ("watch.start", json!({ "watchId": "w-1" }), "watch:w-1"),
+            ("watch.event", json!({ "watchId": "w-1" }), "watch:w-1"),
+            (
+                "proxy.body",
+                json!({ "streamId": u(stream) }),
+                "stream:0193a3b4-0000-7000-8000-0000000000aa",
+            ),
+            (
+                "tcp.open",
+                json!({ "streamId": u(stream) }),
+                "stream:0193a3b4-0000-7000-8000-0000000000aa",
+            ),
+            ("tcp.data", json!({ "streamId": "h'00'" }), "own"),
+            ("fs.read", json!({ "path": "/a" }), "own"),
+            ("fs.write", json!({ "path": "/a" }), "own"),
+            ("future.kind", json!({ "execId": "b" }), "own"),
+        ];
+        for (kind, body, lane) in rows {
+            assert_eq!(lane_of(kind, &cbor(body)).to_string(), lane, "{kind}");
+        }
+    }
+
     #[test]
     fn a_new_session_opens_with_hello_and_node_ready_comes_first() {
         let (mut session, outbox, _clock) = node_session(Limits::default());
-        session.connected(Wire::Plain);
-        assert_eq!(drain(&mut session), [hello(None, None)]);
+        session.connected();
+        assert_eq!(drain_bare(&mut session), [hello(None, None)]);
         outbox.exec_exit(exec("early"), ExitStatus::Exited { code: 0 }, 5);
         assert_eq!(drain(&mut session), [] as [Json; 0]);
 
@@ -1126,6 +1566,7 @@ mod tests {
             }]
         );
         assert!(session.needs_ready());
+        assert!(!session.wants_transmit());
         assert_eq!(drain(&mut session), [] as [Json; 0]);
 
         let execs = vec![ExecSummary {
@@ -1137,6 +1578,7 @@ mod tests {
         }];
         session.ready(info(), execs, vec![watch("w-1")]).unwrap();
         assert!(!session.needs_ready());
+        assert!(session.wants_transmit());
         let frames = drain(&mut session);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["kind"], "node.ready");
@@ -1158,12 +1600,33 @@ mod tests {
     }
 
     #[test]
+    fn frames_get_their_ids_as_they_are_written() {
+        let (mut session, outbox, clock) = open_node(Limits::default());
+        outbox.exec_exit(exec("a"), ExitStatus::Exited { code: 0 }, 1);
+        clock.advance(5000);
+        outbox.exec_exit(exec("b"), ExitStatus::Exited { code: 0 }, 1);
+        clock.advance(5000);
+        let frames = drain(&mut session);
+        let stamp = |f: &Json| {
+            Uuid::parse_str(&id_of(f))
+                .unwrap()
+                .get_timestamp()
+                .unwrap()
+                .to_unix()
+                .0
+        };
+        assert_eq!(stamp(&frames[0]), (T0 + 10_000) / 1000);
+        assert_eq!(stamp(&frames[1]), (T0 + 10_000) / 1000);
+        assert!(id_of(&frames[0]) < id_of(&frames[1]));
+    }
+
+    #[test]
     fn resume_resends_exactly_the_unconfirmed_tail() {
         let (mut session, outbox, _clock) = open_node(Limits::default());
         for id in ["e1", "e2", "e3"] {
             outbox.exec_exit(exec(id), ExitStatus::Exited { code: 0 }, 1);
         }
-        let payloads: Vec<Vec<u8>> = std::iter::from_fn(|| session.poll_transmit()).collect();
+        let payloads = drain_raw(&mut session);
         let ids: Vec<String> = payloads.iter().map(|p| id_of(&literal(p))).collect();
         session.receive(&ack(&ids[0]));
 
@@ -1171,8 +1634,8 @@ mod tests {
         outbox.exec_exit(exec("e4"), ExitStatus::Exited { code: 0 }, 1);
         assert_eq!(session.poll_transmit(), None);
 
-        session.connected(Wire::Plain);
-        assert_eq!(drain(&mut session), [hello(Some(S1), None)]);
+        session.connected();
+        assert_eq!(drain_bare(&mut session), [hello(Some(S1), None)]);
         session.receive(&welcome(S1, true, Some(&ids[1])));
         assert_eq!(
             incoming(&mut session),
@@ -1182,7 +1645,7 @@ mod tests {
                 hello: None,
             }]
         );
-        let resent: Vec<Vec<u8>> = std::iter::from_fn(|| session.poll_transmit()).collect();
+        let resent = drain_raw(&mut session);
         assert_eq!(resent.len(), 2);
         assert_eq!(resent[0], payloads[2]);
         let e4 = literal(&resent[1]);
@@ -1193,12 +1656,12 @@ mod tests {
     #[test]
     fn the_cursor_is_acked_after_200_ms_once_and_again_for_a_duplicate() {
         let (mut session, _outbox, clock) = open_node(Limits::default());
-        let msg = frame(json!({ "t": "msg", "id": u(C1), "kind": "exec.list", "body": {} }));
+        let msg = frame_with(C1, json!({ "t": "msg", "kind": "exec.list", "body": {} }));
         session.receive(&msg);
         assert_eq!(
             incoming(&mut session),
             [Incoming::Message {
-                id: MsgId(Uuid::parse_str(C1).unwrap()),
+                id: mid(C1),
                 kind: "exec.list".to_string(),
                 body: cbor(json!({})),
             }]
@@ -1210,7 +1673,7 @@ mod tests {
         clock.advance(1);
         session.tick();
         assert_eq!(
-            drain(&mut session),
+            drain_bare(&mut session),
             [json!({ "t": "ack", "cursor": u(C1) })]
         );
         assert_eq!(session.deadline(), None);
@@ -1220,7 +1683,7 @@ mod tests {
         clock.advance(200);
         session.tick();
         assert_eq!(
-            drain(&mut session),
+            drain_bare(&mut session),
             [json!({ "t": "ack", "cursor": u(C1) })]
         );
         clock.advance(200);
@@ -1229,20 +1692,52 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_is_dropped_without_decoding_its_body() {
+        let (mut session, _outbox, clock) = open_node(Limits::default());
+        session.receive(&frame_with(
+            C1,
+            json!({ "t": "msg", "kind": "exec.list", "body": {} }),
+        ));
+        incoming(&mut session);
+        // The same ID with a body that is not CBOR: a resend is never decoded.
+        let garbage = [Uuid::parse_str(C1).unwrap().as_bytes(), &b"\xff\xff"[..]].concat();
+        session.receive(&garbage);
+        assert_eq!(incoming(&mut session), []);
+        assert!(!session.is_closing());
+        clock.advance(200);
+        session.tick();
+        assert_eq!(
+            drain_bare(&mut session),
+            [json!({ "t": "ack", "cursor": u(C1) })]
+        );
+        // Above the cursor it is decoded, and refused.
+        session.receive(
+            &[
+                Uuid::parse_str(&peer_id()).unwrap().as_bytes(),
+                &b"\xff\xff"[..],
+            ]
+            .concat(),
+        );
+        assert!(session.is_closing());
+    }
+
+    #[test]
     fn the_64th_message_is_acked_at_once() {
         let (mut session, _outbox, _clock) = open_node(Limits::default());
         let id = |n: u32| format!("0193a3b4-0000-7000-8000-{n:012x}");
         for n in 1..=63 {
-            session.receive(&frame(
-                json!({ "t": "msg", "id": u(&id(n)), "kind": "exec.list", "body": {} }),
+            session.receive(&frame_with(
+                &id(n),
+                json!({ "t": "msg", "kind": "exec.list", "body": {} }),
             ));
         }
         assert_eq!(drain(&mut session), [] as [Json; 0]);
-        session.receive(&frame(
-            json!({ "t": "msg", "id": u(&id(64)), "kind": "x", "body": {} }),
+        session.receive(&frame_with(
+            &id(64),
+            json!({ "t": "msg", "kind": "x", "body": {} }),
         ));
         assert_eq!(
-            drain(&mut session),
+            drain_bare(&mut session),
             [json!({ "t": "ack", "cursor": u(&id(64)) })]
         );
         assert_eq!(incoming(&mut session).len(), 64);
@@ -1256,7 +1751,7 @@ mod tests {
         session.disconnected();
         outbox.exec_exit(exec("e2"), ExitStatus::Exited { code: 0 }, 1);
 
-        session.connected(Wire::Plain);
+        session.connected();
         drain(&mut session);
         session.receive(&welcome(S2, false, None));
         assert_eq!(
@@ -1298,19 +1793,19 @@ mod tests {
             }]
         );
         assert_eq!(session.deadline(), None);
-        session.connected(Wire::Plain);
-        assert_eq!(drain(&mut session), [hello(None, None)]);
+        session.connected();
+        assert_eq!(drain_bare(&mut session), [hello(None, None)]);
     }
 
     #[test]
     fn too_many_unconfirmed_messages_lose_the_session() {
         let limits = Limits {
-            droppable_bytes: 1 << 20,
             retained_bytes: 1000,
+            ..Limits::default()
         };
         let (mut session, outbox, _clock) = open_node(limits);
         outbox.exec_exit(exec("e"), ExitStatus::Exited { code: 0 }, 1);
-        let one = session.poll_transmit().unwrap().len();
+        let one = session.poll_transmit().unwrap().len() - crate::wire::PREFIX_BYTES;
         let mut sent = 1;
         while incoming(&mut session).is_empty() {
             outbox.exec_exit(exec("e"), ExitStatus::Exited { code: 0 }, 1);
@@ -1318,7 +1813,7 @@ mod tests {
             assert!(sent < 100);
         }
         assert_eq!(sent, 1000 / one + 1);
-        let frames = drain(&mut session);
+        let frames = drain_bare(&mut session);
         assert_eq!(
             frames.last(),
             Some(&json!({ "t": "bye", "reason": "queue_overflow" }))
@@ -1331,7 +1826,7 @@ mod tests {
     fn dropped_output_is_counted_on_the_next_chunk_and_before_the_exit() {
         let limits = Limits {
             droppable_bytes: 300,
-            retained_bytes: 1 << 20,
+            ..Limits::default()
         };
         let (mut session, outbox, _clock) = open_node(limits);
         outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 150]);
@@ -1363,7 +1858,7 @@ mod tests {
     fn dropped_changes_become_one_overflow_marker() {
         let limits = Limits {
             droppable_bytes: 300,
-            retained_bytes: 1 << 20,
+            ..Limits::default()
         };
         let (mut session, outbox, _clock) = open_node(limits);
         let change = |path: &str| Change {
@@ -1371,13 +1866,13 @@ mod tests {
             path: path.to_string(),
         };
         session.disconnected();
-        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 240]);
+        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 250]);
         outbox.watch_changes(watch("w"), vec![change("/a")]);
         outbox.watch_changes(watch("w"), vec![change("/b")]);
         outbox.watch_overflow(watch("w"));
         outbox.watch_changes(watch("v"), vec![]);
 
-        session.connected(Wire::Plain);
+        session.connected();
         drain(&mut session);
         session.receive(&welcome(S1, true, None));
         let frames = drain(&mut session);
@@ -1402,7 +1897,7 @@ mod tests {
     fn proxy_messages_are_never_dropped() {
         let limits = Limits {
             droppable_bytes: 300,
-            retained_bytes: 1 << 20,
+            ..Limits::default()
         };
         let (mut session, outbox, _clock) = open_node(limits);
         let stream = StreamId(Uuid::parse_str(S2).unwrap());
@@ -1421,12 +1916,13 @@ mod tests {
     }
 
     #[test]
-    fn replies_and_commands_are_messages() {
+    fn replies_go_in_their_commands_lane_and_commands_get_theirs_back() {
         let (mut session, outbox, _clock) = open_node(Limits::default());
-        let to = MsgId(Uuid::parse_str(C1).unwrap());
-        outbox.reply(to, Ok(cbor(json!({ "execs": [] }))));
-        outbox.reply(to, Err(Error::not_found("no exec `x`")));
-        let id = outbox.command("node.ping", &cbor(json!({ "n": 1 })));
+        command_at(&mut session, C1, "exec.list", json!({}));
+        outbox.reply(mid(C1), Ok(cbor(json!({ "execs": [] }))));
+        // A second reply, or one to a command never received, has no lane and is dropped.
+        outbox.reply(mid(C1), Err(Error::not_found("no exec `x`")));
+        let ticket = outbox.command("node.ping", &cbor(json!({ "n": 1 })));
         let frames = drain(&mut session);
         assert_eq!(
             frames
@@ -1434,26 +1930,22 @@ mod tests {
                 .map(|f| (f["kind"].clone(), f["body"].clone()))
                 .collect::<Vec<_>>(),
             [
+                (json!("node.ping"), json!({ "n": 1 })),
                 (
                     json!("reply"),
                     json!({ "to": u(C1), "ok": { "execs": [] } })
                 ),
-                (
-                    json!("reply"),
-                    json!({ "to": u(C1), "error": { "kind": "not_found", "message": "no exec `x`" } })
-                ),
-                (json!("node.ping"), json!({ "n": 1 })),
             ]
         );
-        assert_eq!(id_of(&frames[2]), id.to_string());
+        assert_ne!(id_of(&frames[0]), ticket.to_string());
 
-        session.receive(
-            &frame(json!({ "t": "msg", "id": u(C1), "kind": "reply", "body": { "to": u(&id.to_string()), "error": { "kind": "unknown_kind", "message": "?" } } })),
-        );
+        session.receive(&frame(
+            json!({ "t": "msg", "kind": "reply", "body": { "to": frames[0]["id"], "error": { "kind": "unknown_kind", "message": "?" } } }),
+        ));
         assert_eq!(
             incoming(&mut session),
             [Incoming::Reply {
-                to: id,
+                to: ticket,
                 result: Err(Error::new(ErrorKind::UnknownKind, "?")),
             }]
         );
@@ -1481,7 +1973,7 @@ mod tests {
         let (mut session, _outbox, _clock) = open_node(Limits::default());
         session.receive(&welcome(S1, true, None));
         assert_eq!(
-            drain(&mut session),
+            drain_bare(&mut session),
             [
                 json!({ "t": "bye", "reason": "protocol_error", "message": "unexpected `welcome` frame" })
             ]
@@ -1495,10 +1987,16 @@ mod tests {
         );
 
         let (mut session, _outbox, _clock) = node_session(Limits::default());
-        session.connected(Wire::Plain);
+        session.connected();
         drain(&mut session);
-        session.receive(b"not cbor");
-        let bye = drain(&mut session);
+        session.receive(
+            &[
+                Uuid::parse_str(&peer_id()).unwrap().as_bytes(),
+                &b"not cbor"[..],
+            ]
+            .concat(),
+        );
+        let bye = drain_bare(&mut session);
         assert_eq!(bye[0]["reason"], "protocol_error");
         assert!(
             bye[0]["message"]
@@ -1507,10 +2005,21 @@ mod tests {
                 .starts_with("bad frame: ")
         );
 
+        let (mut session, _outbox, _clock) = node_session(Limits::default());
+        session.connected();
+        drain(&mut session);
+        session.receive(b"short");
+        assert_eq!(
+            drain_bare(&mut session),
+            [
+                json!({ "t": "bye", "reason": "protocol_error", "message": "bad frame: frame of 5 bytes has no room for its ID" })
+            ]
+        );
+
         let (mut session, _outbox, _clock) = open_node(Limits::default());
         session.reject("a text frame");
         assert_eq!(
-            drain(&mut session),
+            drain_bare(&mut session),
             [json!({ "t": "bye", "reason": "protocol_error", "message": "a text frame" })]
         );
         assert!(session.is_closing());
@@ -1523,10 +2032,10 @@ mod tests {
             resume_window_ms: 1000,
         };
         let (mut cp, outbox) = Session::with_options(role, clock.clone(), Limits::default(), 9);
-        cp.connected(Wire::Plain);
+        cp.connected();
         assert_eq!(drain(&mut cp), [] as [Json; 0]);
         cp.receive(&frame(hello(None, None)));
-        let frames = drain(&mut cp);
+        let frames = drain_bare(&mut cp);
         let s = bare(&frames[0]["session"]);
         assert_eq!(
             frames,
@@ -1546,11 +2055,11 @@ mod tests {
         let command = cp.poll_transmit().unwrap();
         cp.disconnected();
         clock.advance(999);
-        cp.connected(Wire::Plain);
+        cp.connected();
         cp.receive(&frame(hello(Some(&s), None)));
-        let resent: Vec<Vec<u8>> = std::iter::from_fn(|| cp.poll_transmit()).collect();
+        let resent = drain_raw(&mut cp);
         assert_eq!(
-            literal(&resent[0]),
+            bare_literal(&resent[0]),
             json!({ "t": "welcome", "session": u(&s), "resumed": true, "resumeWindowMs": 1000 })
         );
         assert_eq!(resent[1..], [command]);
@@ -1558,7 +2067,7 @@ mod tests {
 
         cp.disconnected();
         clock.advance(1000);
-        cp.connected(Wire::Plain);
+        cp.connected();
         cp.receive(&frame(hello(Some(&s), None)));
         let events = incoming(&mut cp);
         assert_eq!(
@@ -1594,55 +2103,24 @@ mod tests {
 
     #[test]
     fn a_node_and_a_control_plane_talk_through_two_sessions() {
-        let clock = ManualClock::new(T0);
-        let identity = NodeIdentity {
-            node_id: "n_1".to_string(),
-            installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
-        };
-        let (mut node, node_out) =
-            Session::with_options(Role::Node(identity), clock.clone(), Limits::default(), 1);
-        let role = Role::ControlPlane {
-            resume_window_ms: 1000,
-        };
-        let (mut cp, cp_out) = Session::with_options(role, clock.clone(), Limits::default(), 2);
-        let pump = |node: &mut Session, cp: &mut Session| loop {
-            let mut moved = false;
-            while let Some(text) = node.poll_transmit() {
-                cp.receive(&text);
-                moved = true;
-            }
-            while let Some(text) = cp.poll_transmit() {
-                node.receive(&text);
-                moved = true;
-            }
-            if !moved {
-                break;
-            }
-        };
-        node.connected(Wire::Plain);
-        cp.connected(Wire::Plain);
-        pump(&mut node, &mut cp);
-        assert!(node.needs_ready());
-        node.ready(info(), vec![], vec![]).unwrap();
+        let (mut node, node_out, mut cp, cp_out, clock) = pair();
         let command = cp_out.command("exec.list", &cbor(json!({})));
         pump(&mut node, &mut cp);
 
         let at_node = incoming(&mut node);
-        let Incoming::Message { id, kind, .. } = &at_node[1] else {
+        let Incoming::Message { id, kind, .. } = &at_node[0] else {
             panic!("no command at the node: {at_node:?}");
         };
-        assert_eq!((*id, kind.as_str()), (command, "exec.list"));
+        assert_eq!(kind, "exec.list");
         node_out.reply(*id, Ok(cbor(json!({ "execs": [] }))));
         pump(&mut node, &mut cp);
 
-        let at_cp = incoming(&mut cp);
-        assert!(matches!(&at_cp[1], Incoming::Message { kind, .. } if kind == "node.ready"));
         assert_eq!(
-            at_cp[2],
-            Incoming::Reply {
+            incoming(&mut cp),
+            [Incoming::Reply {
                 to: command,
                 result: Ok(cbor(json!({ "execs": [] }))),
-            }
+            }]
         );
         assert_eq!(node.session(), cp.session());
 
@@ -1652,14 +2130,353 @@ mod tests {
         pump(&mut node, &mut cp);
         node.disconnected();
         cp.disconnected();
-        node.connected(Wire::Plain);
-        cp.connected(Wire::Plain);
+        node.connected();
+        cp.connected();
         pump(&mut node, &mut cp);
         assert_eq!(node.poll_transmit(), None);
         assert!(matches!(
             incoming(&mut cp)[..],
             [Incoming::Opened { resumed: true, .. }]
         ));
+    }
+
+    /// The `(t, lane)` of each frame the node writes: `msg` frames by kind and body, parts by
+    /// the message they belong to.
+    fn written(session: &mut Session) -> Vec<(String, String)> {
+        drain(session)
+            .iter()
+            .map(|f| {
+                let t = f["t"].as_str().unwrap().to_string();
+                let what = match t.as_str() {
+                    "part" => format!(
+                        "{}{}",
+                        bare(&f["of"]),
+                        if f["last"] == true { " last" } else { "" }
+                    ),
+                    _ => format!(
+                        "{} {}",
+                        f["kind"].as_str().unwrap(),
+                        if f["body"]["to"].is_string() {
+                            bare(&f["body"]["to"])
+                        } else {
+                            String::new()
+                        }
+                    ),
+                };
+                (t, what)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_small_reply_waits_at_most_one_part_of_a_large_one() {
+        let (mut node, node_out, mut cp, cp_out, _clock) = pair();
+        let big = cp_out.command("fs.read", &cbor(json!({ "path": "/big" })));
+        let small = cp_out.command("fs.stat", &cbor(json!({ "path": "/small" })));
+        pump(&mut node, &mut cp);
+        let commands: Vec<MsgId> = incoming(&mut node)
+            .into_iter()
+            .map(|i| match i {
+                Incoming::Message { id, .. } => id,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let data = vec![7u8; 1 << 20];
+        node_out.reply(
+            commands[0],
+            Ok(cbor(
+                json!({ "data": format!("h'{}'", "07".repeat(1 << 20)) }),
+            )),
+        );
+        node_out.reply(commands[1], Ok(cbor(json!({ "size": 200 }))));
+
+        let frames = drain_raw(&mut node);
+        let literals: Vec<Json> = frames.iter().map(|f| literal(f)).collect();
+        let of = id_of(&literals[0]);
+        let shape: Vec<String> = literals
+            .iter()
+            .map(|f| match f["t"].as_str().unwrap() {
+                "part" => {
+                    assert_eq!(bare(&f["of"]), of);
+                    if f["last"] == true {
+                        "last part".to_string()
+                    } else {
+                        "part".to_string()
+                    }
+                }
+                _ => format!("reply to {}", bare(&f["body"]["to"])),
+            })
+            .collect();
+        let mut expected = vec!["part".to_string(), format!("reply to {}", commands[1])];
+        expected.extend(std::iter::repeat_n("part".to_string(), 15));
+        expected.push("last part".to_string());
+        assert_eq!(shape, expected);
+        assert!(frames.iter().all(|f| f.len() <= MAX_PART_BYTES + 64));
+        assert_eq!(literals[0]["id"], literals[0]["of"]);
+
+        for frame in &frames {
+            cp.receive(frame);
+        }
+        let at_cp = incoming(&mut cp);
+        assert_eq!(
+            at_cp[0],
+            Incoming::Reply {
+                to: small,
+                result: Ok(cbor(json!({ "size": 200 }))),
+            }
+        );
+        let Incoming::Reply {
+            to,
+            result: Ok(body),
+        } = &at_cp[1]
+        else {
+            panic!("{:?}", at_cp[1]);
+        };
+        assert_eq!(*to, big);
+        assert_eq!(
+            crate::testkit::json(body.clone())["data"],
+            format!("h'{}'", "07".repeat(data.len()))
+        );
+    }
+
+    #[test]
+    fn busy_lanes_take_turns_of_64_kib() {
+        let (mut session, outbox, _clock) = open_node(Limits::default());
+        for id in ["a", "b", "c"] {
+            for _ in 0..4 {
+                outbox.exec_output(exec(id), Stream::Stdout, vec![b'x'; 60_000]);
+            }
+        }
+        outbox.exec_exit(exec("d"), ExitStatus::Exited { code: 0 }, 1);
+        let lanes: Vec<String> = drain(&mut session)
+            .iter()
+            .map(|f| f["body"]["execId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            lanes,
+            [
+                "a", "b", "c", "d", "a", "b", "c", "a", "b", "c", "a", "b", "c"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lane_keeps_its_order_and_parts_stay_together() {
+        let (mut node, node_out, mut cp, _cp_out, _clock) = pair();
+        node_out.exec_output(exec("e"), Stream::Stdout, vec![1; 100]);
+        node_out.proxy(ProxyMessage::Body(ProxyBody {
+            stream_id: StreamId(Uuid::parse_str(S2).unwrap()),
+            data: Bytes(vec![2; 200_000]),
+        }));
+        node_out.exec_output(exec("e"), Stream::Stdout, vec![3; 50_000]);
+        node_out.exec_output(exec("e"), Stream::Stdout, vec![4; 10]);
+        node_out.exec_exit(exec("e"), ExitStatus::Exited { code: 0 }, 50_110);
+        let shape = written(&mut node);
+        let parts: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(_, (t, _))| t == "part")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(parts.len(), 4);
+        // Every frame is delivered at the control plane in each lane's order.
+        node.disconnected();
+        node.connected();
+        cp.disconnected();
+        cp.connected();
+        pump(&mut node, &mut cp);
+        let at_cp: Vec<(String, Json)> = incoming(&mut cp)
+            .into_iter()
+            .filter_map(|i| match i {
+                Incoming::Message { kind, body, .. } => Some((kind, crate::testkit::json(body))),
+                _ => None,
+            })
+            .collect();
+        let exec_events: Vec<Json> = at_cp
+            .iter()
+            .filter(|(k, _)| k.starts_with("exec."))
+            .map(|(k, b)| match k.as_str() {
+                "exec.output" => json!(b["data"].as_str().unwrap().len()),
+                _ => json!(k),
+            })
+            .collect();
+        assert_eq!(
+            exec_events,
+            [json!(203), json!(100_003), json!(23), json!("exec.exit")]
+        );
+        assert_eq!(at_cp.iter().filter(|(k, _)| k == "proxy.body").count(), 1);
+    }
+
+    #[test]
+    fn a_message_cut_by_a_reconnect_is_resent_from_the_unconfirmed_part() {
+        let (mut node, node_out, mut cp, _cp_out, _clock) = pair();
+        node_out.proxy(ProxyMessage::Body(ProxyBody {
+            stream_id: StreamId(Uuid::parse_str(S2).unwrap()),
+            data: Bytes(vec![9; 300_000]),
+        }));
+        let first = node.poll_transmit().unwrap();
+        let second = node.poll_transmit().unwrap();
+        let third = node.poll_transmit().unwrap();
+        cp.receive(&first);
+        cp.receive(&second);
+        // The third is lost with the connection; the control plane confirmed the second.
+        cp.tick();
+        let second_id = id_of(&literal(&second));
+        node.receive(&ack(&second_id));
+        node.disconnected();
+        cp.disconnected();
+
+        node.connected();
+        cp.connected();
+        let hello = node.poll_transmit().unwrap();
+        cp.receive(&hello);
+        let welcome = cp.poll_transmit().unwrap();
+        node.receive(&welcome);
+        let resent = node.poll_transmit().unwrap();
+        assert_eq!(resent, third);
+        cp.receive(&resent);
+        pump(&mut node, &mut cp);
+        let messages: Vec<Incoming> = incoming(&mut cp)
+            .into_iter()
+            .filter(|i| matches!(i, Incoming::Message { .. }))
+            .collect();
+        let [Incoming::Message { id, kind, body }] = &messages[..] else {
+            panic!("{messages:?}");
+        };
+        assert_eq!(kind, "proxy.body");
+        assert_eq!(id.to_string(), id_of(&literal(&first)));
+        let ProxyMessage::Body(body) = ProxyMessage::parse(kind, body.clone()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(body.data.0, vec![9; 300_000]);
+    }
+
+    #[test]
+    fn reassembly_is_bounded() {
+        let limits = Limits {
+            message_bytes: 100,
+            partial_bytes: 150,
+            ..Limits::default()
+        };
+        let clock = ManualClock::new(T0);
+        let (mut session, _outbox) =
+            Session::with_options(Role::Node(identity()), clock, limits, 7);
+        let open = |session: &mut Session| {
+            session.connected();
+            drain(session);
+            session.receive(&welcome(S1, false, None));
+            session.ready(info(), vec![], vec![]).unwrap();
+            drain(session);
+            incoming(session);
+        };
+        let part = |id: &str, of: &str, last: bool, len: usize| {
+            frame_with(
+                id,
+                json!({ "t": "part", "of": u(of), "last": last, "data": format!("h'{}'", "00".repeat(len)) }),
+            )
+        };
+        open(&mut session);
+        let a = peer_id();
+        session.receive(&part(&a, &a, false, 60));
+        session.receive(&part(&peer_id(), &a, false, 41));
+        assert_eq!(
+            drain_bare(&mut session),
+            [
+                json!({ "t": "bye", "reason": "protocol_error", "message": format!("message {a} is over 100 bytes") })
+            ]
+        );
+
+        session.disconnected();
+        open(&mut session);
+        let (a, b, c) = (peer_id(), peer_id(), peer_id());
+        session.receive(&part(&a, &a, false, 60));
+        session.receive(&part(&b, &b, false, 60));
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
+        session.receive(&part(&c, &c, false, 31));
+        assert_eq!(
+            drain_bare(&mut session),
+            [
+                json!({ "t": "bye", "reason": "queue_overflow", "message": "over 150 bytes of incomplete messages" })
+            ]
+        );
+        assert!(matches!(
+            incoming(&mut session)[..],
+            [Incoming::Lost {
+                reason: LostReason::QueueOverflow,
+                ..
+            }]
+        ));
+
+        session.disconnected();
+        open(&mut session);
+        let x = peer_id();
+        session.receive(&part(&peer_id(), &x, true, 1));
+        assert_eq!(
+            drain_bare(&mut session)[0]["message"],
+            format!("a part of message {x}, whose first part never came")
+        );
+    }
+
+    #[test]
+    fn incomplete_messages_survive_a_resume_and_go_with_a_lost_session() {
+        let (mut node, node_out, mut cp, _cp_out, _clock) = pair();
+        let stream = StreamId(Uuid::parse_str(S2).unwrap());
+        node_out.proxy(ProxyMessage::Body(ProxyBody {
+            stream_id: stream,
+            data: Bytes(vec![5; 100_000]),
+        }));
+        let first = node.poll_transmit().unwrap();
+        cp.receive(&first);
+        cp.tick();
+        node.disconnected();
+        cp.disconnected();
+        node.connected();
+        cp.connected();
+        pump(&mut node, &mut cp);
+        assert_eq!(
+            incoming(&mut cp)
+                .iter()
+                .filter(|i| matches!(i, Incoming::Message { kind, .. } if kind == "proxy.body"))
+                .count(),
+            1
+        );
+
+        node_out.proxy(ProxyMessage::Body(ProxyBody {
+            stream_id: stream,
+            data: Bytes(vec![6; 100_000]),
+        }));
+        cp.receive(&node.poll_transmit().unwrap());
+        cp.forget();
+        node.disconnected();
+        cp.disconnected();
+        node.connected();
+        cp.connected();
+        pump(&mut node, &mut cp);
+        node.ready(info(), vec![], vec![]).unwrap();
+        pump(&mut node, &mut cp);
+        assert!(
+            incoming(&mut cp)
+                .iter()
+                .all(|i| !matches!(i, Incoming::Message { kind, .. } if kind == "proxy.body"))
+        );
+    }
+
+    #[test]
+    fn a_single_lane_writes_in_queue_order() {
+        let (mut session, outbox, _clock) = open_node(Limits::default());
+        session.set_single_lane(true);
+        command_at(&mut session, C1, "fs.read", json!({ "path": "/big" }));
+        let other = peer_id();
+        command_at(&mut session, &other, "fs.stat", json!({ "path": "/s" }));
+        outbox.reply(
+            mid(C1),
+            Ok(cbor(
+                json!({ "data": format!("h'{}'", "07".repeat(200_000)) }),
+            )),
+        );
+        outbox.reply(mid(&other), Ok(cbor(json!({ "size": 1 }))));
+        let shape: Vec<String> = written(&mut session).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(shape, ["part", "part", "part", "part", "msg"]);
     }
 
     #[tokio::test]

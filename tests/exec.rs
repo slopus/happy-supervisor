@@ -12,7 +12,6 @@ use happy_supervisor::protocol::{
     ByteRange, Event, ExecExit, ExecId, ExecLogParams, ExecStartParams, ExecState, ExecSummary,
     ExecWriteParams, ExitStatus, KillSignal, NodeInfo, Stream,
 };
-use happy_supervisor::wire::Wire;
 use happy_supervisor::{Error, ErrorKind};
 use serde_json::{Value, json};
 
@@ -36,8 +35,8 @@ impl Node {
             resume_window_ms: 60_000,
         };
         let (mut cp, _) = Session::new(role, clock.clone());
-        node.connected(Wire::Plain);
-        cp.connected(Wire::Plain);
+        node.connected();
+        cp.connected();
         let mut this = Node {
             exec: ExecManager::new(outbox),
             node,

@@ -470,7 +470,7 @@ mod tests {
     use crate::link::{ManualClock, NodeIdentity, Role, Session};
     use crate::policy::Policy;
     use crate::protocol::{Frame, SessionId, WatchEvent, Welcome};
-    use crate::wire::{self, Wire};
+    use crate::wire;
 
     /// A node session with `node.ready` sent, so queued events can be drained as frames.
     fn session() -> (Session, Outbox) {
@@ -479,14 +479,17 @@ mod tests {
             installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
         };
         let (mut session, outbox) = Session::new(Role::Node(identity), ManualClock::new(0));
-        session.connected(Wire::Plain);
+        session.connected();
         let welcome = Frame::Welcome(Welcome {
             session: SessionId(uuid::Uuid::from_u128(1)),
             resumed: false,
             cursor: None,
             resume_window_ms: 1000,
         });
-        session.receive(&wire::to_cbor(&welcome));
+        session.receive(&wire::frame(
+            uuid::Uuid::from_u128(2),
+            &wire::to_cbor(&welcome),
+        ));
         let info = serde_json::from_value(json!({
             "installationId": "tz4a98xxat96iws9zmbrgj3a", "name": "box", "hostname": "box",
             "supervisorVersion": "0.1.0",
@@ -506,12 +509,14 @@ mod tests {
     /// The bodies of the `watch.event`s transmitted since the last call.
     fn events(session: &mut Session) -> Vec<Value> {
         std::iter::from_fn(|| session.poll_transmit())
-            .filter_map(|payload| match wire::from_cbor(&payload).unwrap() {
-                Frame::Msg(msg) if msg.kind == "watch.event" => {
-                    let event: WatchEvent = wire::from_value(msg.body).unwrap();
-                    Some(serde_json::to_value(event).unwrap())
+            .filter_map(|payload| {
+                match wire::from_cbor(wire::split(&payload).unwrap().1).unwrap() {
+                    Frame::Msg(msg) if msg.kind == "watch.event" => {
+                        let event: WatchEvent = wire::from_value(msg.body).unwrap();
+                        Some(serde_json::to_value(event).unwrap())
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             .collect()
     }

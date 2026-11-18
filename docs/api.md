@@ -78,24 +78,44 @@ redials.
 
 ## Link protocol
 
-### Encoding
+### Frame layout
 
-Every WebSocket frame is a **binary** frame holding one [CBOR](https://www.rfc-editor.org/rfc/rfc8949)
-map with a `t` field naming the frame type. Text frames are a protocol error. The shapes in this
-document are written as JSON for readability. On the wire:
+Every WebSocket frame is a **binary** frame. Text frames are a protocol error. A frame is a fixed
+16-byte prefix followed by the body:
 
-* map keys are the field names shown here, compacted by the registry below;
-* `data` fields, and header values in proxy.md, are CBOR byte strings (major type 2), not base64
-  (examples write them as `h'…'`, CBOR diagnostic notation for bytes);
-* UUIDs (message IDs, session IDs, stream IDs) are 16-byte byte strings;
+```
++------------------------------+------------------------------+
+| frame ID                     | body                         |
+| 16 bytes, UUIDv7, big-endian | CBOR map                     |
++------------------------------+------------------------------+
+```
+
+Each frame is one WebSocket binary message. Compression, when negotiated, is applied by the
+WebSocket layer to the whole message (Compression), so the prefix compresses with the rest.
+
+* **frame ID.** A UUIDv7 the sender assigns when it writes the frame. Within a session, each
+  sender's frame IDs strictly increase in the order it writes them, across connections. A sender
+  that generates several in one millisecond uses the RFC 9562 monotonic counter.
+* **body.** A CBOR ([RFC 8949](https://www.rfc-editor.org/rfc/rfc8949)) map with a `t` field naming
+  the frame type.
+
+The shapes in this document are written as JSON for readability, with the frame ID shown as
+`"id"`, although on the wire it is the prefix and not a map key. In the body:
+
+* map keys are the integers of the key registry (Key registry, below);
+* `data` fields, and header values in proxy.md, are CBOR byte strings, not base64 (examples write
+  them as `h'…'`, CBOR diagnostic notation for bytes);
+* UUIDs inside bodies (session IDs, cursors, stream IDs, `to`, `of`) are 16-byte byte strings;
 * integers are CBOR integers, and absent optional fields are omitted rather than `null`, except
   where a field is shown as `null` (`hello.session`, `hello.cursor`).
 
-**Compact names.** Every field name in this document, every frame type (`t`) and every
-message `kind` has a number in the registry. On the wire, a map key that is in the registry is
-that CBOR unsigned integer, not the text. A frame's `t` value, and a `msg` frame's `kind` value,
-are their numbers too. Other values stay as they are, so `"stream": "stdout"` is
-`0x0a 0x66 "stdout"`, and the `kind` inside a body (an exit, a change, an error) stays text.
+### Key registry
+
+Every field name in this document, every frame type (`t`) and every message `kind` has a number
+in the registry. In a body, a map key that is in the registry is that CBOR unsigned integer, not
+the text. A frame's `t` value, and a `msg` frame's `kind` value, are their numbers too. Other
+values stay as they are, so `"stream": "stdout"` is `0x0d 0x66 "stdout"`, and the `kind` inside a
+body (an exit, a change, an error) stays text.
 
 * The registry is **append-only**. A number is never changed and never reused. A new name gets
   the next number.
@@ -105,163 +125,166 @@ are their numbers too. Other values stay as they are, so `"stream": "stdout"` is
   type as a key), is a protocol error. Numbers 0 to 23 encode in one byte. They go to the most
   frequent names.
 * Keys of free-form maps (`env`, `defaultEnv`) are data, but the same rule applies to them, so
-  an environment variable named `path` travels as `23` and arrives as `path`.
+  an environment variable named `path` travels as `28` and arrives as `path`.
 
-An `ack` is `a2 00 06 04 50 <16-byte cursor>`, 21 bytes. A 16-byte `exec.output` chunk of
-`build-1` is 62 bytes:
+An `ack` is its 16-byte frame ID, then `a2 00 05 03 50 <16-byte cursor>`: 37 bytes. A 16-byte
+`exec.output` chunk of `build-1` is 60 bytes:
 
 ```
-a4 00 05 01 50 <16-byte id> 02 07 03          t: msg, id, kind: exec.output, body:
-a4 09 67 "build-1" 0a 66 "stdout" 0b 50 <16 bytes> 0c 00
+<16-byte frame ID>
+a3 00 04 01 0a 02                             t: msg, kind: exec.output, body:
+a4 0c 67 "build-1" 0d 66 "stdout" 09 50 <16 bytes> 0e 00
                                               execId, stream, data, droppedBytes: 0
 ```
 
 | Number | Name | Role |
 |---|---|---|
 | 0 | `t` | key |
-| 1 | `id` | key |
-| 2 | `kind` | key |
-| 3 | `body` | key |
-| 4 | `cursor` | key |
-| 5 | `msg` | frame |
-| 6 | `ack` | frame |
-| 7 | `exec.output` | kind |
-| 8 | `reply` | kind |
-| 9 | `execId` | key |
-| 10 | `stream` | key |
-| 11 | `data` | key |
-| 12 | `droppedBytes` | key |
-| 13 | `to` | key |
-| 14 | `ok` | key |
-| 15 | `error` | key |
-| 16 | `exec.exit` | kind |
-| 17 | `exit` | key |
-| 18 | `logBytes` | key |
-| 19 | `code` | key |
-| 20 | `watch.event` | kind |
-| 21 | `watchId` | key |
-| 22 | `changes` | key |
-| 23 | `path` | key |
-| 24 | `hello` | frame |
-| 25 | `welcome` | frame |
-| 26 | `bye` | frame |
-| 27 | `proxy.body` | kind |
-| 28 | `proxy.credit` | kind |
-| 29 | `proxy.request` | kind |
-| 30 | `proxy.response` | kind |
-| 31 | `proxy.end` | kind |
-| 32 | `proxy.reset` | kind |
-| 33 | `node.ready` | kind |
-| 34 | `exec.timedOut` | kind |
-| 35 | `node.info` | kind |
-| 36 | `node.update` | kind |
-| 37 | `exec.start` | kind |
-| 38 | `exec.write` | kind |
-| 39 | `exec.kill` | kind |
-| 40 | `exec.list` | kind |
-| 41 | `exec.log` | kind |
-| 42 | `fs.stat` | kind |
-| 43 | `fs.list` | kind |
-| 44 | `fs.read` | kind |
-| 45 | `fs.write` | kind |
-| 46 | `fs.mkdir` | kind |
-| 47 | `fs.remove` | kind |
-| 48 | `watch.start` | kind |
-| 49 | `watch.stop` | kind |
-| 50 | `streamId` | key |
-| 51 | `bytes` | key |
-| 52 | `message` | key |
-| 53 | `session` | key |
-| 54 | `resumed` | key |
-| 55 | `resumeWindowMs` | key |
-| 56 | `nodeId` | key |
-| 57 | `installationId` | key |
-| 58 | `version` | key |
-| 59 | `reason` | key |
-| 60 | `previousSession` | key |
-| 61 | `signal` | key |
-| 62 | `overflow` | key |
-| 63 | `headers` | key |
-| 64 | `status` | key |
-| 65 | `method` | key |
-| 66 | `scheme` | key |
-| 67 | `host` | key |
-| 68 | `port` | key |
-| 69 | `token` | key |
-| 70 | `hosts` | key |
-| 71 | `proxy` | key |
-| 72 | `argv` | key |
-| 73 | `cwd` | key |
-| 74 | `env` | key |
-| 75 | `stdin` | key |
-| 76 | `timeout` | key |
-| 77 | `ms` | key |
-| 78 | `action` | key |
-| 79 | `log` | key |
-| 80 | `limitBytes` | key |
-| 81 | `access` | key |
-| 82 | `mode` | key |
-| 83 | `policy` | key |
-| 84 | `read` | key |
-| 85 | `write` | key |
-| 86 | `localBind` | key |
-| 87 | `unixSockets` | key |
-| 88 | `eof` | key |
-| 89 | `pid` | key |
-| 90 | `ignoredPaths` | key |
-| 91 | `execs` | key |
-| 92 | `state` | key |
-| 93 | `offset` | key |
-| 94 | `length` | key |
-| 95 | `totalBytes` | key |
-| 96 | `retained` | key |
-| 97 | `start` | key |
-| 98 | `end` | key |
-| 99 | `entries` | key |
-| 100 | `name` | key |
-| 101 | `size` | key |
-| 102 | `modifiedMs` | key |
-| 103 | `readonly` | key |
-| 104 | `recursive` | key |
-| 105 | `nodeToken` | key |
-| 106 | `endpoint` | key |
-| 107 | `info` | key |
-| 108 | `watches` | key |
-| 109 | `hostname` | key |
-| 110 | `supervisorVersion` | key |
-| 111 | `os` | key |
-| 112 | `family` | key |
-| 113 | `kernelVersion` | key |
-| 114 | `arch` | key |
-| 115 | `cpu` | key |
-| 116 | `model` | key |
-| 117 | `logicalCores` | key |
-| 118 | `physicalCores` | key |
-| 119 | `memory` | key |
-| 120 | `swapTotalBytes` | key |
-| 121 | `disks` | key |
-| 122 | `mountPoint` | key |
-| 123 | `fileSystem` | key |
-| 124 | `availableBytes` | key |
-| 125 | `removable` | key |
-| 126 | `gpus` | key |
-| 127 | `vendor` | key |
-| 128 | `memoryBytes` | key |
-| 129 | `driverVersion` | key |
-| 130 | `sandbox` | key |
-| 131 | `mechanism` | key |
-| 132 | `available` | key |
-| 133 | `landlockAbi` | key |
-| 134 | `baselineRead` | key |
-| 135 | `gaps` | key |
-| 136 | `defaultEnv` | key |
-| 137 | `collectedAtMs` | key |
-| 138 | `joinToken` | key |
-| 139 | `tcp.data` | kind |
-| 140 | `tcp.credit` | kind |
-| 141 | `tcp.open` | kind |
-| 142 | `tcp.end` | kind |
-| 143 | `tcp.reset` | kind |
+| 1 | `kind` | key |
+| 2 | `body` | key |
+| 3 | `cursor` | key |
+| 4 | `msg` | frame |
+| 5 | `ack` | frame |
+| 6 | `part` | frame |
+| 7 | `of` | key |
+| 8 | `last` | key |
+| 9 | `data` | key |
+| 10 | `exec.output` | kind |
+| 11 | `reply` | kind |
+| 12 | `execId` | key |
+| 13 | `stream` | key |
+| 14 | `droppedBytes` | key |
+| 15 | `to` | key |
+| 16 | `ok` | key |
+| 17 | `error` | key |
+| 18 | `streamId` | key |
+| 19 | `tcp.data` | kind |
+| 20 | `proxy.body` | kind |
+| 21 | `watch.event` | kind |
+| 22 | `watchId` | key |
+| 23 | `changes` | key |
+| 24 | `exec.exit` | kind |
+| 25 | `exit` | key |
+| 26 | `logBytes` | key |
+| 27 | `code` | key |
+| 28 | `path` | key |
+| 29 | `hello` | frame |
+| 30 | `welcome` | frame |
+| 31 | `bye` | frame |
+| 32 | `proxy.credit` | kind |
+| 33 | `proxy.request` | kind |
+| 34 | `proxy.response` | kind |
+| 35 | `proxy.end` | kind |
+| 36 | `proxy.reset` | kind |
+| 37 | `node.ready` | kind |
+| 38 | `exec.timedOut` | kind |
+| 39 | `node.info` | kind |
+| 40 | `node.update` | kind |
+| 41 | `exec.start` | kind |
+| 42 | `exec.write` | kind |
+| 43 | `exec.kill` | kind |
+| 44 | `exec.list` | kind |
+| 45 | `exec.log` | kind |
+| 46 | `fs.stat` | kind |
+| 47 | `fs.list` | kind |
+| 48 | `fs.read` | kind |
+| 49 | `fs.write` | kind |
+| 50 | `fs.mkdir` | kind |
+| 51 | `fs.remove` | kind |
+| 52 | `watch.start` | kind |
+| 53 | `watch.stop` | kind |
+| 54 | `bytes` | key |
+| 55 | `message` | key |
+| 56 | `session` | key |
+| 57 | `resumed` | key |
+| 58 | `resumeWindowMs` | key |
+| 59 | `nodeId` | key |
+| 60 | `installationId` | key |
+| 61 | `version` | key |
+| 62 | `reason` | key |
+| 63 | `previousSession` | key |
+| 64 | `signal` | key |
+| 65 | `overflow` | key |
+| 66 | `headers` | key |
+| 67 | `status` | key |
+| 68 | `method` | key |
+| 69 | `scheme` | key |
+| 70 | `host` | key |
+| 71 | `port` | key |
+| 72 | `token` | key |
+| 73 | `hosts` | key |
+| 74 | `proxy` | key |
+| 75 | `argv` | key |
+| 76 | `cwd` | key |
+| 77 | `env` | key |
+| 78 | `stdin` | key |
+| 79 | `timeout` | key |
+| 80 | `ms` | key |
+| 81 | `action` | key |
+| 82 | `log` | key |
+| 83 | `limitBytes` | key |
+| 84 | `access` | key |
+| 85 | `mode` | key |
+| 86 | `policy` | key |
+| 87 | `read` | key |
+| 88 | `write` | key |
+| 89 | `localBind` | key |
+| 90 | `unixSockets` | key |
+| 91 | `eof` | key |
+| 92 | `pid` | key |
+| 93 | `ignoredPaths` | key |
+| 94 | `execs` | key |
+| 95 | `state` | key |
+| 96 | `offset` | key |
+| 97 | `length` | key |
+| 98 | `totalBytes` | key |
+| 99 | `retained` | key |
+| 100 | `start` | key |
+| 101 | `end` | key |
+| 102 | `entries` | key |
+| 103 | `name` | key |
+| 104 | `size` | key |
+| 105 | `modifiedMs` | key |
+| 106 | `readonly` | key |
+| 107 | `recursive` | key |
+| 108 | `nodeToken` | key |
+| 109 | `endpoint` | key |
+| 110 | `info` | key |
+| 111 | `watches` | key |
+| 112 | `hostname` | key |
+| 113 | `supervisorVersion` | key |
+| 114 | `os` | key |
+| 115 | `family` | key |
+| 116 | `kernelVersion` | key |
+| 117 | `arch` | key |
+| 118 | `cpu` | key |
+| 119 | `model` | key |
+| 120 | `logicalCores` | key |
+| 121 | `physicalCores` | key |
+| 122 | `memory` | key |
+| 123 | `swapTotalBytes` | key |
+| 124 | `disks` | key |
+| 125 | `mountPoint` | key |
+| 126 | `fileSystem` | key |
+| 127 | `availableBytes` | key |
+| 128 | `removable` | key |
+| 129 | `gpus` | key |
+| 130 | `vendor` | key |
+| 131 | `memoryBytes` | key |
+| 132 | `driverVersion` | key |
+| 133 | `sandbox` | key |
+| 134 | `mechanism` | key |
+| 135 | `available` | key |
+| 136 | `landlockAbi` | key |
+| 137 | `baselineRead` | key |
+| 138 | `gaps` | key |
+| 139 | `defaultEnv` | key |
+| 140 | `collectedAtMs` | key |
+| 141 | `joinToken` | key |
+| 142 | `tcp.credit` | kind |
+| 143 | `tcp.open` | kind |
+| 144 | `tcp.end` | kind |
+| 145 | `tcp.reset` | kind |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -269,26 +292,31 @@ runs a command while ignoring a restriction it does not understand.
 
 ### Compression
 
-The node offers two WebSocket subprotocols on the upgrade, in this order:
+Compression is the WebSocket standard's own, **permessage-deflate** ([RFC 7692](https://www.rfc-editor.org/rfc/rfc7692)),
+negotiated on the upgrade. The node offers:
 
 ```
-Sec-WebSocket-Protocol: happy-supervisor.v1.deflate, happy-supervisor.v1
+Sec-WebSocket-Protocol: happy-supervisor.v1
+Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits
 ```
 
-The control plane picks one in its response. With `happy-supervisor.v1`, each frame's payload is
-the CBOR map itself. With `happy-supervisor.v1.deflate`, each frame's payload starts with one
-byte:
+Compression is **always on**. The control plane must select the subprotocol `happy-supervisor.v1`
+**and** accept the permessage-deflate extension. If its response lacks either, the node closes the
+connection and retries with backoff, logging which one was missing. Every message is compressed,
+with context takeover in both directions (the default), so each direction of the connection is one
+DEFLATE stream. Every frame compresses against what was sent before it: repeated keys, IDs, the
+same process's previous output. Small frames shrink as much as large ones. On a measured sequence
+of build-output frames and acks, frames averaged 80.5 bytes uncompressed and 26.7 bytes with a
+shared stream.
 
-* `0x00`: the rest is the CBOR map, uncompressed;
-* `0x01`: the rest is the CBOR map compressed as raw DEFLATE ([RFC 1951](https://www.rfc-editor.org/rfc/rfc1951)),
-  no zlib or gzip header.
+A bare `client_max_window_bits` lets the control plane choose the window the node compresses
+with. Answering `client_max_window_bits=15` keeps the full 32 KiB window, so a frame can
+compress against the last few frames. A small window gives most of that up.
 
-Each frame is compressed on its own, with no dictionary shared between frames. A resent message
-then decodes with no history, and one corrupt frame cannot spoil the ones after it. The sender
-compresses frames of 256 bytes or more and sends smaller ones as `0x00`. It also sends a frame
-as `0x00` when compression did not make it smaller. A decompressed frame larger than the frame
-limit (Limits) is a protocol error. A control plane that selects neither subprotocol, or none,
-gets the connection closed: the node requires one of the two.
+The protocol above the WebSocket never sees compression. A frame is the same bytes either way.
+Compression state belongs to the WebSocket connection, so a new connection starts fresh, and
+frames resent after a resume are simply compressed again. A message that inflates past the frame
+limit (Limits) closes the connection.
 
 The join request (`POST <join url>`) is a single HTTPS exchange and stays JSON, so it can be
 issued and debugged with ordinary HTTP tools.
@@ -321,36 +349,107 @@ Each connection opens with a handshake. The node sends `hello`, the control plan
 ### Messages
 
 ```json
-{ "t": "msg", "id": "0193a3b4-7c2e-7aa1-9f00-3c1d2e4f5a6b", "kind": "exec.start", "body": { … } }
+{ "id": "0193a3b4-7c2e-7aa1-9f00-3c1d2e4f5a6b", "t": "msg", "kind": "exec.start", "body": { … } }
 ```
 
-* `id` is a UUIDv7 the sender generates. Within a session, each sender's IDs strictly increase,
-  in the order it sent them. A sender that generates several IDs in one millisecond uses the
-  RFC 9562 monotonic counter, so the order still holds.
+* `id` is the frame ID from the prefix (Frame layout). It is the message's ID: replies name it in
+  `to`.
 * `kind` names the message. The tables below list every kind and its `body`.
-* Messages from one sender are delivered and processed in ID order.
 
-The receiver keeps the highest ID it has processed in the session. A message with an ID at or
-below it is a duplicate from a resend: it is not processed again, only confirmed again by the next cursor. So each
-message takes effect exactly once per session, however often the link breaks.
+Only `msg` and `part` frames are **data frames**. They are kept by the sender until confirmed,
+resent after a resume, and counted by the cursor. `hello`, `welcome`, `ack` and `bye` carry a frame
+ID like every frame, but are never kept, resent or counted.
+
+The receiver reads the prefix of every frame and drops a data frame whose ID is at or below its cursor without decoding the body.
+
+The receiver keeps the highest data-frame ID it has accepted in the session, its cursor. A data
+frame with an ID at or below it is a duplicate from a resend. It is not processed again, only
+confirmed again. So each message takes effect exactly once per session, however often the link
+breaks.
+
+### Lanes: no message blocks the others
+
+One connection carries everything: process output, file transfers, proxy and tunnel streams,
+commands and replies. To keep a large transfer or a busy stream from delaying everything behind
+it, each side sends through **lanes** and splits large messages into **parts**.
+
+**Lanes.** Every message belongs to exactly one lane, derived from what it is about:
+
+| Lane | Messages |
+|---|---|
+| `exec:<execId>` | `exec.start`, `exec.write`, `exec.kill`, `exec.output`, `exec.timedOut`, `exec.exit`, and `exec.log` for that process |
+| `watch:<watchId>` | `watch.start`, `watch.stop`, `watch.event` for that watch |
+| `stream:<streamId>` | every `proxy.*` and `tcp.*` message of that stream |
+| `msg:<id>` | a command not covered above, alone (for example `fs.write` with 16 MiB) |
+| `reply:<commandId>` | the reply to such a command (for example a large `fs.read` result) |
+| `control` | `node.*` commands, their replies, and `node.ready`. Always small. |
+
+A reply goes in the lane of its command when the command has an entity lane (an `exec.write`
+reply travels in `exec:<execId>`, a `tcp.open` reply in `stream:<streamId>`). Otherwise it gets its
+own `reply:<commandId>` lane, so a large reply never delays another. Commands without an entity
+lane (`fs.*`) are independent of each other, so each travels alone.
+
+**Order is per lane.** Messages of one lane arrive and are processed in the order they were sent.
+Messages of different lanes may arrive in any order relative to each other. Everything that has to
+stay ordered (a process's output before its exit, stdin writes, a stream's bytes) shares a lane.
+
+**Parts.** A message whose CBOR body would exceed 64 KiB is sent as a run of `part` frames,
+each carrying at most 64 KiB of the `msg` frame's CBOR body:
+
+```json
+{ "t": "part", "id": "0193…f1", "of": "0193…e0", "last": false, "data": h'…' }
+```
+
+* `id` is the part's own frame ID from the prefix, so the cursor confirms parts like any data frame.
+* `of` is the ID of the message's first part, which is also the message's ID (the `to` of its
+  reply). Every part of the message carries it.
+* `last: true` marks the final part. The receiver concatenates the `data` of the parts of one `of`
+  in order. The result is the CBOR body of a `msg` frame (uncompressed). The receiver decodes it and
+  processes it then, as the message with ID `of`.
+* Parts of one message are sent consecutively within its lane. Parts of different lanes
+  interleave.
+* A reassembled message may be up to 32 MiB. More is a protocol error. A receiver holds at most
+  64 MiB of incomplete messages per session. More is `queue_overflow`.
+* Incomplete messages survive a resumed session (their parts were confirmed or are resent). A lost
+  session discards them.
+
+**Scheduling.** The sender keeps one queue per lane. Whenever the WebSocket can take another frame
+(the sender writes one frame at a time and waits for the socket, rather than buffering ahead), it
+picks the next frame:
+
+1. An `ack`, if one is due. Acks never wait behind data.
+2. The `control` lane, if it has a frame. Control traffic is small and latency-sensitive.
+3. Otherwise, the next lane in **deficit round robin** with a quantum of 64 KiB. Each lane with
+   queued frames gets up to 64 KiB per round, so a lane with a 16 MiB transfer and a lane with a
+   200-byte message each get a turn. The small one waits at most one part of every other busy lane.
+
+The frame gets its ID as it is written. Quanta and the scheduling policy are the sender's own
+choice, and a sender may use another fair policy. The wire rules are per-lane order and the 64 KiB
+part limit. The receiver delivers each message once it is complete, in the order messages
+complete. A receiver that runs handlers concurrently (the node does) keeps the handlers of one
+entity, meaning one process, watch or stream, in delivery order, so `exec.write`s reach stdin in
+order. Handlers of different entities run in parallel.
+
+**Resume.** On resume, frames already written (with IDs) after the peer's cursor are resent first,
+in ID order. Then scheduling continues from the lane queues. Messages that never reached the wire
+have no ID yet, and simply go out later.
 
 ### Confirmations are a cursor
 
-Each side confirms what it has received with a **cursor**: the UUIDv7 of the latest message it
+Each side confirms what it has received with a **cursor**: the frame ID of the latest data frame it
 has received and accepted from the other side. It never lists individual IDs. Because each
-sender's IDs strictly increase and messages are processed in order, one cursor confirms that
-message and every message before it.
+sender's frame IDs strictly increase in wire order, one cursor confirms that data frame and every
+data frame before it.
 
 ```json
 { "t": "ack", "cursor": "0193a3b4-7c2e-7aa1-9f00-3c1d2e4f5a6b" }
 ```
 
-When an `ack` arrives, its receiver drops every queued message with an ID at or below `cursor`.
+When an `ack` arrives, its receiver drops every kept data frame with an ID at or below `cursor`.
 Accepted means handed to the handler, not finished (that is what a `reply` says). A side sends
-its cursor no later than 200 ms after receiving a message, or after 64 messages since its last
-`ack`, whichever comes first. An `ack` whose cursor has not moved is not sent, except to answer
-a duplicate (its sender evidently missed the last one). Acks are not
-messages: they have no ID, are never queued and never confirmed. A lost ack costs nothing,
+its cursor no later than 200 ms after receiving a data frame, or after 64 data frames since its
+last `ack`, whichever comes first. An `ack` whose cursor has not moved is not sent, except that a
+duplicate is acked again. Acks are not data frames: they are never kept, resent or confirmed. A lost ack costs nothing,
 because the next one carries a later cursor, and the handshake carries the cursor too.
 
 ### Commands and replies
@@ -792,7 +891,9 @@ session, `node.ready` goes first.
 
 | What | Limit |
 |---|---|
-| WebSocket frame | 32 MiB, after decompression |
+| WebSocket frame | 64 KiB of message per frame (`part`), 1 MiB after decompression |
+| Reassembled message | 32 MiB |
+| Incomplete messages held by a receiver | 64 MiB per session |
 | Ack delay | 200 ms or 64 messages |
 | Session resume window | set by `welcome.resumeWindowMs` |
 | `fs.read` / `fs.write` data | 16 MiB per call |

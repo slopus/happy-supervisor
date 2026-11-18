@@ -32,14 +32,17 @@ impl Peer {
             installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
         };
         let (mut session, _) = Session::new(Role::Node(identity), ManualClock::new(0));
-        session.connected(wire::Wire::Plain);
+        session.connected();
         let welcome = Frame::Welcome(Welcome {
             session: SessionId(uuid::Uuid::from_u128(1)),
             resumed: false,
             cursor: None,
             resume_window_ms: 1000,
         });
-        session.receive(&wire::to_cbor(&welcome));
+        session.receive(&wire::frame(
+            uuid::Uuid::from_u128(2),
+            &wire::to_cbor(&welcome),
+        ));
         let info = serde_json::from_value(json!({
             "installationId": "tz4a98xxat96iws9zmbrgj3a", "name": "box", "hostname": "box",
             "supervisorVersion": "0.1.0",
@@ -64,7 +67,7 @@ impl Peer {
 
     fn drain(&mut self) {
         while let Some(payload) = self.session.poll_transmit() {
-            if let Frame::Msg(msg) = wire::from_cbor(&payload).unwrap()
+            if let Frame::Msg(msg) = wire::from_cbor(wire::split(&payload).unwrap().1).unwrap()
                 && msg.kind == "watch.event"
             {
                 let event: WatchEvent = wire::from_value(msg.body).unwrap();

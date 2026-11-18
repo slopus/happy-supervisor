@@ -21,6 +21,7 @@ pub mod testing;
 pub mod tunnel;
 pub mod watch;
 pub mod wire;
+pub mod ws;
 
 /// JSON literals for CBOR values, for this crate's tests and for tests of a control plane.
 #[cfg(any(test, feature = "testing"))]

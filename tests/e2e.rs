@@ -9,7 +9,7 @@ use std::time::Duration;
 use happy_supervisor::protocol::{
     Bytes, Event, ExecExit, ExitStatus, ProxyBody, ProxyEnd, ProxyMessage, ProxyResponse, Stream,
 };
-use happy_supervisor::testing::{ControlPlane, Options};
+use happy_supervisor::testing::{ControlPlane, Options, Traffic};
 use happy_supervisor::testkit::{cbor, json};
 use serde_json::{Value as Json, json};
 use tokio::process::{Child, Command};
@@ -22,6 +22,7 @@ struct Node {
     cp: ControlPlane,
     dir: tempfile::TempDir,
     node_id: String,
+    single_lane: bool,
     child: Option<Child>,
     /// Events read while waiting for another one, oldest first.
     seen: Vec<Event>,
@@ -33,6 +34,26 @@ impl Node {
     }
 
     async fn start_with(options: Options) -> Node {
+        Node::start_full(options, false).await
+    }
+
+    /// A node that sends everything through one lane, as a link without lanes would.
+    async fn start_single_lane() -> Node {
+        Node::start_full(Options::default(), true).await
+    }
+
+    async fn start_full(options: Options, single_lane: bool) -> Node {
+        let mut node = Node::spawn(options, single_lane).await;
+        let ready = node.event(|e| matches!(e, Event::NodeReady(_))).await;
+        let Event::NodeReady(ready) = ready else {
+            unreachable!()
+        };
+        assert_eq!(ready.previous_session, None);
+        node
+    }
+
+    /// Joins and starts `run`, without waiting for it to connect.
+    async fn spawn(options: Options, single_lane: bool) -> Node {
         let cp = ControlPlane::start_with(options).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let token = cp.issue_join_token();
@@ -43,15 +64,11 @@ impl Node {
             cp,
             dir,
             node_id,
+            single_lane,
             child: None,
             seen: Vec::new(),
         };
         node.run();
-        let ready = node.event(|e| matches!(e, Event::NodeReady(_))).await;
-        let Event::NodeReady(ready) = ready else {
-            unreachable!()
-        };
-        assert_eq!(ready.previous_session, None);
         node
     }
 
@@ -66,7 +83,11 @@ impl Node {
             .append(true)
             .open(self.dir.path().join("run.log"))
             .unwrap();
-        let child = Command::new(BIN)
+        let mut command = Command::new(BIN);
+        if self.single_lane {
+            command.env(happy_supervisor::client::SINGLE_LANE_ENV, "1");
+        }
+        let child = command
             .arg("run")
             .arg("--state-dir")
             .arg(self.state())
@@ -484,52 +505,164 @@ async fn sigterm_ends_the_session_and_exits_0() {
     assert_eq!(node.wait_exit_code().await, Some(0));
 }
 
-/// The same traffic with and without deflate. Prints the byte counts.
-#[tokio::test]
-async fn deflate_shrinks_the_link_and_plain_v1_still_works() {
-    let mut counts = Vec::new();
-    for deflate in [true, false] {
-        let mut node = Node::start_with(Options {
-            deflate,
-            ..Options::default()
-        })
-        .await;
-        for _ in 0..5 {
-            node.ok("node.info", json!({})).await;
-        }
-        node.ok(
-            "exec.start",
-            sh("seq", "seq 1 20000", Path::new("/"), raw()),
-        )
-        .await;
-        let (_, stdout, _) = node.exit("seq").await;
-        assert_eq!(stdout.lines().count(), 20000);
-        let received = node.cp.received();
-        let sent = node.cp.sent();
-        println!(
-            "deflate={deflate}: node -> control plane {} frames, {} bytes on the wire for {} \
-             bytes of CBOR (ratio {:.3}); control plane -> node {} frames, {} wire / {} CBOR",
-            received.frames,
-            received.wire_bytes,
-            received.cbor_bytes,
-            received.wire_bytes as f64 / received.cbor_bytes as f64,
-            sent.frames,
-            sent.wire_bytes,
-            sent.cbor_bytes,
-        );
-        if deflate {
-            // Every frame carries the one-byte prefix; the NodeInfo replies shrink.
-            assert!(
-                received.wire_bytes * 10 < received.cbor_bytes * 6,
-                "{received:?}"
-            );
-        } else {
-            assert_eq!(received.wire_bytes, received.cbor_bytes);
-            assert_eq!(sent.wire_bytes, sent.cbor_bytes);
-        }
-        counts.push(received.cbor_bytes);
+/// What the control plane received between two readings.
+fn since(before: Traffic, after: Traffic) -> Traffic {
+    Traffic {
+        frames: after.frames - before.frames,
+        frame_bytes: after.frame_bytes - before.frame_bytes,
+        wire_bytes: after.wire_bytes - before.wire_bytes,
     }
-    assert!(counts.iter().all(|&c| c > 100_000), "{counts:?}");
+}
+
+fn report(what: &str, t: Traffic) {
+    println!(
+        "{what}: {} frames, {} bytes as frames, {} bytes on the wire (ratio {:.3}; {:.1} -> {:.1} bytes per frame)",
+        t.frames,
+        t.frame_bytes,
+        t.wire_bytes,
+        t.wire_bytes as f64 / t.frame_bytes as f64,
+        t.frame_bytes as f64 / t.frames as f64,
+        t.wire_bytes as f64 / t.frames as f64,
+    );
+}
+
+/// permessage-deflate is offered, accepted, and shrinks small frames and large ones. Prints the
+/// byte counts against the raw frame sizes.
+#[tokio::test]
+async fn the_link_is_compressed_with_permessage_deflate() {
+    let mut node = Node::start().await;
+    assert_eq!(
+        node.cp.offered_extensions().as_deref(),
+        Some(happy_supervisor::ws::DEFLATE_OFFER)
+    );
+    let accepted = node.cp.accepted_extensions().unwrap();
+    assert!(accepted.starts_with("permessage-deflate"), "{accepted}");
+    assert!(node.log().contains("permessage-deflate"), "{}", node.log());
+
+    // Build output, one line per write: a run of small frames.
+    let before = node.cp.received();
+    let script = "i=0; while [ $i -lt 3000 ]; do \
+        echo \"   Compiling crate-$i v0.1.$i (/home/me/repo/crates/crate-$i)\"; i=$((i+1)); done";
+    node.ok("exec.start", sh("build", script, Path::new("/"), raw()))
+        .await;
+    let (_, stdout, _) = node.exit("build").await;
+    assert_eq!(stdout.lines().count(), 3000);
+    let build = since(before, node.cp.received());
+    report("build output, node -> control plane", build);
+
+    let before = node.cp.received();
+    for _ in 0..5 {
+        node.ok("node.info", json!({})).await;
+    }
+    let info = since(before, node.cp.received());
+    report("5 node.info replies, node -> control plane", info);
+    report("everything, control plane -> node", node.cp.sent());
+
+    assert!(build.frames > 100, "{build:?}");
+    assert!(build.wire_bytes * 10 < build.frame_bytes * 5, "{build:?}");
+    assert!(info.wire_bytes * 10 < info.frame_bytes * 6, "{info:?}");
+}
+
+#[tokio::test]
+async fn a_control_plane_that_declines_compression_is_refused() {
+    let node = Node::spawn(
+        Options {
+            deflate: false,
+            ..Options::default()
+        },
+        false,
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !node.log().contains("did not accept permessage-deflate") {
+        assert!(tokio::time::Instant::now() < deadline, "{}", node.log());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(node.cp.accepted_extensions(), None);
+    assert_eq!(node.cp.session(), None);
+}
+
+/// 100 tiny commands while 16 MiB reads keep the link busy, with lanes and through one lane.
+/// Prints both p99s.
+#[tokio::test]
+async fn tiny_commands_stay_fast_beside_a_16_mib_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big");
+    // Incompressible, so the reads keep the link busy.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let data: Vec<u8> = (0..16 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    std::fs::write(&big, &data).unwrap();
+    let mut p99s = Vec::new();
+    for single_lane in [false, true] {
+        let node = if single_lane {
+            Node::start_single_lane().await
+        } else {
+            Node::start().await
+        };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // Three reads in flight keep the node's side of the link busy. Four would pass the
+        // 64 MiB budget of its outgoing queue and lose the session.
+        let reader = || async {
+            let mut reads = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                // The reply stays CBOR: turning 16 MiB into a JSON literal would stall this task.
+                let params = cbor(json!({ "path": path(&big), "access": raw() }));
+                let read = node
+                    .cp
+                    .command("fs.read", params)
+                    .await
+                    .unwrap_or_else(|err| panic!("fs.read: {err}; node log:\n{}", node.log()));
+                let size = read
+                    .as_map()
+                    .unwrap()
+                    .iter()
+                    .find(|(k, _)| k.as_text() == Some("size"));
+                assert_eq!(size.unwrap().1.as_integer(), Some((16 << 20).into()));
+                reads += 1;
+            }
+            reads
+        };
+        let bulk = async {
+            let (a, b, c) = tokio::join!(reader(), reader(), reader());
+            a + b + c
+        };
+        let tiny = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut latencies = Vec::new();
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let started = std::time::Instant::now();
+                node.ok(
+                    "fs.stat",
+                    json!({ "path": path(dir.path()), "access": raw() }),
+                )
+                .await;
+                latencies.push(started.elapsed());
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            latencies
+        };
+        let (reads, mut latencies) = tokio::join!(bulk, tiny);
+        latencies.sort();
+        let (p50, p99) = (latencies[49], latencies[98]);
+        println!(
+            "{}: fs.stat p50 {:.1} ms, p99 {:.1} ms, max {:.1} ms beside {reads} reads of 16 MiB",
+            if single_lane { "one lane" } else { "lanes" },
+            p50.as_secs_f64() * 1000.0,
+            p99.as_secs_f64() * 1000.0,
+            latencies[99].as_secs_f64() * 1000.0,
+        );
+        assert!(reads >= 1);
+        p99s.push(p99);
+    }
+    assert!(p99s[0] < Duration::from_millis(50), "{p99s:?}");
 }
 
 #[tokio::test]

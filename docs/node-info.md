@@ -63,7 +63,7 @@ collection. On the wire a `null` field is omitted (api.md, Encoding). Collection
 | `name` | string \| null | Distribution or product name. Linux: `NAME` from `/etc/os-release`. macOS: `"macOS"`. Windows: the product name, such as `"Windows 11 Pro"`. |
 | `version` | string \| null | Linux: `VERSION_ID`. macOS: the product version (`"15.1"`). Windows: `major.minor.build` (`"10.0.26100"`). |
 | `kernelVersion` | string \| null | Linux: `uname -r`. macOS: the Darwin release (`"24.1.0"`). Windows: the build number. |
-| `arch` | `"x86_64"` \| `"aarch64"` | The CPU architecture of the **machine**, not the binary. An x86_64 binary under Rosetta reports `aarch64`. |
+| `arch` | `"x86_64"` \| `"aarch64"` | The CPU architecture of the **machine**, not the binary. An x86_64 binary under Rosetta reports `aarch64` (`sysctl.proc_translated`), and one under emulation on Windows on ARM reports `aarch64` (`IsWow64Process2`). Linux reports `uname -m`. |
 
 ### `cpu`
 
@@ -86,6 +86,18 @@ One entry per mounted local filesystem that holds data: physical disks, partitio
 Pseudo-filesystems (`proc`, `sysfs`, `tmpfs`, `devtmpfs`, `overlay`, `squashfs`, `autofs`, and
 the like) and macOS system snapshots that duplicate the data volume are left out. Network
 filesystems are left out.
+
+* **Linux.** From `/proc/self/mountinfo`: filesystems whose source is a block device under
+  `/dev/`, and ZFS datasets. That leaves out pseudo, overlay, network and FUSE filesystems
+  (`fuseblk`, which sits on a block device, stays). Read-only images (`squashfs`, `erofs`,
+  `iso9660`) are left out. A device mounted several times, as bind mounts do, is listed once,
+  at the mount of its own root, else at its shortest mount point. Sizes come from `statvfs`.
+  `removable` is the disk's `removable` flag in sysfs, or a disk on USB.
+* **macOS.** From `getfsstat`: local volumes that Finder shows, plus the data volume
+  `/System/Volumes/Data`, which is hidden like the other system volumes but holds the data.
+  Since Catalina `/` is the read-only system volume in the same APFS container, so `/` is left
+  out and the data volume stands for it. `removable` is `MNT_REMOVABLE`.
+* **Windows.** Fixed and removable volumes; `removable` is `DRIVE_REMOVABLE`.
 
 | Field | Type | Meaning |
 |---|---|---|

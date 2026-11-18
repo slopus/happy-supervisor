@@ -1,1 +1,7 @@
-//! GPU discovery per platform (node-info.md, gpus). Owned by the node-info track.
+//! GPU discovery per platform (node-info.md, `gpus`).
+
+use crate::protocol::GpuInfo;
+
+pub(super) fn probe() -> Vec<GpuInfo> {
+    Vec::new()
+}

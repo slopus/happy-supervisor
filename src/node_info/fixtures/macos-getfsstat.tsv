@@ -1,0 +1,16 @@
+/	/dev/disk3s1s1	apfs	0x4480d001	242837545	60633962	4096
+/dev	devfs	devfs	0x04101000	435	0	512
+/System/Volumes/VM	/dev/disk3s6	apfs	0x14909004	242837545	60634216	4096
+/System/Volumes/Preboot	/dev/disk3s2	apfs	0x04909000	242837545	60634216	4096
+/System/Volumes/Update	/dev/disk3s4	apfs	0x04909000	242837545	60634216	4096
+/System/Volumes/xarts	/dev/disk1s2	apfs	0x14909004	128000	123613	4096
+/System/Volumes/iSCPreboot	/dev/disk1s1	apfs	0x04909000	128000	123613	4096
+/System/Volumes/Hardware	/dev/disk1s3	apfs	0x04909000	128000	123613	4096
+/System/Volumes/Data	/dev/disk3s5	apfs	0x04909080	242837545	60633972	4096
+/System/Volumes/Data/home	map auto_home	autofs	0x04500000	0	0	1024
+/Library/Developer/CoreSimulator/Volumes/iOS_23F77	/dev/disk9s1	apfs	0x14909219	4414976	113786	4096
+/Library/Developer/CoreSimulator/Volumes/iOS_23D8133	/dev/disk13s1	apfs	0x14909219	4334592	112212	4096
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.iPhoneOS.SimulatorRuntime-v24.1.434.0.zgpRyq	/dev/disk15s1	apfs	0x04909201	4531200	122949	4096
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.iPhoneOS.SimulatorRuntime-v24.1.94425.0.oxVSFn	/dev/disk17s1	apfs	0x04909201	4455424	121128	4096
+/Volumes/HappyScratch	/dev/disk3s7	apfs	0x04809080	36621094	5714746	4096
+/Volumes/HappyScratch400	/dev/disk3s8	apfs	0x04809080	97656250	54596988	4096

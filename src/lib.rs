@@ -2,6 +2,7 @@
 //! watch for changes on this machine. The contract is in `docs/`.
 
 pub mod error;
+pub mod events;
 pub mod policy;
 pub mod protocol;
 

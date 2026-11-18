@@ -97,11 +97,6 @@ impl Error {
     pub fn too_large(message: impl Into<String>) -> Error {
         Error::new(ErrorKind::TooLarge, message)
     }
-
-    /// Returned by scaffold stubs until their track lands. Delete with the last caller.
-    pub(crate) fn not_implemented(what: &str) -> Error {
-        Error::new(ErrorKind::Io, format!("{what} is not implemented yet"))
-    }
 }
 
 impl From<std::io::Error> for Error {

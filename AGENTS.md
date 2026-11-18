@@ -29,8 +29,8 @@ protocol rule in `client` or `testing`.
 | `node_info/*` | node-info track |
 
 Stay inside your files. A change to a frozen signature, a shared type, or a dependency goes
-through the scaffold owner, not into your track's diff. Stubs return `Error::not_implemented`.
-Replace them, and delete `Error::not_implemented` with its last caller.
+through the scaffold owner, not into your track's diff. Every stub is implemented now; a new
+seam gets a real implementation in the same change, not a stub.
 
 ## Conventions
 

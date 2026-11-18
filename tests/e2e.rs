@@ -531,3 +531,119 @@ async fn deflate_shrinks_the_link_and_plain_v1_still_works() {
     }
     assert!(counts.iter().all(|&c| c > 100_000), "{counts:?}");
 }
+
+#[tokio::test]
+async fn files_are_read_written_and_listed_raw_and_sandboxed() {
+    let node = Node::start().await;
+    let work = tempfile::tempdir().unwrap();
+    let (open, closed) = (work.path().join("open"), work.path().join("closed"));
+    std::fs::create_dir(&open).unwrap();
+    std::fs::create_dir(&closed).unwrap();
+    std::fs::write(closed.join("secret.txt"), "secret").unwrap();
+    let file = |dir: &Path, name: &str| format!("{}/{name}", path(dir));
+
+    for (label, access) in [("raw", raw()), ("sandboxed", node.sandboxed(&[], &[&open]))] {
+        let target = file(&open, &format!("{label}.txt"));
+        let written = json!({ "path": target, "access": access, "data": hex(b"hello\n"),
+                              "mode": "create" });
+        node.ok("fs.write", written.clone()).await;
+        let again = node.call("fs.write", written).await.unwrap_err();
+        assert_eq!(
+            again.kind,
+            happy_supervisor::ErrorKind::AlreadyExists,
+            "{label}"
+        );
+        node.ok(
+            "fs.write",
+            json!({ "path": target, "access": access, "data": hex(b"world\n"), "mode": "append" }),
+        )
+        .await;
+        let read = node
+            .ok(
+                "fs.read",
+                json!({ "path": target, "access": access, "offset": 6 }),
+            )
+            .await;
+        assert_eq!(
+            read,
+            json!({ "data": hex(b"world\n"), "size": 12 }),
+            "{label}"
+        );
+        let stat = node
+            .ok("fs.stat", json!({ "path": target, "access": access }))
+            .await;
+        assert_eq!(
+            (stat["kind"].clone(), stat["size"].clone()),
+            (json!("file"), json!(12))
+        );
+    }
+    let listed = node
+        .ok("fs.list", json!({ "path": path(&open), "access": raw() }))
+        .await;
+    let names: Vec<&str> = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["raw.txt", "sandboxed.txt"]);
+
+    let sandboxed = node.sandboxed(&[], &[&open]);
+    let denied = node
+        .call(
+            "fs.read",
+            json!({ "path": file(&closed, "secret.txt"), "access": sandboxed }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.kind, happy_supervisor::ErrorKind::PermissionDenied);
+    let denied = node
+        .call(
+            "fs.write",
+            json!({ "path": file(&closed, "new.txt"), "access": sandboxed,
+                    "data": hex(b"x"), "mode": "create" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.kind, happy_supervisor::ErrorKind::PermissionDenied);
+    assert!(!closed.join("new.txt").exists());
+    let secret = node
+        .ok(
+            "fs.read",
+            json!({ "path": file(&closed, "secret.txt"), "access": raw() }),
+        )
+        .await;
+    assert_eq!(secret["data"], hex(b"secret"));
+}
+
+#[tokio::test]
+async fn a_watch_reports_a_new_file() {
+    let mut node = Node::start().await;
+    let work = tempfile::tempdir().unwrap();
+    let dir = path(work.path());
+    node.ok(
+        "watch.start",
+        json!({ "watchId": "w-1", "path": dir, "recursive": true,
+                "access": node.sandboxed(&[work.path()], &[]) }),
+    )
+    .await;
+    std::fs::write(work.path().join("new.txt"), "x").unwrap();
+    let created = format!("{dir}/new.txt");
+    let event = node
+        .event(|e| match e {
+            Event::WatchEvent(w) => match &w.body {
+                happy_supervisor::protocol::WatchEventBody::Changes { changes } => {
+                    changes.iter().any(|c| c.path == created)
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+        .await;
+    let Event::WatchEvent(event) = event else {
+        unreachable!()
+    };
+    assert_eq!(event.watch_id.as_str(), "w-1");
+    let listed = node.ok("watch.stop", json!({ "watchId": "w-1" })).await;
+    assert_eq!(listed, json!({}));
+}

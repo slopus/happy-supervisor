@@ -18,6 +18,10 @@ pub mod state;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod watch;
+pub mod wire;
+
+#[cfg(test)]
+mod testkit;
 
 pub use error::{Error, ErrorKind, Result};
 

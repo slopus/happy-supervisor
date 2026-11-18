@@ -34,6 +34,8 @@ notify = "8"
 sysinfo = "0.37"
 cuid2 = "0.1"
 uuid = { version = "1.29", features = ["v7", "serde"] }
+ciborium = "0.2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 axum = { version = "0.8", features = ["ws"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

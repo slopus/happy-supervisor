@@ -23,6 +23,7 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | Type | Module | Owner |
 |---|---|---|
 | Link frames (`hello`, `welcome`, `msg`, `ack`, `bye`), every message kind's body type (commands, replies, events), `Access`, `Policy` wire shape, `NodeInfo` | `protocol` | scaffold, frozen |
+| `Wire::{Plain, Deflate}` (subprotocol ↔ frame codec: 1-byte prefix, raw deflate, 32 MiB inflate bound), `to_cbor`/`from_cbor`/`to_value`/`from_value`, the dynamic body `Value` | `wire` | scaffold |
 | `Error { kind: ErrorKind, message }`, `ErrorKind` ↔ `kind` string table | `error` | scaffold |
 | `Policy` (validated when built or parsed: path rules, list sizes), `ResolvedPolicy` (canonical grants, `ignored`, hidden state dir, `can_read`/`can_write`), `Confinement::{Raw, Sandboxed(ResolvedPolicy)}` | `policy` | scaffold |
 | `Job { policy: ResolvedPolicy, op: JobOp }`, `JobOp::{Exec, Fs}`, the length-prefixed job framing on the helper's stdin, the exec status pipe, `helper::main` | `helper` | scaffold |

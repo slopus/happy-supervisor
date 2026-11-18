@@ -2,13 +2,12 @@
 //! signatures.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::policy::Confinement;
 use crate::protocol::{
     Empty, FsListResult, FsMkdirParams, FsPathParams, FsReadParams, FsReadResult, FsRemoveParams,
-    FsStat, FsWriteParams,
+    FsStat, FsWriteParams, Value,
 };
 
 /// One file operation without its `access`. Travels to the sandbox helper inside a
@@ -35,15 +34,14 @@ pub enum FsResponse {
 }
 
 impl FsResponse {
-    /// The JSON-RPC `result` of the request this answers.
+    /// The reply body of the request this answers.
     pub fn into_value(self) -> Value {
-        let value = match self {
-            FsResponse::Stat(stat) => serde_json::to_value(stat),
-            FsResponse::List(list) => serde_json::to_value(list),
-            FsResponse::Read(read) => serde_json::to_value(read),
-            FsResponse::Done => serde_json::to_value(Empty {}),
-        };
-        value.expect("fs responses serialize")
+        match self {
+            FsResponse::Stat(stat) => crate::wire::to_value(&stat),
+            FsResponse::List(list) => crate::wire::to_value(&list),
+            FsResponse::Read(read) => crate::wire::to_value(&read),
+            FsResponse::Done => crate::wire::to_value(&Empty {}),
+        }
     }
 }
 

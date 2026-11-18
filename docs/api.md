@@ -308,8 +308,10 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
 }
 ```
 
-* `argv[0]` is an absolute path, or a bare name looked up in `env.PATH`. `argv` is not
-  interpreted by a shell. To run a shell line, send `["/bin/sh", "-c", "…"]`.
+* `argv[0]` is an absolute path, or a bare name looked up in `env.PATH` (absolute entries only,
+  in order; on Windows also with each `env.PATHEXT` extension). Without `PATH` a bare name is
+  `not_found`. A relative path with a separator is `invalid_params`. `argv` is not interpreted
+  by a shell. To run a shell line, send `["/bin/sh", "-c", "…"]`.
 * `cwd` is absolute and must exist. Under a sandbox it must be readable by the policy.
 * `env` is the **whole** environment. Nothing from the supervisor's own environment is passed.
   NodeInfo's `defaultEnv` holds the usual variables for this machine, for the control plane
@@ -337,24 +339,30 @@ Result:
 `ignoredPaths` lists the policy paths that did not exist and therefore grant nothing (policy.md).
 It is empty for raw access.
 
-A process that cannot start (binary missing, `cwd` refused) still gets its ID. The start
-replies with the error, and no `exec.exit` follows.
+A process that cannot start (binary missing, `cwd` refused, log file refused, memory budget
+full) still gets its ID. The start replies with the error, and no `exec.exit` follows. It is
+not listed by `exec.list` or `node.ready`, its `exec.log` is empty, and it counts as an exited
+process for retention, so its ID frees up once 256 later processes have ended.
 
-Each command runs in its own process group (Unix) or Job Object (Windows). Killing it kills
-the whole tree. A sandboxed process and everything it starts stay inside the sandbox.
+Each command runs in its own session and process group (Unix, `setsid`) or Job Object
+(Windows). Killing it kills the whole tree. A sandboxed process and everything it starts stay
+inside the sandbox. On Windows the process joins its Job Object right after it is created, so a
+child it starts in that first instant can escape the tree.
 
 ### `exec.write`
 
 Params `{ "execId": "…", "data": h'…', "eof": false }`. Writes to stdin. `eof: true`
 closes stdin after the data. `data` may be empty. Writing to a process started with
-`stdin: false`, or after `eof`, is `invalid_params`. At most 1 MiB of data per call.
+`stdin: false`, after `eof`, or that is not running, is `invalid_params`. At most 1 MiB of data
+per call (more is `too_large`). The reply comes once the process has taken the data into its
+stdin pipe.
 
 ### `exec.kill`
 
 Params `{ "execId": "…", "signal": "terminate" }`, where `signal` is `terminate` (SIGTERM to the
 process group, or `TerminateJobObject` on Windows) or `kill` (SIGKILL to the group, or
 `TerminateJobObject`). Replies `{}` immediately. The exit arrives as `exec.exit`. Killing an
-exited process replies `{}` and does nothing.
+exited process replies `{}` and does nothing. On Windows both end the tree with exit code 1.
 
 ### `exec.list`
 
@@ -388,7 +396,9 @@ full (see Event delivery).
 A backgrounded process that later exits reports `exited` or `signaled` as usual.
 
 `exec.exit` is sent after the last `exec.output` of the process, and is never dropped.
-`logBytes` is the total output the process produced.
+`logBytes` is the total output the process produced. After the process exits, the node waits
+for its stdout and stderr to close, or for them to stay silent for 100 ms, since processes it
+left behind may hold them open. Output those leftovers write later is neither sent nor logged.
 
 ### `exec.timedOut` (event)
 
@@ -418,8 +428,8 @@ Result:
 ```
 
 Offsets are positions in everything the process ever wrote, so they stay valid when the node
-drops old output. `retained` lists the ranges the log still holds, at most two (see Output
-logs). If `offset` falls in a dropped range, the read starts at the next retained byte, and the
+drops old output. `retained` lists the non-empty ranges the log still holds, at most two (see
+Output logs), so an empty log has none. If `offset` falls in a dropped range, the read starts at the next retained byte, and the
 answered `offset` says where. A read never crosses a dropped range: it stops at the range's end,
 and the caller continues from the next `retained` start. To follow a running process, read from
 the previous `offset` + data length until it reaches `totalBytes`.
@@ -443,18 +453,21 @@ output is the least useful.
 
 * `{ "kind": "memory", "limitBytes": 1048576 }`. Held in the supervisor's memory. `limitBytes`
   defaults to 1 MiB and may be at most 16 MiB. All memory logs on a node share a 256 MiB budget.
-  When it is exceeded, the logs of the oldest exited processes are discarded first (their
-  `exec.log` then replies with empty `retained`). An `exec.start` that would exceed the budget
-  with running processes alone replies `too_large`.
+  A running process counts at its `limitBytes`, an exited one at the bytes its log still holds.
+  When a start would exceed the budget, the logs of the oldest exited processes are discarded
+  first (their `exec.log` then replies with empty `retained`, and `totalBytes` keeps counting).
+  An `exec.start` that would exceed the budget with running processes alone replies
+  `too_large`.
 * `{ "kind": "file", "path": "/abs/path.log", "limitBytes": 67108864 }`. Written to `path` as plain
   text, so it can also be read with `fs.read` or by people on the machine. `limitBytes` defaults
   to 64 MiB and may be at most 1 GiB. The parent directory must exist. The node never creates
   directories for a log. The file is created, or truncated if it exists. Under a sandbox, `path`
   must be writable by the policy, and the node checks that against the policy before starting.
   The node writes the log itself, not the sandboxed process. When the middle is dropped, the
-  node rewrites the file as the head, one line `[happy-supervisor: N bytes omitted]`, then the
-  tail, by writing a temp file beside it and renaming it over. `exec.log` offsets never count
-  that line.
+  node rewrites the file as the head, one line `[happy-supervisor: N bytes omitted]` (`N` is
+  every byte dropped so far), then the tail, by writing `<name>.happy-supervisor-tmp` beside it
+  and renaming it over. The line follows the head's last byte directly, even mid-line.
+  `exec.log` offsets never count that line.
 
 ## Files
 

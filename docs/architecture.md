@@ -75,6 +75,21 @@ blocking thread. Raw commands are spawned directly.
 The job travels on stdin, never in argv or the environment, so other users cannot see
 the command's environment in `ps`.
 
+## Watching
+
+Watches run in the supervisor, not in the sandbox helper. A watch lives as long as the control
+plane wants, and an OS sandbox would cost a long-lived helper process per watch. Watching shows
+only names and kinds of changes, never contents, so filtering them is enough: a sandboxed watch
+keeps the `ResolvedPolicy` its `access` resolved to, the same canonical grants a helper would
+get, and reports a change only when `can_read` allows its path. notify watches the canonical
+root and does not follow symlinks, so every path the OS reports is canonical and `can_read`
+applies to it directly. The state directory is never readable, so it is never reported.
+
+Each watch is a notify watcher feeding a bounded channel, and one task that owns its
+`WatchState`: the scope (canonical root, the path as given, the filter) and the batch being
+collected until its deadline. The task sends through `Outbox`, which turns a full droppable
+queue into `overflow`. A full channel also becomes `overflow`.
+
 ## The link
 
 `link::Session` holds no sockets and no tasks. It is a state machine fed with events

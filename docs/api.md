@@ -490,18 +490,25 @@ Params `{ "path", "access" }`. Result:
 `kind` is `file`, `directory`, `symlink` or `other`. `stat` follows symlinks. `symlink` appears
 only from `fs.list`.
 
+Under a sandbox the supervisor also checks the path, with symlinks resolved, against the
+policy's read set before the helper runs, because Landlock governs opening files but not
+reading their metadata.
+
 ### `fs.list`
 
 Params `{ "path", "access" }`. Result `{ "entries": [ { "name": "src", "kind": "directory", "size": 4096 } ] }`,
-sorted by name. Entries are not followed, so a symlink lists as `symlink`. At most 10 000 entries.
-A larger directory replies `too_large`.
+sorted by name. Entries are not followed, so a symlink lists as `symlink`, and its `size` is the
+length of its target path. A name that is not valid UTF-8 is reported with U+FFFD in place of
+the invalid bytes. At most 10 000 entries. A larger directory replies `too_large`.
 
 ### `fs.read`
 
 Params `{ "path", "access", "offset": 0, "length": 1048576 }`. `offset` defaults to 0.
 `length` defaults to the rest of the file, and at most 16 MiB is read per call (more is
-`too_large`). Result `{ "data": h'…', "size": 1234 }`, where `size` is the whole file's
-size.
+`too_large`). Without `length`, a rest longer than 16 MiB is `too_large` too. The rest is found by
+reading, not from the size, so files that report size 0 (such as Linux's `/proc`) read fully.
+Result `{ "data": h'…', "size": 1234 }`, where `size` is the whole file's size. An
+`offset` at or past the end reads no data.
 
 ### `fs.write`
 
@@ -513,7 +520,11 @@ Params `{ "path", "access", "data": h'…', "mode": "overwrite" }`. `mode` is:
 
 The parent directory must exist. `fs.write` never creates directories. At most 16 MiB per call.
 `overwrite` writes a temp file beside the target and renames it over, so readers never see a
-half-written file. Result `{}`.
+half-written file. The replacement keeps the target's permissions. Through a symlink, the file
+it points to is replaced and the link stays. `overwrite` refuses what writing the file in place
+would refuse, such as a read-only file. When the directory does not allow the temp file but the
+file itself is writable (a sandbox policy that grants only the file), the file is truncated and
+written in place instead, and readers can then see it half-written. Result `{}`.
 
 ### `fs.mkdir`
 
@@ -523,7 +534,8 @@ Params `{ "path", "access", "recursive": false }`. `recursive` creates missing p
 ### `fs.remove`
 
 Params `{ "path", "access", "recursive": false }`. Removes a file, a symlink (not its target)
-or an empty directory. `recursive: true` removes a directory tree. Result `{}`.
+or an empty directory. `recursive: true` removes a directory tree. Symlinks inside the tree are
+removed, never followed. Result `{}`.
 
 ## Watching
 
@@ -533,10 +545,20 @@ or an empty directory. `recursive: true` removes a directory tree. Result `{}`.
 { "watchId": "w-1", "path": "/home/me/repo", "recursive": true, "access": { … } }
 ```
 
-Starts reporting changes under `path`, which must exist. Under a sandbox, `path` must be
-readable by the policy, and changes to paths the policy cannot read are never reported. The
-control plane chooses `watchId`, with the same rules as `execId`. A node holds at most 64
-watches. Result `{}`.
+Starts reporting changes under `path`, which must exist (else `not_found`). `path` may be a
+directory or a file. `recursive: false` reports only `path` and its direct children. Under a
+sandbox, `path` must be readable by the policy (else `permission_denied`), and changes to paths
+the policy cannot read, such as the supervisor's state directory, are never reported. The
+control plane chooses `watchId`, with the same rules as `execId`. An ID in use is
+`already_exists`. A node holds at most 64 watches, and a 65th is `too_large`. Result `{}`.
+
+Symlinks inside the watched tree are reported as themselves and never followed, so changes
+behind them are not reported. Changed paths are reported under `path` as written, even when it
+runs through a symlink (on macOS, `/tmp/x` is reported as `/tmp/x/…`, not `/private/tmp/x/…`).
+
+On Linux each watch holds one inotify instance and, when recursive, one inotify watch per
+directory. The OS caps both per user (`fs.inotify.max_user_instances`, by default 128, and
+`fs.inotify.max_user_watches`). A start that hits a cap replies `io`.
 
 ### `watch.stop`
 
@@ -549,8 +571,16 @@ Params `{ "watchId" }`. Result `{}`. Stopping an unknown watch is `not_found`.
 ```
 
 `kind` is `created`, `modified`, `removed` or `renamed`. A rename reports `renamed` for the old
-path and `created` for the new one when the OS gives both. Changes are batched for up to
-100 ms. At most 256 changes go in one event.
+path and `created` for the new one when the OS gives both. macOS does not say which side of a
+rename a path was on, so the node reports `created` if the path exists afterwards and `renamed`
+if it does not. Changes are batched for up to 100 ms. At most 256 changes go in one event.
+Within a batch, a change identical to the previous change of the same path is left out, so a
+file written in many pieces reports `modified` once.
+
+When a directory appears under a recursive watch, by creation or by moving in, each entry
+already in it is reported `created` too, since the OS reports nothing for entries made before
+it watched the directory. A path can therefore be reported `created` twice. A directory with
+more than 10 000 entries is reported as `overflow` instead.
 
 ```json
 { "watchId": "w-1", "overflow": true }
@@ -560,7 +590,8 @@ path and `created` for the new one when the OS gives both. Changes are batched f
 control plane should rescan what it cares about.
 
 If the watched path itself is removed, the node sends a final event with that `removed` change,
-then stops the watch.
+then stops the watch. Moving it away, or replacing it with a new file or directory, counts as
+removing it. The watch's ID is free again after that.
 
 ## Event delivery
 

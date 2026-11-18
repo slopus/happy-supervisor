@@ -6,7 +6,7 @@ every `node.ready` event, and collected again on each `node.info` command (api.m
 sampled over time. Free disk space is the one value that changes between collections.
 
 A probe that fails leaves its field `null` (or a list empty) rather than failing the whole
-collection. Collection must finish in under 5 seconds. A slow external probe (for example
+collection. On the wire a `null` field is omitted (api.md, Encoding). Collection must finish in under 5 seconds. A slow external probe (for example
 `nvidia-smi`) is cut off at 3 seconds.
 
 ## Example
@@ -50,7 +50,7 @@ collection. Collection must finish in under 5 seconds. A slow external probe (fo
 
 | Field | Type | Meaning |
 |---|---|---|
-| `installationId` | string | A [cuid2](https://github.com/paralleldrive/cuid2), 24 lowercase characters, generated the first time the supervisor runs with a given state directory and stored there in `installation-id`. It never changes after that, across restarts, re-joins and upgrades. Deleting the state directory makes a new installation. |
+| `installationId` | string | A [cuid2](https://github.com/paralleldrive/cuid2), 24 lowercase characters, generated the first time the supervisor runs with a given state directory and stored there in `private/installation-id`. It never changes after that, across restarts, re-joins and upgrades. Deleting the state directory makes a new installation. |
 | `name` | string | The name given with `join --name`, stored with the credentials. Defaults to the hostname. |
 | `hostname` | string | The OS hostname at collection time. |
 | `supervisorVersion` | string | The crate version of the running binary. |

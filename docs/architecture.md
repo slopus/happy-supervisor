@@ -47,7 +47,7 @@ behind it trusts those types and does not validate them again.
 
 Every sandboxed operation, command or file, runs in a fresh child: the supervisor's own binary
 invoked as `happy-supervisor __sandbox`. The child reads one job from stdin as a 4-byte
-big-endian length followed by that many bytes of JSON. It reads the job with unbuffered reads, so
+big-endian length followed by that many bytes of CBOR, the same encoding as the link. It reads the job with unbuffered reads, so
 nothing past the job is consumed. Then:
 
 * Linux: the helper calls `sandbox::enter(&job.policy)` (Landlock + `no_new_privs` + seccomp) on itself.
@@ -57,10 +57,11 @@ nothing past the job is consumed. Then:
   already confined.
 * Then `JobOp::Exec` execs the command (`execve`, so the PID stays the same and the rest of stdin
   belongs to the command). The parent passes the write end of a pipe as the helper's fd 3. If
-  confinement or the exec fails, the helper writes the `Error` as JSON there and exits 127. A
+  confinement or the exec fails, the helper writes the `Error` as CBOR there and exits 127. A
   successful exec closes it (close-on-exec) with nothing written, so the parent learns whether
   the command started before it replies to `exec.start`. `JobOp::Fs` runs `fs::perform` and
-  writes one JSON line, `{"ok": FsResponse}` or `{"err": Error}`, to stdout, then exits 0.
+  writes one frame, `{"ok": FsResponse}` or `{"err": Error}` as length-prefixed CBOR, to stdout,
+  then exits 0.
 * A job that cannot be read exits 125.
 
 The parent resolves the policy and sends the `ResolvedPolicy` in the job, so the parent's view
@@ -81,8 +82,8 @@ messages to deliver. `client.rs` owns the WebSocket and the reconnect loop and d
 keeps every protocol rule in one place, testable with literal frames and a fake clock, and lets
 the test control plane reuse it rather than reimplementing the protocol.
 
-The driver loop is: on connect call `connected`, write every `poll_transmit`; on each text frame
-call `receive`; after any call drain `poll_transmit` to the socket and `poll_incoming` to the
+The driver loop is: on connect call `connected` with the negotiated `Wire`, write every
+`poll_transmit` as a binary frame; on each binary frame call `receive`; after any call drain `poll_transmit` to the socket and `poll_incoming` to the
 handlers; sleep until `deadline` and call `tick`; wake on `changed` (an `Outbox` call) and
 drain again; close the socket when `is_closing` and nothing is left to transmit; call
 `disconnected` when the socket is gone. On the node, after `Incoming::Opened`, if
@@ -102,8 +103,13 @@ normally it kills every running group.
 Default: Linux `$XDG_STATE_HOME/happy-supervisor` (else `~/.local/state/happy-supervisor`;
 `/var/lib/happy-supervisor` when running as root). macOS
 `~/Library/Application Support/happy-supervisor`. Windows `%LOCALAPPDATA%\happy-supervisor`.
-`--state-dir` overrides it. It contains `installation-id` and `credentials.json`, created
-`0700` and `0600`. It is the `hidden` path of every job.
+`--state-dir` overrides it. Created `0700`. Two parts:
+
+* `private/` (`0700`): `installation-id`, `credentials.json` (`0600`), and the proxy CA key
+  `proxy-ca.key` (`0600`). It is the `hidden` path of every job: no sandboxed operation can read
+  or write it, whatever its policy grants.
+* `public/`: `ca-bundle.pem`, rewritten at each start (proxy.md). Sandboxed commands with a
+  `proxy` get read access to that one file.
 
 ## Testing
 

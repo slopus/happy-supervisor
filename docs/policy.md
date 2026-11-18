@@ -66,8 +66,10 @@ machine needs to run ordinary programs, for the control plane to copy into polic
 
 ## Always denied
 
-The supervisor's state directory, which holds its credentials, is neither readable nor
-writable by any sandboxed operation, even when a granted path contains it.
+The private part of the supervisor's state directory (`private/`, which holds its credentials and
+its proxy CA key) is neither readable nor writable by any sandboxed operation, even when a
+granted path contains it. The one exception to "nothing implicit" is the node's CA bundle
+(`public/ca-bundle.pem`), readable by sandboxed commands that use a proxy (proxy.md).
 
 ## Outbound network
 

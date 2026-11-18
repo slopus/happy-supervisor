@@ -7,6 +7,7 @@ use crate::protocol::{
     ExecId, ExecLogParams, ExecLogResult, ExecStartParams, ExecStartResult, ExecSummary,
     ExecWriteParams, KillSignal,
 };
+use crate::proxy::ProxyLease;
 
 /// Every command of this node, running or recently exited. Commands outlive connections.
 pub struct ExecManager {
@@ -20,12 +21,17 @@ impl ExecManager {
     }
 
     /// Starts a command. Sandboxed ones go through `sandbox::prepare` and the helper.
+    ///
+    /// `proxy` is the command's running credential proxy when `exec.start` asked for one
+    /// (`params.proxy` is then taken). Its `env()` replaces the same names in `params.env`, and
+    /// the command keeps it until it exits: dropping it stops the proxy (proxy.md).
     pub async fn start(
         &self,
         params: ExecStartParams,
         confinement: Confinement,
+        proxy: Option<ProxyLease>,
     ) -> Result<ExecStartResult> {
-        let _ = (params, confinement);
+        let _ = (params, confinement, proxy);
         Err(Error::not_implemented("exec.start"))
     }
 

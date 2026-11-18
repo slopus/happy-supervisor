@@ -29,6 +29,16 @@ impl StateDir {
         &self.root
     }
 
+    /// `private/`: identity, credentials and the proxy CA key. Every job's `hidden` path.
+    pub fn private_dir(&self) -> PathBuf {
+        self.root.join("private")
+    }
+
+    /// `public/`: the CA bundle, which sandboxed commands with a proxy may read.
+    pub fn public_dir(&self) -> PathBuf {
+        self.root.join("public")
+    }
+
     /// The cuid2 in `installation-id`, created on first use and never changed after.
     pub fn installation_id(&self) -> Result<String> {
         Err(Error::not_implemented("the installation ID"))

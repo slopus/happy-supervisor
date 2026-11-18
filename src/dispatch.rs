@@ -1,5 +1,5 @@
-//! The command boundary: parses each command's body, resolves `access` once, and calls the
-//! module that owns the command.
+//! The message boundary: parses each command's body, resolves `access` once, and calls the
+//! module that owns the command. Stream messages from the control plane go to the proxy.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -12,9 +12,10 @@ use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
     Access, CommandKind, Empty, ExecKillParams, ExecListResult, ExecLogParams, ExecStartParams,
     ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams, FsRemoveParams,
-    FsWriteParams, NodeInfo, NodeUpdate, SandboxInfo, Value, WatchId, WatchStartParams,
-    WatchStopParams, WithAccess,
+    FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, SandboxInfo, Value, WatchId,
+    WatchStartParams, WatchStopParams, WithAccess,
 };
+use crate::proxy::{NodeCa, ProxyManager};
 use crate::state::StateDir;
 use crate::watch::WatchManager;
 
@@ -27,16 +28,26 @@ pub struct Node {
     sandbox: SandboxInfo,
     exec: ExecManager,
     watch: WatchManager,
+    proxy: ProxyManager,
 }
 
 impl Node {
-    /// Reads the installation ID and the joined name from `state` and probes the sandbox.
-    /// Blocking.
+    /// Reads the installation ID and the joined name from `state`, loads the proxy CA (writing
+    /// `public/ca-bundle.pem`) and probes the sandbox. Blocking.
     pub fn open(state: StateDir, outbox: Outbox) -> Result<Node> {
         let installation_id = state.installation_id()?;
         let name = state.credentials()?.map(|c| c.name);
+        let ca = NodeCa::load_or_create(&state.private_dir(), &state.public_dir())?;
+        let proxy = ProxyManager::new(outbox.clone(), ca);
         let sandbox = crate::sandbox::probe();
-        Ok(Node::new(state, installation_id, name, sandbox, outbox))
+        Ok(Node::new(
+            state,
+            installation_id,
+            name,
+            sandbox,
+            outbox,
+            proxy,
+        ))
     }
 
     pub fn new(
@@ -45,6 +56,7 @@ impl Node {
         name: Option<String>,
         sandbox: SandboxInfo,
         outbox: Outbox,
+        proxy: ProxyManager,
     ) -> Node {
         Node {
             state,
@@ -53,6 +65,7 @@ impl Node {
             sandbox,
             exec: ExecManager::new(outbox.clone()),
             watch: WatchManager::new(outbox),
+            proxy,
         }
     }
 
@@ -78,6 +91,11 @@ impl Node {
         Ok((self.info().await?, self.exec.list(), self.watch.ids()))
     }
 
+    /// The session was lost (api.md, Lost sessions): every open proxy stream ends.
+    pub fn session_lost(&self) {
+        self.proxy.session_lost();
+    }
+
     /// Kills every running command, for a normal exit.
     pub async fn shutdown(&self) {
         self.exec.shutdown().await;
@@ -88,7 +106,7 @@ impl Node {
             Access::Raw {} => Ok(Confinement::Raw),
             Access::Sandboxed { policy } => {
                 self.sandbox.require_available()?;
-                let hidden = self.state.root().to_path_buf();
+                let hidden = self.state.private_dir();
                 let resolved =
                     tokio::task::spawn_blocking(move || ResolvedPolicy::resolve(&policy, &hidden))
                         .await
@@ -124,9 +142,25 @@ impl Node {
     }
 }
 
-/// Handles one command message. The result is the reply's `ok` or `error`. A kind that is not a
-/// command (including an event the node does not know) is `unknown_kind` (api.md, Errors).
-pub async fn dispatch(node: &Node, kind: &str, body: Value) -> Result<Value> {
+/// Handles one message from the control plane. A command's result is the reply's `ok` or
+/// `error`. A `proxy.*` stream message goes to the proxy and gets no reply (`None`); the node
+/// drops one it cannot parse, and `proxy.request`, which only the node sends. Any other kind,
+/// including an event the node does not know, is `unknown_kind` (api.md, Errors).
+pub async fn dispatch(node: &Node, kind: &str, body: Value) -> Option<Result<Value>> {
+    if !ProxyMessage::KINDS.contains(&kind) {
+        return Some(command(node, kind, body).await);
+    }
+    match ProxyMessage::parse(kind, body) {
+        Ok(ProxyMessage::Request(_)) => {
+            tracing::warn!("dropped a proxy.request from the control plane");
+        }
+        Ok(message) => node.proxy.on_event(message),
+        Err(err) => tracing::warn!("dropped a malformed {kind}: {err}"),
+    }
+    None
+}
+
+async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
     let kind = CommandKind::from_name(kind).ok_or_else(|| {
         Error::new(
             ErrorKind::UnknownKind,
@@ -144,9 +178,22 @@ pub async fn dispatch(node: &Node, kind: &str, body: Value) -> Result<Value> {
             to_value(Empty {})
         }
         CommandKind::ExecStart => {
-            let WithAccess { params, access } = parse::<WithAccess<ExecStartParams>>(params)?;
-            let confinement = node.confine(access).await?;
-            to_value(node.exec.start(params, confinement).await?)
+            let WithAccess { mut params, access } = parse::<WithAccess<ExecStartParams>>(params)?;
+            let mut confinement = node.confine(access).await?;
+            let proxy = match params.proxy.take() {
+                Some(spec) => {
+                    let lease = node
+                        .proxy
+                        .start_for_exec(params.exec_id.clone(), spec)
+                        .await?;
+                    if let Confinement::Sandboxed(policy) = &mut confinement {
+                        policy.grant_read_file(lease.ca_bundle());
+                    }
+                    Some(lease)
+                }
+                None => None,
+            };
+            to_value(node.exec.start(params, confinement, proxy).await?)
         }
         CommandKind::ExecWrite => {
             node.exec.write(parse::<ExecWriteParams>(params)?).await?;
@@ -225,7 +272,8 @@ mod tests {
     use crate::link::{ManualClock, NodeIdentity, Role, Session};
     use crate::protocol::{Mechanism, SandboxStatus};
 
-    fn node() -> Node {
+    /// A node in a fresh state directory, which lives as long as the returned guard.
+    fn node() -> (Node, tempfile::TempDir) {
         let sandbox = SandboxInfo {
             mechanism: Mechanism::None,
             status: SandboxStatus::Unavailable {
@@ -233,18 +281,50 @@ mod tests {
             },
             baseline_read: vec![],
         };
-        let state = StateDir::at("/nonexistent-state".into());
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::at(dir.path().to_path_buf());
+        std::fs::create_dir(state.private_dir()).unwrap();
+        std::fs::create_dir(state.public_dir()).unwrap();
         let identity = NodeIdentity {
             node_id: "n_1".to_string(),
             installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
         };
         let (_session, outbox) = Session::new(Role::Node(identity), ManualClock::new(0));
+        let ca = NodeCa::load_or_create(&state.private_dir(), &state.public_dir()).unwrap();
+        let proxy = ProxyManager::new(outbox.clone(), ca);
         let installation_id = "tz4a98xxat96iws9zmbrgj3a".to_string();
-        Node::new(state, installation_id, None, sandbox, outbox)
+        let node = Node::new(state, installation_id, None, sandbox, outbox, proxy);
+        (node, dir)
     }
 
     async fn call(method: &str, params: serde_json::Value) -> Result<Value> {
-        dispatch(&node(), method, cbor(params)).await
+        let (node, _dir) = node();
+        dispatch(&node, method, cbor(params))
+            .await
+            .expect("a command gets a reply")
+    }
+
+    #[tokio::test]
+    async fn stream_messages_get_no_reply() {
+        let (node, _dir) = node();
+        let stream = "u'0193a3b4-0000-7000-8000-000000000001'";
+        for (kind, body) in [
+            (
+                "proxy.response",
+                json!({ "streamId": stream, "status": 200, "headers": [] }),
+            ),
+            ("proxy.body", json!({ "streamId": stream, "data": "h'00'" })),
+            ("proxy.end", json!({ "streamId": stream })),
+            (
+                "proxy.reset",
+                json!({ "streamId": stream, "reason": "gone" }),
+            ),
+            ("proxy.credit", json!({ "streamId": stream, "bytes": 1 })),
+            ("proxy.end", json!({ "streamId": "not a uuid" })),
+            ("proxy.request", json!({})),
+        ] {
+            assert_eq!(dispatch(&node, kind, cbor(body)).await, None, "{kind}");
+        }
     }
 
     #[tokio::test]

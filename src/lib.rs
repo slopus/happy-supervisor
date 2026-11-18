@@ -13,6 +13,7 @@ pub mod node_info;
 pub mod policy;
 mod process;
 pub mod protocol;
+pub mod proxy;
 pub mod sandbox;
 pub mod state;
 #[cfg(feature = "testing")]

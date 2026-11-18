@@ -6,7 +6,7 @@
 use crate::protocol::Value;
 
 use crate::error::{Error, Result};
-use crate::protocol::{Event, NodeInfo};
+use crate::protocol::{Event, NodeInfo, ProxyMessage};
 
 /// api.md's join endpoint and the WebSocket endpoint it hands out, served by axum on
 /// `127.0.0.1:0`.
@@ -58,8 +58,16 @@ impl ControlPlane {
         match self.unbuilt {}
     }
 
-    /// The next event from the node, `node.ready` included.
+    /// The next event from the node, `node.ready` and `proxy.*` stream messages
+    /// ([`Event::Proxy`]) included.
     pub async fn next_event(&self) -> Result<Event> {
+        match self.unbuilt {}
+    }
+
+    /// Sends a `proxy.*` stream message to the connected node, as the control plane's side of a
+    /// stream (proxy.md).
+    pub fn send_proxy(&self, message: ProxyMessage) {
+        let _ = message;
         match self.unbuilt {}
     }
 

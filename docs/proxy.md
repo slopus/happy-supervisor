@@ -125,8 +125,9 @@ until credit arrives. So one slow client or upstream never fills the link's queu
 ### Limits and failure
 
 * At most 64 open streams per command and 1024 per node. Past that the client gets `503`.
-* At most 32 MiB of request body, summed over every stream of the node, may be sent and not yet
-  credited. Past that every request body pauses until credit arrives. Each `proxy.body` waits in
+* At most 32 MiB of request body, summed over every stream of the node (tunnels included,
+  tunnels.md), may be sent and not yet credited. Past that every request body pauses until
+  credit arrives. Each `proxy.body` waits in
   the link's queue of messages it must not drop until it is acknowledged, and that queue ends
   the session at 64 MiB (api.md, Lost sessions), so 1024 full windows could not fit.
 * When the session is lost (api.md, Lost sessions), every open stream ends. A client still

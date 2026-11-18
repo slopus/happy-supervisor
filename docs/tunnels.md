@@ -33,6 +33,8 @@ These are two new error kinds (api.md, Errors). Either way, no stream exists aft
 Data may follow only after the reply `{}`. The control plane can also send `tcp.data` immediately
 after `tcp.open`, without waiting. The node buffers it within the stream's window, and discards it
 if the connect fails.
+A `tcp.reset` for the stream while the node is still connecting makes `tcp.open` reply `io`, and
+the connection, if it was made, is closed with an RST.
 
 ## Bytes
 
@@ -55,8 +57,14 @@ the local socket when its window is empty, so TCP backpressure reaches the local
 
 * At most 1024 open streams per node, proxy streams included. Past that `tcp.open` replies
   `too_large`.
+* At most 32 MiB of bytes sent by the node and not yet credited, summed over every stream of
+  the node, proxy streams included (proxy.md, Limits and failure). Past that every tunnel stops
+  reading its socket until credit arrives.
+* A control plane that breaks the stream rules gets the stream reset: a `tcp.data` over 64 KiB,
+  past the window, or after its `tcp.end`. The node sends `tcp.reset` and closes the local
+  socket with an RST. Messages for a stream the node no longer has are ignored.
 * When the session is lost (api.md, Lost sessions), every tunnel is reset and its local socket
-  closed. Unlike processes, connections do not survive a lost session. A **resumed** session
+  closed with an RST, and the node sends nothing for it. Unlike processes, connections do not survive a lost session. A **resumed** session
   keeps them, since no message was lost.
 * A tunnel lives independently of processes. When the process that owns the listening port
   exits, the local server closes the connection, and the node sends `tcp.end` or `tcp.reset` as

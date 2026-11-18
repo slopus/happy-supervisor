@@ -36,9 +36,11 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | `ExecManager` (processes, timeouts, output logs, `exec.log`) | `exec`, `process/{unix,windows}` | exec track |
 | `fs::perform(&FsRequest) -> Result<FsResponse>`, `fs::handle(FsRequest, Confinement)` | `fs` | files track |
 | `WatchManager` | `watch` | files track |
-| `NodeCa` (the CA and `public/ca-bundle.pem`), `ProxyManager` (`start_for_exec` → `ProxyLease`, `on_event`, `session_lost`), `Upstream` (implemented by `Outbox`) | `proxy/*` | proxy track |
+| `Streams`: the node's one stream table for proxy streams and tunnels. A stream is a `Kind` (`Http` with its command, or `Tcp`), an `Outbound` side (window, uncredited bytes, ended) and an `Inbound` side (awaiting a proxy response head, open, ended); one lock, one 1024-stream limit, one 32 MiB budget of uncredited bytes. `Upstream` (implemented by `Outbox`) is where its `proxy.*` and `tcp.*` messages go | `streams` | proxy track |
+| `NodeCa` (the CA and `public/ca-bundle.pem`), `ProxyManager` (`start_for_exec` → `ProxyLease`, `on_event`, `session_lost`) | `proxy/*` | proxy track |
+| `TunnelManager` (`open` for `tcp.open`, `on_event`, `session_lost`): one task per tunnel moving bytes between its loopback socket and its stream | `tunnel` | proxy track |
 | `node_info::collect(installation_id, name, &SandboxInfo) -> NodeInfo` | `node_info/*` | node-info track |
-| `Node`, `dispatch(&Node, kind, body) -> Option<Result<Value>>`: a reply for every command kind, `None` for a `proxy.*` stream message | `dispatch` | scaffold wires kinds to the functions above |
+| `Node`, `dispatch(&Node, kind, body) -> Option<Result<Value>>`: a reply for every command kind, `None` for a `proxy.*` or `tcp.*` stream message | `dispatch` | scaffold wires kinds to the functions above |
 
 `dispatch` is the command boundary. It parses bodies into the `protocol` types, which validate
 IDs, argv, absolute paths, policies and log limits as they parse. It turns `access` into a

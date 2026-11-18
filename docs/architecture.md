@@ -24,16 +24,23 @@ control plane ──wss── client ──► dispatch ──► exec      ─�
 |---|---|---|
 | JSON-RPC envelope, every request/response/notification param type, `Access`, `Policy` wire shape, `NodeInfo` | `protocol` | scaffold, frozen |
 | `Error { kind: ErrorKind, message }`, `ErrorKind` ↔ code/kind table | `error` | scaffold |
-| `Policy::validate` (path rules), `ResolvedPolicy` (canonical grants, `ignored`, hidden state dir), `ResolvedPolicy::can_read/can_write` | `policy` | scaffold |
-| `Job { policy, hidden, op: JobOp }`, `JobOp::{Exec, Fs}`, the length-prefixed job framing on the helper's stdin, `helper::main` | `helper` | scaffold |
-| `sandbox::prepare(&Job, &ResolvedPolicy) -> Result<std::process::Command>`, `sandbox::probe() -> SandboxInfo`, `sandbox::enter(&Job)` (Linux, inside helper) | `sandbox/{mod,linux,macos,windows}` | Linux / macOS tracks |
+| `Policy` (validated when built or parsed: path rules, list sizes), `ResolvedPolicy` (canonical grants, `ignored`, hidden state dir, `can_read`/`can_write`), `Confinement::{Raw, Sandboxed(ResolvedPolicy)}` | `policy` | scaffold |
+| `Job { policy: ResolvedPolicy, op: JobOp }`, `JobOp::{Exec, Fs}`, the length-prefixed job framing on the helper's stdin, the exec status pipe, `helper::main` | `helper` | scaffold |
+| `sandbox::prepare(&Job) -> Result<std::process::Command>`, `sandbox::probe() -> SandboxInfo`, `sandbox::baseline_read()`, `sandbox::enter(&ResolvedPolicy)` (Linux, inside helper) | `sandbox/{mod,linux,macos,windows}` | Linux / macOS tracks |
 | `StateDir` (paths, installation ID, credentials load/store) | `state` | transport track |
-| `Events` (bounded outbound queue with drop accounting) | `events` | transport track |
-| `ExecManager` | `exec`, `process/{unix,windows}` | exec track |
-| `fs::perform(&FsRequest) -> Result<FsResponse>` | `fs` | files track |
+| `enroll::join`, `client::run`, `testing::ControlPlane` | `enroll`, `client`, `testing` | transport track |
+| `Events` (bounded outbound queue with drop accounting) | `events` | scaffold |
+| `ExecManager` (processes, timeouts, output logs, `exec.log`) | `exec`, `process/{unix,windows}` | exec track |
+| `fs::perform(&FsRequest) -> Result<FsResponse>`, `fs::handle(FsRequest, Confinement)` | `fs` | files track |
 | `WatchManager` | `watch` | files track |
-| `node_info::collect(&StateDir) -> NodeInfo` | `node_info/*` | node-info track |
-| `dispatch(Request, &Node) -> Response` | `dispatch` | scaffold wires methods to the functions above |
+| `node_info::collect(installation_id, name, &SandboxInfo) -> NodeInfo` | `node_info/*` | node-info track |
+| `Node`, `dispatch(&Node, method, params) -> Result<Value>` | `dispatch` | scaffold wires methods to the functions above |
+
+`dispatch` is the request boundary. It parses params into the `protocol` types, which validate
+IDs, argv, absolute paths, policies and log limits as they parse. It turns `access` into a
+`Confinement` once: `raw` stays raw, and `sandboxed` answers `sandbox_unavailable` unless the
+probed `SandboxInfo` is available, then resolves the policy against the state directory. Code
+behind it trusts those types and does not validate them again.
 
 ## The sandbox helper
 
@@ -48,8 +55,16 @@ nothing past the job is consumed. Then:
 * macOS: the parent spawned it as `/usr/bin/sandbox-exec -p <profile> <exe> __sandbox`, so it is
   already confined.
 * Then `JobOp::Exec` execs the command (`execve`, so the PID stays the same and the rest of stdin
-  belongs to the command). `JobOp::Fs` runs `fs::perform` and writes one JSON line,
-  `{"ok": FsResponse}` or `{"err": Error}`, to stdout, then exits 0.
+  belongs to the command). The parent passes the write end of a pipe as the helper's fd 3. If
+  confinement or the exec fails, the helper writes the `Error` as JSON there and exits 127. A
+  successful exec closes it (close-on-exec) with nothing written, so the parent learns whether
+  the command started before it answers `exec.start`. `JobOp::Fs` runs `fs::perform` and writes
+  one JSON line, `{"ok": FsResponse}` or `{"err": Error}`, to stdout, then exits 0.
+* A job that cannot be read exits 125.
+
+The parent resolves the policy and sends the `ResolvedPolicy` in the job, so the parent's view
+(`ignoredPaths`, the macOS profile, watch filtering) and the helper's Landlock rules come from
+the same canonical grants.
 
 Raw operations never use the helper. Raw file requests run `fs::perform` in-process on a
 blocking thread. Raw commands are spawned directly.
@@ -80,3 +95,7 @@ exposes `request(method, params) -> Result<Value>` and a stream of notifications
 connected node. Integration tests start it on `127.0.0.1:0`, run `join` and `run` against it
 (in-process via the library, and as the real binary), and assert on the wire. They run on
 Linux and macOS natively.
+
+An in-process test runs as the test harness, not as `happy-supervisor`, so before any sandboxed
+operation it calls `helper::set_exe(env!("CARGO_BIN_EXE_happy-supervisor").into())` to point the
+helper at the real binary.

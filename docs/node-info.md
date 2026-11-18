@@ -154,7 +154,7 @@ What this node can enforce for `{ "mode": "sandboxed" }` commands (policy.md).
 `baselineRead` by platform, keeping only paths that exist:
 
 * Linux: `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/sys/devices/system/cpu`, `/opt`. (`/proc` because `/proc/self` resolves to one process and its children would lose it.)
-* macOS: `/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/private/etc`, `/private/var/db/timezone`, `/dev`, `/opt/homebrew`.
+* macOS: `/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/private/etc`, `/private/var/db/timezone`, `/private/var/select`, `/dev/fd`, `/dev/tty`, `/opt/homebrew`, and the app bundle of the selected developer directory (`/Applications/Xcode.app` by default). `/bin/sh` reads `/private/var/select/sh`. `/usr/bin/git`, `/usr/bin/python3` and the other developer shims run their tool from the Xcode bundle (Command Line Tools live under `/Library`). The shims also cache their lookups in `TMPDIR`. They work without writing it, only slower.
 * Windows: empty.
 
 ### `defaultEnv`

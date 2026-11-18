@@ -35,7 +35,7 @@ use crate::protocol::{
     ACK_DELAY_MS, ACK_EVERY_MSGS, Ack, Bye, ByeReason, Bytes, Change, DROPPABLE_QUEUE_BYTES,
     ExecExit, ExecId, ExecOutput, ExecSummary, ExecTimedOut, ExitStatus, Frame, Hello, MsgId,
     NodeInfo, NodeReady, Outcome, ProxyMessage, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply, SessionId,
-    Stream, TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
+    Stream, TcpMessage, TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
 };
 use crate::wire::{Value, Wire, from_cbor, from_value, to_cbor};
 
@@ -610,6 +610,18 @@ impl Outbox {
         if !s.overflowed.contains(&watch_id) {
             s.overflow(watch_id);
         }
+    }
+
+    /// Queues a `tcp.*` stream message (tunnels.md). Never dropped, like proxy messages.
+    pub fn tcp(&self, message: TcpMessage) {
+        let kind = message.kind();
+        let mut s = self.lock();
+        match &message {
+            TcpMessage::Data(body) => s.enqueue(kind, body, Class::Retained),
+            TcpMessage::End(body) => s.enqueue(kind, body, Class::Retained),
+            TcpMessage::Reset(body) => s.enqueue(kind, body, Class::Retained),
+            TcpMessage::Credit(body) => s.enqueue(kind, body, Class::Retained),
+        };
     }
 
     /// Queues a `proxy.*` stream message (proxy.md). Never dropped: the stream's flow-control

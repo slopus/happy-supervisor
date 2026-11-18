@@ -27,7 +27,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::link::{Clock, Incoming, Outbox, Role, Session, SystemClock};
 use crate::protocol::{
     ByeReason, Event, Frame, JoinError, JoinRequest, JoinResponse, MAX_FRAME_BYTES, MsgId,
-    NodeInfo, ProxyMessage, SessionId, Value,
+    NodeInfo, ProxyMessage, SessionId, TcpMessage, Value,
 };
 use crate::wire::{Wire, from_cbor};
 
@@ -112,6 +112,7 @@ enum Control {
         reply: oneshot::Sender<Result<Value>>,
     },
     Proxy(ProxyMessage),
+    Tcp(TcpMessage),
     DropConnection,
     StallAcks(bool),
     Forget,
@@ -227,6 +228,12 @@ impl ControlPlane {
     /// stream (proxy.md).
     pub fn send_proxy(&self, message: ProxyMessage) {
         self.send(Control::Proxy(message));
+    }
+
+    /// Sends a `tcp.*` stream message to the connected node, as the control plane's end of a
+    /// tunnel (tunnels.md).
+    pub fn send_tcp(&self, message: TcpMessage) {
+        self.send(Control::Tcp(message));
     }
 
     /// Closes the current WebSocket without `bye`. The session survives.
@@ -559,6 +566,7 @@ impl Actor {
                 self.pending.insert(id, reply);
             }
             Control::Proxy(message) => self.outbox.proxy(message),
+            Control::Tcp(message) => self.outbox.tcp(message),
             Control::DropConnection => self.disconnect(),
             Control::StallAcks(stalled) => self.stall_acks = stalled,
             Control::Forget => self.session.forget(),

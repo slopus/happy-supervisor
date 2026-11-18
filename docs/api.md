@@ -13,7 +13,8 @@ knowingly rather than silently losing messages.
 
 This document is the wire contract. The policy carried by sandboxed commands is in
 [policy.md](policy.md). The node description is in [node-info.md](node-info.md). Proxying a command's HTTP traffic
-through the control plane is in [proxy.md](proxy.md).
+through the control plane is in [proxy.md](proxy.md). TCP tunnels to the node's loopback ports are in
+[tunnels.md](tunnels.md).
 
 ## Joining and credentials
 
@@ -256,6 +257,11 @@ a4 09 67 "build-1" 0a 66 "stdout" 0b 50 <16 bytes> 0c 00
 | 136 | `defaultEnv` | key |
 | 137 | `collectedAtMs` | key |
 | 138 | `joinToken` | key |
+| 139 | `tcp.data` | kind |
+| 140 | `tcp.credit` | kind |
+| 141 | `tcp.open` | kind |
+| 142 | `tcp.end` | kind |
+| 143 | `tcp.reset` | kind |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -416,6 +422,8 @@ A reply's `error.kind` is one of:
 | `sandbox_unavailable` | Sandboxed access was requested but this node cannot enforce it. `message` says why. |
 | `too_large` | A size limit in this document was exceeded. |
 | `io` | Any other OS error. `message` carries it. |
+| `connection_refused` | `tcp.open` found nothing listening (tunnels.md). |
+| `timed_out` | `tcp.open` did not connect within 10 s (tunnels.md). |
 
 A message of unknown kind is confirmed like any other and replied to with `unknown_kind`. The
 receiver cannot tell an unknown command from an unknown event, so it replies to both, and a

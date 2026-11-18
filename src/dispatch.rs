@@ -12,11 +12,12 @@ use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
     Access, CommandKind, Empty, ExecKillParams, ExecListResult, ExecLogParams, ExecStartParams,
     ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams, FsRemoveParams,
-    FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, SandboxInfo, Value, WatchId,
+    FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, SandboxInfo, TcpMessage, Value, WatchId,
     WatchStartParams, WatchStopParams, WithAccess,
 };
 use crate::proxy::{NodeCa, ProxyManager};
 use crate::state::StateDir;
+use crate::tunnel::TunnelManager;
 use crate::watch::WatchManager;
 
 /// Everything one supervisor serves. Lives across connections and sessions.
@@ -29,6 +30,7 @@ pub struct Node {
     exec: ExecManager,
     watch: WatchManager,
     proxy: ProxyManager,
+    tunnels: TunnelManager,
 }
 
 impl Node {
@@ -65,6 +67,7 @@ impl Node {
             sandbox,
             exec: ExecManager::new(outbox.clone()),
             watch: WatchManager::new(outbox),
+            tunnels: TunnelManager::new(&proxy),
             proxy,
         }
     }
@@ -94,6 +97,7 @@ impl Node {
     /// The session was lost (api.md, Lost sessions): every open proxy stream ends.
     pub fn session_lost(&self) {
         self.proxy.session_lost();
+        self.tunnels.session_lost();
     }
 
     /// Kills every running command, for a normal exit.
@@ -150,6 +154,13 @@ impl Node {
 /// drops one it cannot parse, and `proxy.request`, which only the node sends. Any other kind,
 /// including an event the node does not know, is `unknown_kind` (api.md, Errors).
 pub async fn dispatch(node: &Node, kind: &str, body: Value) -> Option<Result<Value>> {
+    if TcpMessage::KINDS.contains(&kind) {
+        match TcpMessage::parse(kind, body) {
+            Ok(message) => node.tunnels.on_event(message),
+            Err(err) => tracing::warn!("dropped a malformed {kind}: {err}"),
+        }
+        return None;
+    }
     if !ProxyMessage::KINDS.contains(&kind) {
         return Some(command(node, kind, body).await);
     }
@@ -242,6 +253,10 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
             let WithAccess { params, access } = parse::<WithAccess<WatchStartParams>>(params)?;
             let confinement = node.confine(access).await?;
             node.watch.start(params, confinement).await?;
+            to_value(Empty {})
+        }
+        CommandKind::TcpOpen => {
+            node.tunnels.open(parse(params)?).await?;
             to_value(Empty {})
         }
         CommandKind::WatchStop => {

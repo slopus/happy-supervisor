@@ -248,6 +248,11 @@ pub const REGISTRY: &[(u64, &str, Role)] = &[
     (136, "defaultEnv", Role::Key),
     (137, "collectedAtMs", Role::Key),
     (138, "joinToken", Role::Key),
+    (139, "tcp.data", Role::Kind),
+    (140, "tcp.credit", Role::Kind),
+    (141, "tcp.open", Role::Kind),
+    (142, "tcp.end", Role::Kind),
+    (143, "tcp.reset", Role::Kind),
 ];
 
 struct Names {

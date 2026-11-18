@@ -15,10 +15,12 @@ pub enum ErrorKind {
     SandboxUnavailable,
     TooLarge,
     Io,
+    ConnectionRefused,
+    TimedOut,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 8] = [
+    pub const ALL: [ErrorKind; 10] = [
         ErrorKind::InvalidParams,
         ErrorKind::UnknownKind,
         ErrorKind::NotFound,
@@ -27,6 +29,8 @@ impl ErrorKind {
         ErrorKind::SandboxUnavailable,
         ErrorKind::TooLarge,
         ErrorKind::Io,
+        ErrorKind::ConnectionRefused,
+        ErrorKind::TimedOut,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -39,6 +43,8 @@ impl ErrorKind {
             ErrorKind::SandboxUnavailable => "sandbox_unavailable",
             ErrorKind::TooLarge => "too_large",
             ErrorKind::Io => "io",
+            ErrorKind::ConnectionRefused => "connection_refused",
+            ErrorKind::TimedOut => "timed_out",
         }
     }
 
@@ -129,6 +135,8 @@ mod tests {
                 "sandbox_unavailable",
                 "too_large",
                 "io",
+                "connection_refused",
+                "timed_out",
             ]
         );
     }

@@ -18,6 +18,7 @@ pub mod sandbox;
 pub mod state;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod tunnel;
 pub mod watch;
 pub mod wire;
 

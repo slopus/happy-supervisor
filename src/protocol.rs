@@ -31,6 +31,12 @@ pub const MAX_LIST_ENTRIES: usize = 10_000;
 pub const MAX_PROXY_TOKEN_BYTES: usize = 4096;
 pub const MAX_PROXY_HOSTS: usize = 256;
 pub const MAX_PROXY_BODY_BYTES: usize = 64 << 10;
+pub const MAX_TCP_DATA_BYTES: usize = 64 << 10;
+/// Open proxy streams and tunnels together (proxy.md, tunnels.md).
+pub const MAX_STREAMS: usize = 1024;
+/// Each direction of a proxy stream or tunnel (proxy.md, Flow control).
+pub const STREAM_WINDOW_BYTES: u64 = 1 << 20;
+pub const TCP_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const MAX_CHANGES_PER_EVENT: usize = 256;
 pub const ACK_DELAY_MS: u64 = 200;
 pub const ACK_EVERY_MSGS: u32 = 64;
@@ -225,6 +231,9 @@ pub enum Event {
     /// A `proxy.*` stream message (proxy.md), which carries its own `kind`.
     #[serde(untagged)]
     Proxy(ProxyMessage),
+    /// A `tcp.*` stream message (tunnels.md), which carries its own `kind`.
+    #[serde(untagged)]
+    Tcp(TcpMessage),
 }
 
 impl Event {
@@ -240,6 +249,9 @@ impl Event {
     pub fn parse(kind: &str, body: Value) -> Option<Result<Event, String>> {
         if ProxyMessage::KINDS.contains(&kind) {
             return Some(ProxyMessage::parse(kind, body).map(Event::Proxy));
+        }
+        if TcpMessage::KINDS.contains(&kind) {
+            return Some(TcpMessage::parse(kind, body).map(Event::Tcp));
         }
         if !Event::KINDS.contains(&kind) {
             return None;
@@ -274,10 +286,11 @@ pub enum CommandKind {
     FsRemove,
     WatchStart,
     WatchStop,
+    TcpOpen,
 }
 
 impl CommandKind {
-    pub const ALL: [CommandKind; 15] = [
+    pub const ALL: [CommandKind; 16] = [
         CommandKind::NodeInfo,
         CommandKind::NodeUpdate,
         CommandKind::ExecStart,
@@ -293,6 +306,7 @@ impl CommandKind {
         CommandKind::FsRemove,
         CommandKind::WatchStart,
         CommandKind::WatchStop,
+        CommandKind::TcpOpen,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -312,6 +326,7 @@ impl CommandKind {
             CommandKind::FsRemove => "fs.remove",
             CommandKind::WatchStart => "watch.start",
             CommandKind::WatchStop => "watch.stop",
+            CommandKind::TcpOpen => "tcp.open",
         }
     }
 
@@ -1136,6 +1151,163 @@ impl ProxyMessage {
 }
 
 // ---------------------------------------------------------------------------------------------
+// TCP tunnels (docs/tunnels.md)
+
+/// `tcp.open`'s params. The host is loopback by construction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "TcpOpenWire")]
+pub struct TcpOpenParams {
+    pub stream_id: StreamId,
+    pub host: LoopbackHost,
+    pub port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TcpOpenWire {
+    stream_id: StreamId,
+    host: LoopbackHost,
+    port: u16,
+}
+
+impl TryFrom<TcpOpenWire> for TcpOpenParams {
+    type Error = Error;
+
+    fn try_from(wire: TcpOpenWire) -> Result<Self, Error> {
+        if wire.port == 0 {
+            return Err(Error::invalid_params("port must be 1 to 65535, got 0"));
+        }
+        Ok(TcpOpenParams {
+            stream_id: wire.stream_id,
+            host: wire.host,
+            port: wire.port,
+        })
+    }
+}
+
+/// The hosts a tunnel may reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum LoopbackHost {
+    /// `127.0.0.1`.
+    V4,
+    /// `::1`.
+    V6,
+    /// `localhost`: `::1`, then `127.0.0.1`.
+    Localhost,
+}
+
+impl LoopbackHost {
+    /// The addresses to try, in order.
+    pub fn addresses(self) -> &'static [std::net::IpAddr] {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        const V4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        const V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        match self {
+            LoopbackHost::V4 => &[V4],
+            LoopbackHost::V6 => &[V6],
+            LoopbackHost::Localhost => &[V6, V4],
+        }
+    }
+}
+
+impl TryFrom<String> for LoopbackHost {
+    type Error = Error;
+
+    fn try_from(host: String) -> Result<Self, Error> {
+        match host.as_str() {
+            "127.0.0.1" => Ok(LoopbackHost::V4),
+            "::1" => Ok(LoopbackHost::V6),
+            "localhost" => Ok(LoopbackHost::Localhost),
+            _ => Err(Error::invalid_params(format!(
+                "a tunnel reaches 127.0.0.1, ::1 or localhost, not {host:?}"
+            ))),
+        }
+    }
+}
+
+impl From<LoopbackHost> for String {
+    fn from(host: LoopbackHost) -> String {
+        match host {
+            LoopbackHost::V4 => "127.0.0.1",
+            LoopbackHost::V6 => "::1",
+            LoopbackHost::Localhost => "localhost",
+        }
+        .to_string()
+    }
+}
+
+/// Bytes of a tunnel, at most [`MAX_TCP_DATA_BYTES`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpData {
+    pub stream_id: StreamId,
+    pub data: Bytes,
+}
+
+/// The sender's half-close.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpEnd {
+    pub stream_id: StreamId,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpReset {
+    pub stream_id: StreamId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpCredit {
+    pub stream_id: StreamId,
+    pub bytes: u64,
+}
+
+/// One `tcp.*` stream message, in either direction, as `{"kind": …, "body": …}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "body")]
+pub enum TcpMessage {
+    #[serde(rename = "tcp.data")]
+    Data(TcpData),
+    #[serde(rename = "tcp.end")]
+    End(TcpEnd),
+    #[serde(rename = "tcp.reset")]
+    Reset(TcpReset),
+    #[serde(rename = "tcp.credit")]
+    Credit(TcpCredit),
+}
+
+impl TcpMessage {
+    pub const KINDS: [&str; 4] = ["tcp.data", "tcp.end", "tcp.reset", "tcp.credit"];
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TcpMessage::Data(_) => "tcp.data",
+            TcpMessage::End(_) => "tcp.end",
+            TcpMessage::Reset(_) => "tcp.reset",
+            TcpMessage::Credit(_) => "tcp.credit",
+        }
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        match self {
+            TcpMessage::Data(m) => m.stream_id,
+            TcpMessage::End(m) => m.stream_id,
+            TcpMessage::Reset(m) => m.stream_id,
+            TcpMessage::Credit(m) => m.stream_id,
+        }
+    }
+
+    /// Parses a received message of one of [`TcpMessage::KINDS`].
+    pub fn parse(kind: &str, body: Value) -> Result<TcpMessage, String> {
+        crate::wire::from_value(tagged(kind, body))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Files
 
 /// `fs.stat` and `fs.list` params without `access`.
@@ -1615,6 +1787,9 @@ mod tests {
                 );
             }
         }
+        // tunnels.md defines the one command api.md does not.
+        assert!(include_str!("../docs/tunnels.md").contains("`tcp.open` is a **command**"));
+        commands.push(CommandKind::TcpOpen);
         assert_eq!(commands, CommandKind::ALL);
     }
 
@@ -1954,6 +2129,45 @@ mod tests {
                     .contains("is not a DNS name"),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn tunnel_messages() {
+        let open: TcpOpenParams =
+            round_trip(json!({ "streamId": u(ID_A), "host": "localhost", "port": 3000 }));
+        assert_eq!(open.host.addresses().len(), 2);
+        assert_eq!(
+            parse::<TcpOpenParams>(json!({ "streamId": u(ID_A), "host": "::1", "port": 1 })).host,
+            LoopbackHost::V6
+        );
+        assert!(
+            rejects::<TcpOpenParams>(
+                json!({ "streamId": u(ID_A), "host": "10.0.0.1", "port": 22 })
+            )
+            .contains(r#"a tunnel reaches 127.0.0.1, ::1 or localhost, not "10.0.0.1""#)
+        );
+        assert!(
+            rejects::<TcpOpenParams>(
+                json!({ "streamId": u(ID_A), "host": "127.0.0.1", "port": 0 })
+            )
+            .contains("port must be 1 to 65535, got 0")
+        );
+        let data: Event = round_trip(
+            json!({ "kind": "tcp.data", "body": { "streamId": u(ID_A), "data": "h'0102'" } }),
+        );
+        assert!(matches!(data, Event::Tcp(TcpMessage::Data(_))));
+        for (kind, body) in [
+            ("tcp.end", json!({ "streamId": u(ID_A) })),
+            (
+                "tcp.reset",
+                json!({ "streamId": u(ID_A), "reason": "peer reset" }),
+            ),
+            ("tcp.credit", json!({ "streamId": u(ID_A), "bytes": 65536 })),
+        ] {
+            let message: TcpMessage = round_trip(json!({ "kind": kind, "body": body }));
+            assert_eq!(message.kind(), kind);
+            assert_eq!(message.stream_id().to_string(), ID_A);
         }
     }
 

@@ -97,6 +97,12 @@ impl Harness {
             .env_remove("no_proxy")
             .envs(self.lease().env().iter().cloned())
             .kill_on_drop(true);
+        // Windows' curl uses Schannel, which trusts the Windows store and not CURL_CA_BUNDLE,
+        // and checks revocation, which the node CA's leaves cannot answer.
+        #[cfg(windows)]
+        curl.arg("--cacert")
+            .arg(self.env("CURL_CA_BUNDLE"))
+            .arg("--ssl-no-revoke");
         curl
     }
 

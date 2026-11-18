@@ -605,8 +605,9 @@ async fn a_control_plane_that_declines_compression_is_refused() {
 }
 
 /// 100 tiny commands while 16 MiB reads keep the link busy, with lanes and through one lane.
-/// Prints both p99s.
+/// Prints both p99s. It measures time, so it runs alone: CI runs it in a step of its own.
 #[tokio::test]
+#[ignore = "timing: run alone with --ignored"]
 async fn tiny_commands_stay_fast_beside_a_16_mib_read() {
     let dir = tempfile::tempdir().unwrap();
     let big = dir.path().join("big");
@@ -685,6 +686,7 @@ async fn tiny_commands_stay_fast_beside_a_16_mib_read() {
         p99s.push(p99);
     }
     assert!(p99s[0] < Duration::from_millis(50), "{p99s:?}");
+    assert!(p99s[0] * 10 < p99s[1], "{p99s:?}");
 }
 
 #[tokio::test]

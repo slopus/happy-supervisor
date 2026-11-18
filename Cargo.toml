@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "e2e"
 required-features = ["testing"]
 
+[[test]]
+name = "e2e_tunnels"
+required-features = ["testing"]
+
 [features]
 testing = ["dep:axum", "yawc/axum"]
 

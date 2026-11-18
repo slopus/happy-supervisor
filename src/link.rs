@@ -892,18 +892,8 @@ fn frame_cbor(frame: &Frame) -> Vec<u8> {
     to_cbor(frame)
 }
 
-/// The start of a `msg` frame, up to its `body` value: a 4-entry map with `t`, `id`, `kind` and
-/// `body` keys. CBOR items concatenate, so appending the body's own encoding completes it.
 fn msg_prefix(id: MsgId, kind: &str) -> Vec<u8> {
-    let mut out = vec![0xa4];
-    for item in [&Value::from("t"), &Value::from("msg"), &Value::from("id")] {
-        out.extend(to_cbor(item));
-    }
-    out.extend(to_cbor(&id));
-    out.extend(to_cbor("kind"));
-    out.extend(to_cbor(kind));
-    out.extend(to_cbor("body"));
-    out
+    crate::wire::msg_prefix(&id, kind)
 }
 
 fn msg_cbor(id: MsgId, kind: &str, body: &[u8]) -> Vec<u8> {
@@ -1332,26 +1322,26 @@ mod tests {
             retained_bytes: 1 << 20,
         };
         let (mut session, outbox, _clock) = open_node(limits);
-        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 100]);
+        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 150]);
         let first = drain(&mut session);
         assert_eq!(first[0]["body"]["droppedBytes"], 0);
-        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'b'; 100]);
+        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'b'; 150]);
         assert_eq!(drain(&mut session), [] as [Json; 0]);
         session.receive(&ack(&id_of(&first[0])));
         outbox.exec_output(exec("e"), Stream::Stdout, b"tail".to_vec());
         let tail = drain(&mut session);
         assert_eq!(
             tail[0]["body"],
-            json!({ "execId": "e", "stream": "stdout", "data": "h'7461696c'", "droppedBytes": 100 })
+            json!({ "execId": "e", "stream": "stdout", "data": "h'7461696c'", "droppedBytes": 150 })
         );
 
-        outbox.exec_output(exec("e"), Stream::Stderr, vec![b'c'; 200]);
+        outbox.exec_output(exec("e"), Stream::Stderr, vec![b'c'; 260]);
         outbox.exec_exit(exec("e"), ExitStatus::Signaled { signal: 9 }, 304);
         let frames = drain(&mut session);
         assert_eq!(
             frames.iter().map(|f| f["body"].clone()).collect::<Vec<_>>(),
             [
-                json!({ "execId": "e", "stream": "stderr", "data": "h''", "droppedBytes": 200 }),
+                json!({ "execId": "e", "stream": "stderr", "data": "h''", "droppedBytes": 260 }),
                 json!({ "execId": "e", "exit": { "kind": "signaled", "signal": 9 }, "logBytes": 304 }),
             ]
         );
@@ -1369,7 +1359,7 @@ mod tests {
             path: path.to_string(),
         };
         session.disconnected();
-        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 200]);
+        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 240]);
         outbox.watch_changes(watch("w"), vec![change("/a")]);
         outbox.watch_changes(watch("w"), vec![change("/b")]);
         outbox.watch_overflow(watch("w"));

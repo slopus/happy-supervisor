@@ -1517,7 +1517,13 @@ mod tests {
     fn round_trip<T: Serialize + DeserializeOwned>(literal: Json) -> T {
         let bytes = to_cbor(&cbor(literal.clone()));
         let parsed: T = from_cbor(&bytes).unwrap();
-        let again: Value = from_cbor(&to_cbor(&parsed)).unwrap();
+        let encoded = to_cbor(&parsed);
+        let unregistered = crate::wire::text_keys(&encoded);
+        assert!(
+            unregistered.is_empty(),
+            "field names missing from wire::REGISTRY: {unregistered:?}"
+        );
+        let again: Value = from_cbor(&encoded).unwrap();
         assert_eq!(canon(crate::testkit::json(again)), canon(literal));
         parsed
     }

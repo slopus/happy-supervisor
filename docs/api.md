@@ -83,12 +83,179 @@ Every WebSocket frame is a **binary** frame holding one [CBOR](https://www.rfc-e
 map with a `t` field naming the frame type. Text frames are a protocol error. The shapes in this
 document are written as JSON for readability. On the wire:
 
-* maps have text keys, the field names shown here;
+* map keys are the field names shown here, compacted by the registry below;
 * `data` fields, and header values in proxy.md, are CBOR byte strings (major type 2), not base64
   (examples write them as `h'…'`, CBOR diagnostic notation for bytes);
 * UUIDs (message IDs, session IDs, stream IDs) are 16-byte byte strings;
 * integers are CBOR integers, and absent optional fields are omitted rather than `null`, except
   where a field is shown as `null` (`hello.session`, `hello.cursor`).
+
+**Compact names.** Every field name in this document, every frame type (`t`) and every
+message `kind` has a number in the registry. On the wire, a map key that is in the registry is
+that CBOR unsigned integer, not the text. A frame's `t` value, and a `msg` frame's `kind` value,
+are their numbers too. Other values stay as they are, so `"stream": "stdout"` is
+`0x0a 0x66 "stdout"`, and the `kind` inside a body (an exit, a change, an error) stays text.
+
+* The registry is **append-only**. A number is never changed and never reused. A new name gets
+  the next number.
+* A text key, `t` or `kind` that is not in the registry passes through as text. A sender may add
+  a field, or a message kind, before it has a number, and an older receiver still reads it.
+* A number the receiver's registry does not have, or a number used in the wrong place (a frame
+  type as a key), is a protocol error. Numbers 0 to 23 encode in one byte. They go to the most
+  frequent names.
+* Keys of free-form maps (`env`, `defaultEnv`) are data, but the same rule applies to them, so
+  an environment variable named `path` travels as `23` and arrives as `path`.
+
+An `ack` is `a2 00 06 04 50 <16-byte cursor>`, 21 bytes. A 16-byte `exec.output` chunk of
+`build-1` is 62 bytes:
+
+```
+a4 00 05 01 50 <16-byte id> 02 07 03          t: msg, id, kind: exec.output, body:
+a4 09 67 "build-1" 0a 66 "stdout" 0b 50 <16 bytes> 0c 00
+                                              execId, stream, data, droppedBytes: 0
+```
+
+| Number | Name | Role |
+|---|---|---|
+| 0 | `t` | key |
+| 1 | `id` | key |
+| 2 | `kind` | key |
+| 3 | `body` | key |
+| 4 | `cursor` | key |
+| 5 | `msg` | frame |
+| 6 | `ack` | frame |
+| 7 | `exec.output` | kind |
+| 8 | `reply` | kind |
+| 9 | `execId` | key |
+| 10 | `stream` | key |
+| 11 | `data` | key |
+| 12 | `droppedBytes` | key |
+| 13 | `to` | key |
+| 14 | `ok` | key |
+| 15 | `error` | key |
+| 16 | `exec.exit` | kind |
+| 17 | `exit` | key |
+| 18 | `logBytes` | key |
+| 19 | `code` | key |
+| 20 | `watch.event` | kind |
+| 21 | `watchId` | key |
+| 22 | `changes` | key |
+| 23 | `path` | key |
+| 24 | `hello` | frame |
+| 25 | `welcome` | frame |
+| 26 | `bye` | frame |
+| 27 | `proxy.body` | kind |
+| 28 | `proxy.credit` | kind |
+| 29 | `proxy.request` | kind |
+| 30 | `proxy.response` | kind |
+| 31 | `proxy.end` | kind |
+| 32 | `proxy.reset` | kind |
+| 33 | `node.ready` | kind |
+| 34 | `exec.timedOut` | kind |
+| 35 | `node.info` | kind |
+| 36 | `node.update` | kind |
+| 37 | `exec.start` | kind |
+| 38 | `exec.write` | kind |
+| 39 | `exec.kill` | kind |
+| 40 | `exec.list` | kind |
+| 41 | `exec.log` | kind |
+| 42 | `fs.stat` | kind |
+| 43 | `fs.list` | kind |
+| 44 | `fs.read` | kind |
+| 45 | `fs.write` | kind |
+| 46 | `fs.mkdir` | kind |
+| 47 | `fs.remove` | kind |
+| 48 | `watch.start` | kind |
+| 49 | `watch.stop` | kind |
+| 50 | `streamId` | key |
+| 51 | `bytes` | key |
+| 52 | `message` | key |
+| 53 | `session` | key |
+| 54 | `resumed` | key |
+| 55 | `resumeWindowMs` | key |
+| 56 | `nodeId` | key |
+| 57 | `installationId` | key |
+| 58 | `version` | key |
+| 59 | `reason` | key |
+| 60 | `previousSession` | key |
+| 61 | `signal` | key |
+| 62 | `overflow` | key |
+| 63 | `headers` | key |
+| 64 | `status` | key |
+| 65 | `method` | key |
+| 66 | `scheme` | key |
+| 67 | `host` | key |
+| 68 | `port` | key |
+| 69 | `token` | key |
+| 70 | `hosts` | key |
+| 71 | `proxy` | key |
+| 72 | `argv` | key |
+| 73 | `cwd` | key |
+| 74 | `env` | key |
+| 75 | `stdin` | key |
+| 76 | `timeout` | key |
+| 77 | `ms` | key |
+| 78 | `action` | key |
+| 79 | `log` | key |
+| 80 | `limitBytes` | key |
+| 81 | `access` | key |
+| 82 | `mode` | key |
+| 83 | `policy` | key |
+| 84 | `read` | key |
+| 85 | `write` | key |
+| 86 | `localBind` | key |
+| 87 | `unixSockets` | key |
+| 88 | `eof` | key |
+| 89 | `pid` | key |
+| 90 | `ignoredPaths` | key |
+| 91 | `execs` | key |
+| 92 | `state` | key |
+| 93 | `offset` | key |
+| 94 | `length` | key |
+| 95 | `totalBytes` | key |
+| 96 | `retained` | key |
+| 97 | `start` | key |
+| 98 | `end` | key |
+| 99 | `entries` | key |
+| 100 | `name` | key |
+| 101 | `size` | key |
+| 102 | `modifiedMs` | key |
+| 103 | `readonly` | key |
+| 104 | `recursive` | key |
+| 105 | `nodeToken` | key |
+| 106 | `endpoint` | key |
+| 107 | `info` | key |
+| 108 | `watches` | key |
+| 109 | `hostname` | key |
+| 110 | `supervisorVersion` | key |
+| 111 | `os` | key |
+| 112 | `family` | key |
+| 113 | `kernelVersion` | key |
+| 114 | `arch` | key |
+| 115 | `cpu` | key |
+| 116 | `model` | key |
+| 117 | `logicalCores` | key |
+| 118 | `physicalCores` | key |
+| 119 | `memory` | key |
+| 120 | `swapTotalBytes` | key |
+| 121 | `disks` | key |
+| 122 | `mountPoint` | key |
+| 123 | `fileSystem` | key |
+| 124 | `availableBytes` | key |
+| 125 | `removable` | key |
+| 126 | `gpus` | key |
+| 127 | `vendor` | key |
+| 128 | `memoryBytes` | key |
+| 129 | `driverVersion` | key |
+| 130 | `sandbox` | key |
+| 131 | `mechanism` | key |
+| 132 | `available` | key |
+| 133 | `landlockAbi` | key |
+| 134 | `baselineRead` | key |
+| 135 | `gaps` | key |
+| 136 | `defaultEnv` | key |
+| 137 | `collectedAtMs` | key |
+| 138 | `joinToken` | key |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never

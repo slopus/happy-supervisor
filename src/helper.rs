@@ -6,11 +6,12 @@
 //!
 //! For an exec job the parent passes the write end of a close-on-exec pipe as fd
 //! [`STATUS_FD`] (see [`install_status_fd`]). If the helper cannot confine itself or exec the
-//! command, it writes the [`Error`] as JSON there and exits 127. A successful exec closes the
+//! command, it writes the [`Error`] as CBOR there and exits 127. A successful exec closes the
 //! pipe with nothing written. [`parse_exec_status`] reads the result.
 //!
-//! For a file job the helper writes one line, `{"ok": FsResponse}` or `{"err": Error}`, to stdout
-//! and exits 0. [`parse_fs_reply`] reads it.
+//! For a file job the helper writes one frame, `{"ok": FsResponse}` or `{"err": Error}`, to stdout
+//! and exits 0. [`parse_fs_reply`] reads it. Jobs and replies are framed the same way: a 4-byte
+//! big-endian length, then CBOR.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write as _};
@@ -19,12 +20,14 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::wire::{from_cbor, to_cbor};
+
 use crate::error::{Error, ErrorKind, Result};
 use crate::fs::{FsRequest, FsResponse};
 use crate::policy::ResolvedPolicy;
 use crate::protocol::{AbsPath, Argv};
 
-/// Bigger than any valid job: a 16 MiB `fs.write`, base64-encoded, plus a full policy.
+/// Bigger than any valid job: a 16 MiB `fs.write` plus a full policy.
 pub const MAX_JOB_BYTES: usize = 32 << 20;
 
 /// The helper's fd for the exec status pipe.
@@ -56,12 +59,16 @@ pub enum JobOp {
     Fs(FsRequest),
 }
 
-/// The frame the parent writes to the helper's stdin: a 4-byte big-endian length, then JSON.
+/// The frame the parent writes to the helper's stdin.
 pub fn encode_job(job: &Job) -> Vec<u8> {
-    let json = serde_json::to_vec(job).expect("jobs serialize");
-    let mut frame = Vec::with_capacity(4 + json.len());
-    frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&json);
+    encode_frame(job)
+}
+
+fn encode_frame<T: Serialize>(value: &T) -> Vec<u8> {
+    let cbor = to_cbor(value);
+    let mut frame = Vec::with_capacity(4 + cbor.len());
+    frame.extend_from_slice(&(cbor.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&cbor);
     frame
 }
 
@@ -76,9 +83,9 @@ pub fn read_job(reader: &mut impl Read) -> Result<Job> {
             "job is {len} bytes, at most {MAX_JOB_BYTES} are allowed"
         )));
     }
-    let mut json = vec![0u8; len];
-    reader.read_exact(&mut json)?;
-    serde_json::from_slice(&json).map_err(|err| Error::invalid_params(format!("bad job: {err}")))
+    let mut cbor = vec![0u8; len];
+    reader.read_exact(&mut cbor)?;
+    from_cbor(&cbor).map_err(|err| Error::invalid_params(format!("bad job: {err}")))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,14 +97,18 @@ enum FsReply {
 
 /// Parses the helper's stdout after a file job.
 pub fn parse_fs_reply(stdout: &[u8]) -> Result<FsResponse> {
-    let line = stdout.strip_suffix(b"\n").unwrap_or(stdout);
-    if line.is_empty() {
+    if stdout.is_empty() {
         return Err(Error::new(
             ErrorKind::Io,
             "sandbox helper exited without a reply",
         ));
     }
-    match serde_json::from_slice(line) {
+    let reply = stdout
+        .split_first_chunk::<4>()
+        .filter(|(len, rest)| u32::from_be_bytes(**len) as usize == rest.len())
+        .ok_or_else(|| "the frame length does not match".to_string())
+        .and_then(|(_, cbor)| from_cbor::<FsReply>(cbor));
+    match reply {
         Ok(FsReply::Ok(response)) => Ok(response),
         Ok(FsReply::Err(err)) => Err(err),
         Err(err) => Err(Error::new(
@@ -113,7 +124,7 @@ pub fn parse_exec_status(status: &[u8]) -> Result<()> {
     if status.is_empty() {
         return Ok(());
     }
-    match serde_json::from_slice::<Error>(status) {
+    match from_cbor::<Error>(status) {
         Ok(err) => Err(err),
         Err(err) => Err(Error::new(
             ErrorKind::Io,
@@ -218,7 +229,7 @@ fn run_exec(
     };
     match status {
         Some(mut pipe) => {
-            let _ = pipe.write_all(&serde_json::to_vec(&err).expect("errors serialize"));
+            let _ = pipe.write_all(&to_cbor(&err));
         }
         None => eprintln!("happy-supervisor __sandbox: {err}"),
     }
@@ -268,10 +279,9 @@ fn run_fs(policy: &ResolvedPolicy, request: &FsRequest) -> ! {
         Ok(response) => FsReply::Ok(response),
         Err(err) => FsReply::Err(err),
     };
-    let mut line = serde_json::to_vec(&reply).expect("replies serialize");
-    line.push(b'\n');
+    let frame = encode_frame(&reply);
     let mut stdout = std::io::stdout().lock();
-    let written = stdout.write_all(&line).and_then(|()| stdout.flush());
+    let written = stdout.write_all(&frame).and_then(|()| stdout.flush());
     std::process::exit(if written.is_ok() { 0 } else { 1 })
 }
 
@@ -279,7 +289,7 @@ fn run_fs(policy: &ResolvedPolicy, request: &FsRequest) -> ! {
 mod tests {
     use super::*;
     use crate::policy::Policy;
-    use crate::protocol::{FileKind, FsPathParams, FsStat};
+    use crate::protocol::{Bytes, FileKind, FsPathParams, FsReadResult, FsStat};
 
     fn job() -> Job {
         let policy = Policy::new(vec![], vec![], false, true).unwrap();
@@ -294,12 +304,12 @@ mod tests {
     }
 
     #[test]
-    fn frame_is_length_then_json_and_reading_stops_at_its_end() {
+    fn frame_is_length_then_cbor_and_reading_stops_at_its_end() {
         let job = job();
         let frame = encode_job(&job);
-        let json = serde_json::to_vec(&job).unwrap();
-        assert_eq!(frame[..4], (json.len() as u32).to_be_bytes());
-        assert_eq!(frame[4..], json[..]);
+        let cbor = to_cbor(&job);
+        assert_eq!(frame[..4], (cbor.len() as u32).to_be_bytes());
+        assert_eq!(frame[4..], cbor[..]);
 
         let mut stream = std::io::Cursor::new([frame, b"stdin of the command".to_vec()].concat());
         assert_eq!(read_job(&mut stream).unwrap(), job);
@@ -314,13 +324,13 @@ mod tests {
         let err = read_job(&mut &huge[..]).unwrap_err();
         assert_eq!(err.kind, ErrorKind::TooLarge);
 
-        let truncated = [0, 0, 0, 10, b'{'];
+        let truncated = [0, 0, 0, 10, 0xa0];
         assert_eq!(
             read_job(&mut &truncated[..]).unwrap_err().kind,
             ErrorKind::Io
         );
 
-        let garbage = [&3u32.to_be_bytes()[..], b"{x}"].concat();
+        let garbage = [&1u32.to_be_bytes()[..], &[0xa0]].concat();
         assert_eq!(
             read_job(&mut &garbage[..]).unwrap_err().kind,
             ErrorKind::InvalidParams
@@ -328,22 +338,27 @@ mod tests {
     }
 
     #[test]
-    fn fs_job_json_shape() {
-        let request = FsRequest::Stat(FsPathParams {
-            path: AbsPath::try_from(if cfg!(windows) { r"C:\x" } else { "/x" }).unwrap(),
-        });
+    fn fs_job_shape() {
         let path = if cfg!(windows) { r"C:\x" } else { "/x" };
+        let request = FsRequest::Stat(FsPathParams {
+            path: AbsPath::try_from(path).unwrap(),
+        });
         assert_eq!(
-            serde_json::to_value(JobOp::Fs(request)).unwrap(),
+            crate::testkit::json(crate::wire::to_value(&JobOp::Fs(request))),
             serde_json::json!({ "fs": { "stat": { "path": path } } })
         );
     }
 
+    fn framed(literal: serde_json::Value) -> Vec<u8> {
+        let cbor = to_cbor(&crate::testkit::cbor(literal));
+        [&(cbor.len() as u32).to_be_bytes()[..], &cbor].concat()
+    }
+
     #[test]
     fn fs_replies() {
-        let stat = br#"{"ok":{"stat":{"kind":"file","size":3,"modifiedMs":5,"readonly":true}}}"#;
+        let stat = serde_json::json!({ "ok": { "stat": { "kind": "file", "size": 3, "modifiedMs": 5, "readonly": true } } });
         assert_eq!(
-            parse_fs_reply(&[&stat[..], b"\n"].concat()).unwrap(),
+            parse_fs_reply(&framed(stat)).unwrap(),
             FsResponse::Stat(FsStat {
                 kind: FileKind::File,
                 size: 3,
@@ -351,28 +366,41 @@ mod tests {
                 readonly: true,
             })
         );
+        let read = serde_json::json!({ "ok": { "read": { "data": "h'6869'", "size": 2 } } });
         assert_eq!(
-            parse_fs_reply(b"{\"ok\":\"done\"}\n").unwrap(),
-            FsResponse::Done
+            parse_fs_reply(&framed(read)).unwrap(),
+            FsResponse::Read(FsReadResult {
+                data: Bytes(b"hi".to_vec()),
+                size: 2,
+            })
         );
         assert_eq!(
-            parse_fs_reply(br#"{"err":{"kind":"permission_denied","message":"no"}}"#).unwrap_err(),
+            parse_fs_reply(&framed(serde_json::json!({ "ok": "done" }))).unwrap(),
+            FsResponse::Done
+        );
+        let denied = serde_json::json!({ "err": { "kind": "permission_denied", "message": "no" } });
+        assert_eq!(
+            parse_fs_reply(&framed(denied)).unwrap_err(),
             Error::new(ErrorKind::PermissionDenied, "no")
         );
         assert_eq!(
             parse_fs_reply(b"").unwrap_err(),
             Error::new(ErrorKind::Io, "sandbox helper exited without a reply")
         );
-        assert_eq!(parse_fs_reply(b"nope\n").unwrap_err().kind, ErrorKind::Io);
+        assert_eq!(
+            parse_fs_reply(&[0, 0, 0, 9, 0xa0]).unwrap_err(),
+            Error::new(
+                ErrorKind::Io,
+                "sandbox helper sent a bad reply: the frame length does not match"
+            )
+        );
     }
 
     #[test]
     fn exec_status() {
         assert_eq!(parse_exec_status(b""), Ok(()));
-        assert_eq!(
-            parse_exec_status(br#"{"kind":"not_found","message":"No such file or directory"}"#),
-            Err(Error::new(ErrorKind::NotFound, "No such file or directory"))
-        );
-        assert_eq!(parse_exec_status(b"\x00").unwrap_err().kind, ErrorKind::Io);
+        let not_found = Error::new(ErrorKind::NotFound, "No such file or directory");
+        assert_eq!(parse_exec_status(&to_cbor(&not_found)), Err(not_found));
+        assert_eq!(parse_exec_status(b"\xff").unwrap_err().kind, ErrorKind::Io);
     }
 }

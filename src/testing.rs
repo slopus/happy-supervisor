@@ -3,7 +3,7 @@
 //! protocol through [`link::Session`](crate::link::Session) with
 //! [`Role::ControlPlane`](crate::link::Role::ControlPlane), one session per node.
 
-use serde_json::Value;
+use crate::protocol::Value;
 
 use crate::error::{Error, Result};
 use crate::protocol::{Event, NodeInfo};

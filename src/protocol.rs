@@ -8,13 +8,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::Error;
 pub use crate::policy::Policy;
+pub use crate::wire::Value;
 
 pub const MAX_FRAME_BYTES: usize = 32 << 20;
 pub const MAX_FS_DATA_BYTES: usize = 16 << 20;
@@ -38,27 +37,71 @@ pub const RETAINED_QUEUE_BYTES: usize = 64 << 20;
 // ---------------------------------------------------------------------------------------------
 // Link frames (api.md, Link protocol)
 
-/// A message ID: a UUIDv7, strictly increasing per sender within a session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct MsgId(pub Uuid);
+/// Reads a CBOR byte string and nothing else: a text string or an array of numbers is rejected,
+/// where a generic byte buffer would take either.
+fn byte_string<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    struct Visitor;
 
-/// A session ID: a UUIDv7 chosen by the control plane.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SessionId(pub Uuid);
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = Vec<u8>;
 
-impl std::fmt::Display for MsgId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a byte string")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
     }
+
+    d.deserialize_byte_buf(Visitor)
 }
 
-impl std::fmt::Display for SessionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
+/// Defines a UUID newtype carried as a 16-byte CBOR byte string.
+macro_rules! uuid_type {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(pub Uuid);
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_bytes(self.0.as_bytes())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let bytes = byte_string(d)?;
+                Uuid::from_slice(&bytes).map($name).map_err(|_| {
+                    serde::de::Error::custom(format!(
+                        "a UUID is 16 bytes, got {}",
+                        bytes.len()
+                    ))
+                })
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
 }
+
+uuid_type!(
+    /// A message ID: a UUIDv7, strictly increasing per sender within a session.
+    MsgId
+);
+uuid_type!(
+    /// A session ID: a UUIDv7 chosen by the control plane.
+    SessionId
+);
 
 /// One WebSocket text frame.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -88,6 +131,7 @@ pub struct Welcome {
     pub session: SessionId,
     pub resumed: bool,
     /// The control plane's cursor. Always `None` when `resumed` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<MsgId>,
     pub resume_window_ms: u64,
 }
@@ -96,8 +140,12 @@ pub struct Welcome {
 pub struct Msg {
     pub id: MsgId,
     pub kind: String,
-    #[serde(default)]
+    #[serde(default = "null")]
     pub body: Value,
+}
+
+fn null() -> Value {
+    Value::Null
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,13 +231,15 @@ impl Event {
     ];
 
     /// Parses a received message as an event. `None` for a kind that is not an event.
-    pub fn parse(kind: &str, body: Value) -> Option<Result<Event, serde_json::Error>> {
+    pub fn parse(kind: &str, body: Value) -> Option<Result<Event, String>> {
         if !Event::KINDS.contains(&kind) {
             return None;
         }
-        Some(serde_json::from_value(
-            serde_json::json!({ "kind": kind, "body": body }),
-        ))
+        let tagged = Value::Map(vec![
+            (Value::Text("kind".into()), Value::Text(kind.into())),
+            (Value::Text("body".into()), body),
+        ]);
+        Some(crate::wire::from_value(tagged))
     }
 }
 
@@ -430,29 +480,39 @@ impl From<Argv> for Vec<String> {
     }
 }
 
-/// Bytes carried as standard padded base64 in `data` fields.
+/// Bytes carried as a CBOR byte string: `data` fields and proxy header values.
 #[derive(Clone, Default, PartialEq, Eq)]
-pub struct Base64Bytes(pub Vec<u8>);
+pub struct Bytes(pub Vec<u8>);
 
-impl std::fmt::Debug for Base64Bytes {
+impl Bytes {
+    pub fn new(bytes: Vec<u8>) -> Bytes {
+        Bytes(bytes)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Bytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Base64Bytes({} bytes)", self.0.len())
+        write!(f, "Bytes({} bytes)", self.0.len())
     }
 }
 
-impl Serialize for Base64Bytes {
+impl Serialize for Bytes {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+        s.serialize_bytes(&self.0)
     }
 }
 
-impl<'de> Deserialize<'de> for Base64Bytes {
+impl<'de> Deserialize<'de> for Bytes {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(d)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(text)
-            .map(Base64Bytes)
-            .map_err(|err| serde::de::Error::custom(format!("data is not base64: {err}")))
+        byte_string(d).map(Bytes)
     }
 }
 
@@ -521,6 +581,7 @@ impl TryFrom<NodeUpdateWire> for NodeUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct NodeReady {
     pub info: NodeInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_session: Option<SessionId>,
     pub execs: Vec<ExecSummary>,
     pub watches: Vec<WatchId>,
@@ -546,7 +607,6 @@ pub struct ExecStartParams {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Timeout {
     pub ms: u64,
     #[serde(with = "tagged_action")]
@@ -570,7 +630,6 @@ mod tagged_action {
     use super::TimeoutAction;
 
     #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Tagged {
         kind: TimeoutAction,
     }
@@ -591,7 +650,6 @@ mod tagged_action {
     tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
-    deny_unknown_fields,
     try_from = "LogSpecWire"
 )]
 pub enum LogSpec {
@@ -626,8 +684,7 @@ impl LogSpec {
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
+    rename_all_fields = "camelCase"
 )]
 enum LogSpecWire {
     Memory {
@@ -675,7 +732,7 @@ pub struct ExecStartResult {
 #[serde(rename_all = "camelCase")]
 pub struct ExecWriteParams {
     pub exec_id: ExecId,
-    pub data: Base64Bytes,
+    pub data: Bytes,
     #[serde(default)]
     pub eof: bool,
 }
@@ -735,7 +792,7 @@ pub enum Stream {
 pub struct ExecOutput {
     pub exec_id: ExecId,
     pub stream: Stream,
-    pub data: Base64Bytes,
+    pub data: Bytes,
     pub dropped_bytes: u64,
 }
 
@@ -768,7 +825,7 @@ pub struct ExecLogParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecLogResult {
-    pub data: Base64Bytes,
+    pub data: Bytes,
     pub offset: u64,
     pub total_bytes: u64,
     pub retained: Vec<ByteRange>,
@@ -810,7 +867,7 @@ pub enum WriteMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsWriteParams {
     pub path: AbsPath,
-    pub data: Base64Bytes,
+    pub data: Bytes,
     pub mode: WriteMode,
 }
 
@@ -860,7 +917,7 @@ pub struct FsListResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsReadResult {
-    pub data: Base64Bytes,
+    pub data: Bytes,
     pub size: u64,
 }
 
@@ -957,8 +1014,11 @@ pub struct NodeInfo {
 #[serde(rename_all = "camelCase")]
 pub struct OsInfo {
     pub family: OsFamily,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
     pub arch: Arch,
 }
@@ -982,7 +1042,9 @@ pub enum Arch {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CpuInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_cores: Option<u32>,
     pub logical_cores: u32,
 }
@@ -1009,7 +1071,9 @@ pub struct DiskInfo {
 pub struct GpuInfo {
     pub name: String,
     pub vendor: GpuVendor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver_version: Option<String>,
 }
 
@@ -1058,11 +1122,13 @@ impl SandboxInfo {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct SandboxInfoWire {
     mechanism: MechanismName,
     available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     landlock_abi: Option<u32>,
     baseline_read: Vec<String>,
 }
@@ -1137,26 +1203,55 @@ impl TryFrom<SandboxInfoWire> for SandboxInfo {
 #[cfg(all(test, unix))]
 mod tests {
     use serde::de::DeserializeOwned;
-    use serde_json::json;
+    use serde_json::{Value as Json, json};
 
     use super::*;
+    use crate::testkit::cbor;
+    use crate::wire::{from_cbor, from_value, to_cbor};
 
-    /// Parses `json` as `T`, checks it serializes back to the same JSON, and returns it.
-    fn round_trip<T: Serialize + DeserializeOwned>(json: Value) -> T {
-        let parsed: T = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    /// Parses the CBOR that `literal` stands for as `T`, checks that `T` encodes back to the
+    /// same CBOR (nulls and omitted fields being equal), and returns it.
+    fn round_trip<T: Serialize + DeserializeOwned>(literal: Json) -> T {
+        let bytes = to_cbor(&cbor(literal.clone()));
+        let parsed: T = from_cbor(&bytes).unwrap();
+        let again: Value = from_cbor(&to_cbor(&parsed)).unwrap();
+        assert_eq!(canon(crate::testkit::json(again)), canon(literal));
         parsed
     }
 
-    fn rejects<T: DeserializeOwned + std::fmt::Debug>(json: Value) -> String {
-        serde_json::from_value::<T>(json).unwrap_err().to_string()
+    /// Drops null map entries, so a field written as `null` equals one that was omitted.
+    fn canon(json: serde_json::Value) -> serde_json::Value {
+        match json {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.into_iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, v)| (k, canon(v)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(canon).collect())
+            }
+            other => other,
+        }
     }
 
-    fn policy_json() -> Value {
+    fn parse<T: DeserializeOwned>(literal: Json) -> T {
+        from_value(cbor(literal)).unwrap()
+    }
+
+    fn rejects<T: DeserializeOwned + std::fmt::Debug>(literal: Json) -> String {
+        from_value::<T>(cbor(literal)).unwrap_err()
+    }
+
+    fn u(id: &str) -> String {
+        format!("u'{id}'")
+    }
+
+    fn policy_json() -> Json {
         json!({ "read": ["/usr", "/home/me/repo"], "write": ["/home/me/repo"], "localBind": false, "unixSockets": false })
     }
 
-    fn node_info_json() -> Value {
+    fn node_info_json() -> Json {
         json!({
           "installationId": "tz4a98xxat96iws9zmbrgj3a",
           "name": "build-box-3",
@@ -1219,7 +1314,7 @@ mod tests {
     #[test]
     fn link_frames() {
         let hello: Frame = round_trip(
-            json!({ "t": "hello", "session": ID_A, "cursor": ID_B, "nodeId": "n_1", "installationId": "tz4a98xxat96iws9zmbrgj3a", "version": "0.1.0" }),
+            json!({ "t": "hello", "session": u(ID_A), "cursor": u(ID_B), "nodeId": "n_1", "installationId": "tz4a98xxat96iws9zmbrgj3a", "version": "0.1.0" }),
         );
         assert_eq!(
             hello,
@@ -1235,7 +1330,7 @@ mod tests {
             json!({ "t": "hello", "session": null, "cursor": null, "nodeId": "n_1", "installationId": "x", "version": "0.1.0" }),
         );
         let welcome: Frame = round_trip(
-            json!({ "t": "welcome", "session": ID_A, "resumed": true, "cursor": ID_B, "resumeWindowMs": 300000 }),
+            json!({ "t": "welcome", "session": u(ID_A), "resumed": true, "cursor": u(ID_B), "resumeWindowMs": 300000 }),
         );
         assert_eq!(
             welcome,
@@ -1247,17 +1342,17 @@ mod tests {
             })
         );
         let msg: Frame = round_trip(
-            json!({ "t": "msg", "id": ID_A, "kind": "exec.start", "body": { "execId": "build-1" } }),
+            json!({ "t": "msg", "id": u(ID_A), "kind": "exec.start", "body": { "execId": "build-1" } }),
         );
         assert_eq!(
             msg,
             Frame::Msg(Msg {
                 id: MsgId(id(ID_A)),
                 kind: "exec.start".to_string(),
-                body: json!({ "execId": "build-1" }),
+                body: cbor(json!({ "execId": "build-1" })),
             })
         );
-        let ack: Frame = round_trip(json!({ "t": "ack", "cursor": ID_A }));
+        let ack: Frame = round_trip(json!({ "t": "ack", "cursor": u(ID_A) }));
         assert_eq!(
             ack,
             Frame::Ack(Ack {
@@ -1278,21 +1373,35 @@ mod tests {
             round_trip::<Frame>(json!({ "t": "bye", "reason": reason }));
         }
         assert!(rejects::<Frame>(json!({ "t": "ping" })).contains("unknown variant `ping`"));
-        assert!(rejects::<Frame>(json!({ "t": "ack", "cursor": "nope" })).contains("UUID"));
+        assert!(
+            rejects::<Frame>(json!({ "t": "ack", "cursor": "h'0102'" }))
+                .contains("a UUID is 16 bytes, got 2")
+        );
+        assert!(
+            rejects::<Frame>(json!({ "t": "ack", "cursor": ID_A }))
+                .contains("invalid type: string")
+        );
+        let unknown_keys: Frame = parse(json!({ "t": "ack", "cursor": u(ID_A), "future": 1 }));
+        assert_eq!(
+            unknown_keys,
+            Frame::Ack(Ack {
+                cursor: MsgId(id(ID_A))
+            })
+        );
     }
 
     #[test]
     fn replies() {
-        let ok: Reply = round_trip(json!({ "to": ID_A, "ok": { "size": 1 } }));
+        let ok: Reply = round_trip(json!({ "to": u(ID_A), "ok": { "size": 1 } }));
         assert_eq!(
             ok,
             Reply {
                 to: MsgId(id(ID_A)),
-                outcome: Outcome::Ok(json!({ "size": 1 })),
+                outcome: Outcome::Ok(cbor(json!({ "size": 1 }))),
             }
         );
         let err: Reply = round_trip(
-            json!({ "to": ID_B, "error": { "kind": "permission_denied", "message": "…" } }),
+            json!({ "to": u(ID_B), "error": { "kind": "permission_denied", "message": "…" } }),
         );
         assert_eq!(
             crate::Result::<Value>::from(err.outcome),
@@ -1327,7 +1436,7 @@ mod tests {
 
         let ready = json!({ "kind": "node.ready", "body": {
             "info": node_info_json(),
-            "previousSession": ID_A,
+            "previousSession": u(ID_A),
             "execs": [ { "execId": "build-1", "state": "running", "logBytes": 1200 } ],
             "watches": [ "w-1" ]
         }});
@@ -1350,19 +1459,21 @@ mod tests {
     fn events_parse_by_kind() {
         let event = Event::parse(
             "exec.output",
-            json!({ "execId": "build-1", "stream": "stdout", "data": "aGk=", "droppedBytes": 0 }),
+            cbor(
+                json!({ "execId": "build-1", "stream": "stdout", "data": "h'6869'", "droppedBytes": 0 }),
+            ),
         );
         assert_eq!(
             event.unwrap().unwrap(),
             Event::ExecOutput(ExecOutput {
                 exec_id: ExecId::try_from("build-1").unwrap(),
                 stream: Stream::Stdout,
-                data: Base64Bytes(b"hi".to_vec()),
+                data: Bytes(b"hi".to_vec()),
                 dropped_bytes: 0,
             })
         );
-        assert!(Event::parse("exec.start", json!({})).is_none());
-        assert!(Event::parse("exec.exit", json!({})).unwrap().is_err());
+        assert!(Event::parse("exec.start", cbor(json!({}))).is_none());
+        assert!(Event::parse("exec.exit", cbor(json!({}))).unwrap().is_err());
     }
 
     #[test]
@@ -1431,8 +1542,7 @@ mod tests {
         assert_eq!(start.params.log.limit_bytes(), 67108864);
 
         let minimal: ExecStartParams =
-            serde_json::from_value(json!({ "execId": "a", "argv": ["sh"], "cwd": "/", "env": {} }))
-                .unwrap();
+            parse(json!({ "execId": "a", "argv": ["sh"], "cwd": "/", "env": {} }));
         assert_eq!(
             (minimal.stdin, minimal.timeout, &minimal.log),
             (false, None, &LogSpec::Memory { limit_bytes: None })
@@ -1508,26 +1618,27 @@ mod tests {
                 .contains("log limitBytes must be positive")
         );
         assert!(rejects::<LogSpec>(json!({ "kind": "file" })).contains("missing field `path`"));
-        assert!(
-            rejects::<LogSpec>(json!({ "kind": "memory", "path": "/x" }))
-                .contains("unknown field `path`")
+        assert_eq!(
+            parse::<LogSpec>(json!({ "kind": "memory", "path": "/x" })),
+            LogSpec::Memory { limit_bytes: None }
         );
     }
 
     #[test]
     fn exec_methods_and_notifications() {
         let write: ExecWriteParams =
-            round_trip(json!({ "execId": "e", "data": "AAEC", "eof": false }));
-        assert_eq!(write.data, Base64Bytes(vec![0, 1, 2]));
-        let empty: ExecWriteParams = round_trip(json!({ "execId": "e", "data": "", "eof": true }));
+            round_trip(json!({ "execId": "e", "data": "h'000102'", "eof": false }));
+        assert_eq!(write.data, Bytes(vec![0, 1, 2]));
+        let empty: ExecWriteParams =
+            round_trip(json!({ "execId": "e", "data": "h''", "eof": true }));
         assert_eq!(empty.data.0, b"");
         assert!(
-            rejects::<ExecWriteParams>(json!({ "execId": "e", "data": "A" }))
-                .contains("data is not base64")
+            rejects::<ExecWriteParams>(json!({ "execId": "e", "data": "AAEC" }))
+                .contains("invalid type: string")
         );
         assert!(
-            rejects::<ExecWriteParams>(json!({ "execId": "e", "data": "AAE" }))
-                .contains("data is not base64")
+            rejects::<ExecWriteParams>(json!({ "execId": "e", "data": [0, 1, 2] }))
+                .contains("invalid type: sequence")
         );
 
         let kill: ExecKillParams = round_trip(json!({ "execId": "e", "signal": "terminate" }));
@@ -1582,11 +1693,10 @@ mod tests {
         let log: ExecLogParams =
             round_trip(json!({ "execId": "build-1", "offset": 0, "length": 65536 }));
         assert_eq!(log.length, Some(65536));
-        let defaults: ExecLogParams =
-            serde_json::from_value(json!({ "execId": "build-1" })).unwrap();
+        let defaults: ExecLogParams = parse(json!({ "execId": "build-1" }));
         assert_eq!((defaults.offset, defaults.length), (0, None));
         let read: ExecLogResult = round_trip(
-            json!({ "data": "aGk=", "offset": 0, "totalBytes": 183022, "retained": [ { "start": 0, "end": 16384 }, { "start": 120000, "end": 183022 } ] }),
+            json!({ "data": "h'6869'", "offset": 0, "totalBytes": 183022, "retained": [ { "start": 0, "end": 16384 }, { "start": 120000, "end": 183022 } ] }),
         );
         assert_eq!(
             read.retained,
@@ -1617,13 +1727,13 @@ mod tests {
         let read: WithAccess<FsReadParams> =
             round_trip(json!({ "path": "/x", "access": access, "offset": 0, "length": 1048576 }));
         assert_eq!(read.params.length, Some(1048576));
-        let read_defaults: FsReadParams = serde_json::from_value(json!({ "path": "/x" })).unwrap();
+        let read_defaults: FsReadParams = parse(json!({ "path": "/x" }));
         assert_eq!((read_defaults.offset, read_defaults.length), (0, None));
-        let result: FsReadResult = round_trip(json!({ "data": "aGk=", "size": 1234 }));
+        let result: FsReadResult = round_trip(json!({ "data": "h'6869'", "size": 1234 }));
         assert_eq!(result.data.0, b"hi");
         for mode in ["create", "overwrite", "append"] {
             round_trip::<WithAccess<FsWriteParams>>(
-                json!({ "path": "/x", "access": access, "data": "", "mode": mode }),
+                json!({ "path": "/x", "access": access, "data": "h''", "mode": mode }),
             );
         }
         let mkdir: WithAccess<FsMkdirParams> =
@@ -1661,8 +1771,7 @@ mod tests {
         let overflow: WatchEvent = round_trip(json!({ "watchId": "w-1", "overflow": true }));
         assert_eq!(overflow.body, WatchEventBody::Overflow { overflow: True });
         assert!(
-            serde_json::from_value::<WatchEvent>(json!({ "watchId": "w-1", "overflow": false }))
-                .is_err()
+            from_value::<WatchEvent>(cbor(json!({ "watchId": "w-1", "overflow": false }))).is_err()
         );
         for kind in ["created", "modified", "removed", "renamed"] {
             round_trip::<Change>(json!({ "kind": kind, "path": "/p" }));

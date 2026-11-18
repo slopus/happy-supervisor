@@ -3,7 +3,6 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::exec::ExecManager;
@@ -13,8 +12,8 @@ use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
     Access, CommandKind, Empty, ExecKillParams, ExecListResult, ExecLogParams, ExecStartParams,
     ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams, FsRemoveParams,
-    FsWriteParams, NodeInfo, NodeUpdate, SandboxInfo, WatchId, WatchStartParams, WatchStopParams,
-    WithAccess,
+    FsWriteParams, NodeInfo, NodeUpdate, SandboxInfo, Value, WatchId, WatchStartParams,
+    WatchStopParams, WithAccess,
 };
 use crate::state::StateDir;
 use crate::watch::WatchManager;
@@ -206,19 +205,21 @@ pub async fn dispatch(node: &Node, kind: &str, body: Value) -> Result<Value> {
 /// An absent body (`null`) parses as `{}`.
 fn parse<T: DeserializeOwned>(params: Value) -> Result<T> {
     let params = match params {
-        Value::Null => Value::Object(Default::default()),
+        Value::Null => Value::Map(Vec::new()),
         other => other,
     };
-    serde_json::from_value(params).map_err(|err| Error::invalid_params(err.to_string()))
+    crate::wire::from_value(params).map_err(Error::invalid_params)
 }
 
 fn to_value(value: impl Serialize) -> Result<Value> {
-    Ok(serde_json::to_value(value).expect("results serialize"))
+    Ok(crate::wire::to_value(&value))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use serde_json::json;
+
+    use crate::testkit::cbor;
 
     use super::*;
     use crate::link::{ManualClock, NodeIdentity, Role, Session};
@@ -242,8 +243,8 @@ mod tests {
         Node::new(state, installation_id, None, sandbox, outbox)
     }
 
-    async fn call(method: &str, params: Value) -> Result<Value> {
-        dispatch(&node(), method, params).await
+    async fn call(method: &str, params: serde_json::Value) -> Result<Value> {
+        dispatch(&node(), method, cbor(params)).await
     }
 
     #[tokio::test]
@@ -283,8 +284,8 @@ mod tests {
     #[tokio::test]
     async fn exec_list_answers_from_the_manager() {
         assert_eq!(
-            call("exec.list", Value::Null).await,
-            Ok(json!({ "execs": [] }))
+            call("exec.list", serde_json::Value::Null).await,
+            Ok(cbor(json!({ "execs": [] })))
         );
     }
 

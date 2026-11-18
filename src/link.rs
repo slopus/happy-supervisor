@@ -2,7 +2,8 @@
 //!
 //! A [`Session`] holds no socket and starts no task. Its driver (the node's `client`, or the test
 //! control plane) owns the WebSocket and feeds the session what happens to it:
-//! [`connected`](Session::connected), [`receive`](Session::receive) for each text frame,
+//! [`connected`](Session::connected) with the negotiated [`Wire`],
+//! [`receive`](Session::receive) for each binary frame,
 //! [`disconnected`](Session::disconnected), and [`tick`](Session::tick) at
 //! [`deadline`](Session::deadline). After each call it drains
 //! [`poll_transmit`](Session::poll_transmit) into the socket and
@@ -14,8 +15,9 @@
 //! node has one. The control plane has one per node. [`Role`] is the only difference.
 //!
 //! Sending goes through [`Outbox`], a cloneable handle that exec, watch and the driver use from
-//! any task. Each message gets its UUIDv7 and its serialized frame when it is queued, and the same
-//! bytes are resent after a reconnect.
+//! any task. Each message gets its UUIDv7 and its CBOR frame when it is queued, and the same
+//! bytes are resent after a reconnect. Compression, when the connection uses it, is applied per
+//! transmission.
 //!
 //! Messages queued while no session is live wait in the queue and go out once one is. On the
 //! node a new session goes live only after [`Session::ready`], whose `node.ready` takes an ID
@@ -26,16 +28,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
-use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ACK_DELAY_MS, ACK_EVERY_MSGS, Ack, Base64Bytes, Bye, ByeReason, Change, DROPPABLE_QUEUE_BYTES,
+    ACK_DELAY_MS, ACK_EVERY_MSGS, Ack, Bye, ByeReason, Bytes, Change, DROPPABLE_QUEUE_BYTES,
     ExecExit, ExecId, ExecOutput, ExecSummary, ExecTimedOut, ExitStatus, Frame, Hello, MsgId,
     NodeInfo, NodeReady, Outcome, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply, SessionId, Stream,
     TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
 };
+use crate::wire::{Value, Wire, from_cbor, from_value, to_cbor};
 
 /// Milliseconds since the Unix epoch. Message IDs carry it, and every timer reads it.
 pub trait Clock: Send + Sync {
@@ -223,7 +225,8 @@ enum Class {
 
 struct Queued {
     id: MsgId,
-    text: String,
+    /// The CBOR frame. Budgets count its length.
+    cbor: Vec<u8>,
     class: Class,
 }
 
@@ -235,6 +238,7 @@ struct State {
     limits: Limits,
     ids: IdGen,
     conn: Conn,
+    wire: Wire,
     closing: bool,
 
     session: Option<SessionId>,
@@ -262,7 +266,8 @@ struct State {
     unacked_since: Option<u64>,
     duplicate: bool,
 
-    control: VecDeque<String>,
+    /// Handshake, ack and bye frames, as CBOR, sent before queued messages.
+    control: VecDeque<Vec<u8>>,
     incoming: VecDeque<Incoming>,
 }
 
@@ -292,6 +297,7 @@ impl Session {
             limits,
             ids,
             conn: Conn::Down { since: None },
+            wire: Wire::Plain,
             closing: false,
             session: None,
             live: false,
@@ -330,12 +336,14 @@ impl Session {
         }
     }
 
-    /// A WebSocket is up. The node queues its `hello`; the control plane waits for one.
-    pub fn connected(&mut self) {
+    /// A WebSocket is up, speaking `wire`. The node queues its `hello`; the control plane waits
+    /// for one.
+    pub fn connected(&mut self, wire: Wire) {
         let mut s = self.shared.lock();
         let now = s.now;
         s.expire(now);
         s.conn = Conn::Handshake;
+        s.wire = wire;
         s.sent = 0;
         s.closing = false;
         s.control.clear();
@@ -361,10 +369,14 @@ impl Session {
         s.control.clear();
     }
 
-    /// Feeds one received text frame.
-    pub fn receive(&mut self, text: &str) {
+    /// Feeds the payload of one received binary frame.
+    pub fn receive(&mut self, payload: &[u8]) {
         let mut s = self.shared.lock();
-        match serde_json::from_str::<Frame>(text) {
+        let frame = s
+            .wire
+            .decode(payload)
+            .and_then(|cbor| from_cbor::<Frame>(&cbor));
+        match frame {
             Ok(frame) => s.receive(frame),
             Err(err) => s.protocol_error(format!("bad frame: {err}")),
         }
@@ -394,11 +406,12 @@ impl Session {
         [ack, expiry].into_iter().flatten().min()
     }
 
-    /// The next text frame to write on the current connection.
-    pub fn poll_transmit(&mut self) -> Option<String> {
+    /// The payload of the next binary frame to write on the current connection.
+    pub fn poll_transmit(&mut self) -> Option<Vec<u8>> {
         let mut s = self.shared.lock();
+        let wire = s.wire;
         if let Some(frame) = s.control.pop_front() {
-            return Some(frame);
+            return Some(wire.encode(&frame));
         }
         if !s.transmittable() {
             return None;
@@ -406,11 +419,11 @@ impl Session {
         let index = s.sent;
         s.sent += 1;
         let queued = &s.queue[index];
-        let text = queued.text.clone();
+        let payload = wire.encode(&queued.cbor);
         if let Class::Overflow(watch_id) = queued.class.clone() {
             s.overflowed.remove(&watch_id);
         }
-        Some(text)
+        Some(payload)
     }
 
     pub fn poll_incoming(&mut self) -> Option<Incoming> {
@@ -460,11 +473,11 @@ impl Session {
             execs,
             watches,
         };
-        let text = msg_text(id, "node.ready", &body);
-        s.retained_bytes += text.len();
+        let cbor = msg_cbor(id, "node.ready", &to_cbor(&body));
+        s.retained_bytes += cbor.len();
         s.queue.push_front(Queued {
             id,
-            text,
+            cbor,
             class: Class::Retained,
         });
         s.ready_id = None;
@@ -504,8 +517,8 @@ impl Outbox {
     }
 
     /// Queues a command. Its reply arrives as [`Incoming::Reply`] with this ID in `to`.
-    pub fn command(&self, kind: &str, body: Value) -> MsgId {
-        self.lock().enqueue(kind, &body, Class::Retained)
+    pub fn command<T: Serialize + ?Sized>(&self, kind: &str, body: &T) -> MsgId {
+        self.lock().enqueue(kind, body, Class::Retained)
     }
 
     /// Queues the reply to the command `to`.
@@ -527,12 +540,12 @@ impl Outbox {
             exec_id: key.0.clone(),
             stream,
             dropped_bytes: s.dropped.get(&key).copied().unwrap_or(0),
-            data: Base64Bytes(data),
+            data: Bytes(data),
         };
-        let body = body_text(&output);
+        let body = to_cbor(&output);
         if s.fits_droppable("exec.output", &body) {
             s.dropped.remove(&key);
-            s.enqueue_text("exec.output", &body, Class::Droppable);
+            s.enqueue_cbor("exec.output", &body, Class::Droppable);
         } else {
             *s.dropped.entry(key).or_default() += output.data.0.len() as u64;
         }
@@ -577,9 +590,9 @@ impl Outbox {
             watch_id,
             body: WatchEventBody::Changes { changes },
         };
-        let body = body_text(&event);
+        let body = to_cbor(&event);
         if s.fits_droppable("watch.event", &body) {
-            s.enqueue_text("watch.event", &body, Class::Droppable);
+            s.enqueue_cbor("watch.event", &body, Class::Droppable);
         } else {
             s.overflow(event.watch_id);
         }
@@ -603,7 +616,7 @@ impl State {
     }
 
     fn handshake_sent(&mut self, frame: Frame) {
-        self.control.push_back(frame_text(&frame));
+        self.control.push_back(frame_cbor(&frame));
         self.acked = self.cursor;
         self.unacked = 0;
         self.unacked_since = None;
@@ -699,7 +712,7 @@ impl State {
             return;
         }
         let incoming = if kind == REPLY_KIND {
-            match serde_json::from_value::<Reply>(body) {
+            match from_value::<Reply>(body) {
                 Ok(reply) => Incoming::Reply {
                     to: reply.to,
                     result: reply.outcome.into(),
@@ -725,10 +738,10 @@ impl State {
             let queued = self.queue.pop_front().expect("checked");
             self.sent = self.sent.saturating_sub(1);
             match queued.class {
-                Class::Droppable => self.droppable_bytes -= queued.text.len(),
-                Class::Retained => self.retained_bytes -= queued.text.len(),
+                Class::Droppable => self.droppable_bytes -= queued.cbor.len(),
+                Class::Retained => self.retained_bytes -= queued.cbor.len(),
                 Class::Overflow(watch_id) => {
-                    self.retained_bytes -= queued.text.len();
+                    self.retained_bytes -= queued.cbor.len();
                     self.overflowed.remove(&watch_id);
                 }
             }
@@ -743,7 +756,7 @@ impl State {
             && (self.acked != Some(cursor) || self.duplicate)
         {
             self.control
-                .push_back(frame_text(&Frame::Ack(Ack { cursor })));
+                .push_back(frame_cbor(&Frame::Ack(Ack { cursor })));
             self.acked = Some(cursor);
         }
         self.unacked = 0;
@@ -774,7 +787,7 @@ impl State {
         if let Some(bye) = bye
             && !matches!(self.conn, Conn::Down { .. })
         {
-            self.control.push_back(frame_text(&Frame::Bye(bye)));
+            self.control.push_back(frame_cbor(&Frame::Bye(bye)));
             self.closing = true;
         }
         self.queue.clear();
@@ -800,22 +813,22 @@ impl State {
         }
     }
 
-    fn fits_droppable(&self, kind: &str, body: &str) -> bool {
-        self.droppable_bytes + msg_text_len(kind, body) <= self.limits.droppable_bytes
+    fn fits_droppable(&self, kind: &str, body: &[u8]) -> bool {
+        self.droppable_bytes + msg_cbor_len(kind, body) <= self.limits.droppable_bytes
     }
 
-    fn enqueue<T: Serialize>(&mut self, kind: &str, body: &T, class: Class) -> MsgId {
-        self.enqueue_text(kind, &body_text(body), class)
+    fn enqueue<T: Serialize + ?Sized>(&mut self, kind: &str, body: &T, class: Class) -> MsgId {
+        self.enqueue_cbor(kind, &to_cbor(body), class)
     }
 
-    fn enqueue_text(&mut self, kind: &str, body: &str, class: Class) -> MsgId {
+    fn enqueue_cbor(&mut self, kind: &str, body: &[u8], class: Class) -> MsgId {
         let id = MsgId(self.ids.next(self.now));
-        let text = msg_text_raw(id, kind, body);
+        let cbor = msg_cbor(id, kind, body);
         match class {
-            Class::Droppable => self.droppable_bytes += text.len(),
-            Class::Retained | Class::Overflow(_) => self.retained_bytes += text.len(),
+            Class::Droppable => self.droppable_bytes += cbor.len(),
+            Class::Retained | Class::Overflow(_) => self.retained_bytes += cbor.len(),
         }
-        self.queue.push_back(Queued { id, text, class });
+        self.queue.push_back(Queued { id, cbor, class });
         self.check_retained();
         id
     }
@@ -836,7 +849,7 @@ impl State {
                 let output = ExecOutput {
                     exec_id: exec_id.clone(),
                     stream,
-                    data: Base64Bytes::default(),
+                    data: Bytes::default(),
                     dropped_bytes,
                 };
                 self.enqueue("exec.output", &output, Class::Retained);
@@ -854,26 +867,34 @@ impl State {
     }
 }
 
-fn body_text<T: Serialize>(body: &T) -> String {
-    serde_json::to_string(body).expect("message bodies serialize")
+fn frame_cbor(frame: &Frame) -> Vec<u8> {
+    to_cbor(frame)
 }
 
-fn frame_text(frame: &Frame) -> String {
-    serde_json::to_string(frame).expect("frames serialize")
+/// The start of a `msg` frame, up to its `body` value: a 4-entry map with `t`, `id`, `kind` and
+/// `body` keys. CBOR items concatenate, so appending the body's own encoding completes it.
+fn msg_prefix(id: MsgId, kind: &str) -> Vec<u8> {
+    let mut out = vec![0xa4];
+    for item in [&Value::from("t"), &Value::from("msg"), &Value::from("id")] {
+        out.extend(to_cbor(item));
+    }
+    out.extend(to_cbor(&id));
+    out.extend(to_cbor("kind"));
+    out.extend(to_cbor(kind));
+    out.extend(to_cbor("body"));
+    out
 }
 
-fn msg_text<T: Serialize>(id: MsgId, kind: &str, body: &T) -> String {
-    msg_text_raw(id, kind, &body_text(body))
+fn msg_cbor(id: MsgId, kind: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = msg_prefix(id, kind);
+    out.extend_from_slice(body);
+    out
 }
 
-fn msg_text_raw(id: MsgId, kind: &str, body: &str) -> String {
-    let kind = serde_json::to_string(kind).expect("strings serialize");
-    format!(r#"{{"t":"msg","id":"{id}","kind":{kind},"body":{body}}}"#)
-}
-
-/// The length `msg_text_raw` will produce, before an ID is spent on a message that may not fit.
-fn msg_text_len(kind: &str, body: &str) -> usize {
-    msg_text_raw(MsgId(Uuid::nil()), kind, body).len()
+/// The length `msg_cbor` will produce, before an ID is spent on a message that may not fit.
+/// Every ID encodes to the same 17 bytes.
+fn msg_cbor_len(kind: &str, body: &[u8]) -> usize {
+    msg_prefix(MsgId(Uuid::nil()), kind).len() + body.len()
 }
 
 /// UUIDv7 generation with the RFC 9562 monotonic random method: within one millisecond, or when
@@ -938,11 +959,12 @@ fn random_bits(uuid: u128) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value as Json, json};
 
     use super::*;
     use crate::error::ErrorKind;
     use crate::protocol::{ChangeKind, ExecState};
+    use crate::testkit::cbor;
 
     const T0: u64 = 1_763_496_000_000;
     const S1: &str = "0193a3b4-0000-7000-8000-000000000001";
@@ -962,7 +984,7 @@ mod tests {
     }
 
     fn info() -> NodeInfo {
-        serde_json::from_value(json!({
+        from_value(cbor(json!({
             "installationId": "tz4a98xxat96iws9zmbrgj3a", "name": "box", "hostname": "box",
             "supervisorVersion": "0.1.0",
             "os": { "family": "linux", "name": null, "version": null, "kernelVersion": null, "arch": "x86_64" },
@@ -971,7 +993,7 @@ mod tests {
             "disks": [], "gpus": [],
             "sandbox": { "mechanism": "none", "available": false, "reason": "test", "landlockAbi": null, "baselineRead": [] },
             "defaultEnv": {}, "collectedAtMs": 0
-        }))
+        })))
         .unwrap()
     }
 
@@ -986,19 +1008,42 @@ mod tests {
         (session, outbox, clock)
     }
 
-    fn hello(session: Option<&str>, cursor: Option<&str>) -> Value {
-        json!({ "t": "hello", "session": session, "cursor": cursor, "nodeId": "n_1",
-                "installationId": "tz4a98xxat96iws9zmbrgj3a", "version": crate::VERSION })
+    /// The `u'…'` test literal of a UUID.
+    fn u(id: &str) -> String {
+        format!("u'{id}'")
     }
 
-    fn welcome(session: &str, resumed: bool, cursor: Option<&str>) -> String {
-        json!({ "t": "welcome", "session": session, "resumed": resumed, "cursor": cursor, "resumeWindowMs": 1000 })
-            .to_string()
+    /// The CBOR frame a JSON test literal stands for.
+    fn frame(literal: Json) -> Vec<u8> {
+        to_cbor(&cbor(literal))
     }
 
-    fn drain(session: &mut Session) -> Vec<Value> {
+    /// The node's `hello`; an absent session or cursor is omitted, as on the wire.
+    fn hello(session: Option<&str>, cursor: Option<&str>) -> Json {
+        let mut hello = json!({ "t": "hello", "nodeId": "n_1",
+                "installationId": "tz4a98xxat96iws9zmbrgj3a", "version": crate::VERSION });
+        if let Some(session) = session {
+            hello["session"] = json!(u(session));
+        }
+        if let Some(cursor) = cursor {
+            hello["cursor"] = json!(u(cursor));
+        }
+        hello
+    }
+
+    fn welcome(session: &str, resumed: bool, cursor: Option<&str>) -> Vec<u8> {
+        frame(
+            json!({ "t": "welcome", "session": u(session), "resumed": resumed, "cursor": cursor.map(u), "resumeWindowMs": 1000 }),
+        )
+    }
+
+    fn literal(payload: &[u8]) -> Json {
+        crate::testkit::json(from_cbor(payload).unwrap())
+    }
+
+    fn drain(session: &mut Session) -> Vec<Json> {
         std::iter::from_fn(|| session.poll_transmit())
-            .map(|text| serde_json::from_str(&text).unwrap())
+            .map(|payload| literal(&payload))
             .collect()
     }
 
@@ -1006,22 +1051,32 @@ mod tests {
         std::iter::from_fn(|| session.poll_incoming()).collect()
     }
 
-    fn id_of(frame: &Value) -> String {
-        frame["id"].as_str().unwrap().to_string()
+    /// The bare UUID text of a `u'…'` literal.
+    fn bare(literal: &Json) -> String {
+        let text = literal.as_str().unwrap();
+        text.strip_prefix("u'")
+            .unwrap()
+            .strip_suffix('\'')
+            .unwrap()
+            .to_string()
     }
 
-    fn ack(cursor: &str) -> String {
-        json!({ "t": "ack", "cursor": cursor }).to_string()
+    fn id_of(frame: &Json) -> String {
+        bare(&frame["id"])
     }
 
-    fn exit_body(id: &str, log_bytes: u64) -> Value {
+    fn ack(cursor: &str) -> Vec<u8> {
+        frame(json!({ "t": "ack", "cursor": u(cursor) }))
+    }
+
+    fn exit_body(id: &str, log_bytes: u64) -> Json {
         json!({ "execId": id, "exit": { "kind": "exited", "code": 0 }, "logBytes": log_bytes })
     }
 
     /// A node in session S1 with `node.ready` sent and confirmed.
     fn open_node(limits: Limits) -> (Session, Outbox, Arc<ManualClock>) {
         let (mut session, outbox, clock) = node_session(limits);
-        session.connected();
+        session.connected(Wire::Plain);
         session.receive(&welcome(S1, false, None));
         session.ready(info(), vec![], vec![]).unwrap();
         let frames = drain(&mut session);
@@ -1033,10 +1088,10 @@ mod tests {
     #[test]
     fn a_new_session_opens_with_hello_and_node_ready_comes_first() {
         let (mut session, outbox, _clock) = node_session(Limits::default());
-        session.connected();
+        session.connected(Wire::Plain);
         assert_eq!(drain(&mut session), [hello(None, None)]);
         outbox.exec_exit(exec("early"), ExitStatus::Exited { code: 0 }, 5);
-        assert_eq!(drain(&mut session), [] as [Value; 0]);
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
 
         session.receive(&welcome(S1, false, None));
         assert_eq!(
@@ -1048,7 +1103,7 @@ mod tests {
             }]
         );
         assert!(session.needs_ready());
-        assert_eq!(drain(&mut session), [] as [Value; 0]);
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
 
         let execs = vec![ExecSummary {
             exec_id: exec("early"),
@@ -1062,7 +1117,7 @@ mod tests {
         let frames = drain(&mut session);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["kind"], "node.ready");
-        assert_eq!(frames[0]["body"]["previousSession"], Value::Null);
+        assert_eq!(frames[0]["body"]["previousSession"], Json::Null);
         assert_eq!(
             frames[0]["body"]["execs"],
             json!([{ "execId": "early", "state": "exited", "exit": { "kind": "exited", "code": 0 }, "logBytes": 5 }])
@@ -1085,18 +1140,15 @@ mod tests {
         for id in ["e1", "e2", "e3"] {
             outbox.exec_exit(exec(id), ExitStatus::Exited { code: 0 }, 1);
         }
-        let texts: Vec<String> = std::iter::from_fn(|| session.poll_transmit()).collect();
-        let ids: Vec<String> = texts
-            .iter()
-            .map(|t| id_of(&serde_json::from_str(t).unwrap()))
-            .collect();
+        let payloads: Vec<Vec<u8>> = std::iter::from_fn(|| session.poll_transmit()).collect();
+        let ids: Vec<String> = payloads.iter().map(|p| id_of(&literal(p))).collect();
         session.receive(&ack(&ids[0]));
 
         session.disconnected();
         outbox.exec_exit(exec("e4"), ExitStatus::Exited { code: 0 }, 1);
         assert_eq!(session.poll_transmit(), None);
 
-        session.connected();
+        session.connected(Wire::Plain);
         assert_eq!(drain(&mut session), [hello(Some(S1), None)]);
         session.receive(&welcome(S1, true, Some(&ids[1])));
         assert_eq!(
@@ -1107,10 +1159,10 @@ mod tests {
                 hello: None,
             }]
         );
-        let resent: Vec<String> = std::iter::from_fn(|| session.poll_transmit()).collect();
+        let resent: Vec<Vec<u8>> = std::iter::from_fn(|| session.poll_transmit()).collect();
         assert_eq!(resent.len(), 2);
-        assert_eq!(resent[0], texts[2]);
-        let e4: Value = serde_json::from_str(&resent[1]).unwrap();
+        assert_eq!(resent[0], payloads[2]);
+        let e4 = literal(&resent[1]);
         assert_eq!(e4["body"], exit_body("e4", 1));
         assert!(id_of(&e4) > ids[2]);
     }
@@ -1118,33 +1170,39 @@ mod tests {
     #[test]
     fn the_cursor_is_acked_after_200_ms_once_and_again_for_a_duplicate() {
         let (mut session, _outbox, clock) = open_node(Limits::default());
-        let msg = json!({ "t": "msg", "id": C1, "kind": "exec.list", "body": {} }).to_string();
+        let msg = frame(json!({ "t": "msg", "id": u(C1), "kind": "exec.list", "body": {} }));
         session.receive(&msg);
         assert_eq!(
             incoming(&mut session),
             [Incoming::Message {
                 id: MsgId(Uuid::parse_str(C1).unwrap()),
                 kind: "exec.list".to_string(),
-                body: json!({}),
+                body: cbor(json!({})),
             }]
         );
         assert_eq!(session.deadline(), Some(T0 + 200));
         clock.advance(199);
         session.tick();
-        assert_eq!(drain(&mut session), [] as [Value; 0]);
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
         clock.advance(1);
         session.tick();
-        assert_eq!(drain(&mut session), [json!({ "t": "ack", "cursor": C1 })]);
+        assert_eq!(
+            drain(&mut session),
+            [json!({ "t": "ack", "cursor": u(C1) })]
+        );
         assert_eq!(session.deadline(), None);
 
         session.receive(&msg);
         assert_eq!(incoming(&mut session), []);
         clock.advance(200);
         session.tick();
-        assert_eq!(drain(&mut session), [json!({ "t": "ack", "cursor": C1 })]);
+        assert_eq!(
+            drain(&mut session),
+            [json!({ "t": "ack", "cursor": u(C1) })]
+        );
         clock.advance(200);
         session.tick();
-        assert_eq!(drain(&mut session), [] as [Value; 0]);
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
     }
 
     #[test]
@@ -1152,15 +1210,17 @@ mod tests {
         let (mut session, _outbox, _clock) = open_node(Limits::default());
         let id = |n: u32| format!("0193a3b4-0000-7000-8000-{n:012x}");
         for n in 1..=63 {
-            session.receive(
-                &json!({ "t": "msg", "id": id(n), "kind": "exec.list", "body": {} }).to_string(),
-            );
+            session.receive(&frame(
+                json!({ "t": "msg", "id": u(&id(n)), "kind": "exec.list", "body": {} }),
+            ));
         }
-        assert_eq!(drain(&mut session), [] as [Value; 0]);
-        session.receive(&json!({ "t": "msg", "id": id(64), "kind": "x", "body": {} }).to_string());
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
+        session.receive(&frame(
+            json!({ "t": "msg", "id": u(&id(64)), "kind": "x", "body": {} }),
+        ));
         assert_eq!(
             drain(&mut session),
-            [json!({ "t": "ack", "cursor": id(64) })]
+            [json!({ "t": "ack", "cursor": u(&id(64)) })]
         );
         assert_eq!(incoming(&mut session).len(), 64);
     }
@@ -1173,7 +1233,7 @@ mod tests {
         session.disconnected();
         outbox.exec_exit(exec("e2"), ExitStatus::Exited { code: 0 }, 1);
 
-        session.connected();
+        session.connected(Wire::Plain);
         drain(&mut session);
         session.receive(&welcome(S2, false, None));
         assert_eq!(
@@ -1194,7 +1254,7 @@ mod tests {
         let frames = drain(&mut session);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["kind"], "node.ready");
-        assert_eq!(frames[0]["body"]["previousSession"], S1);
+        assert_eq!(frames[0]["body"]["previousSession"], u(S1));
     }
 
     #[test]
@@ -1215,7 +1275,7 @@ mod tests {
             }]
         );
         assert_eq!(session.deadline(), None);
-        session.connected();
+        session.connected(Wire::Plain);
         assert_eq!(drain(&mut session), [hello(None, None)]);
     }
 
@@ -1255,13 +1315,13 @@ mod tests {
         let first = drain(&mut session);
         assert_eq!(first[0]["body"]["droppedBytes"], 0);
         outbox.exec_output(exec("e"), Stream::Stdout, vec![b'b'; 100]);
-        assert_eq!(drain(&mut session), [] as [Value; 0]);
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
         session.receive(&ack(&id_of(&first[0])));
         outbox.exec_output(exec("e"), Stream::Stdout, b"tail".to_vec());
         let tail = drain(&mut session);
         assert_eq!(
             tail[0]["body"],
-            json!({ "execId": "e", "stream": "stdout", "data": "dGFpbA==", "droppedBytes": 100 })
+            json!({ "execId": "e", "stream": "stdout", "data": "h'7461696c'", "droppedBytes": 100 })
         );
 
         outbox.exec_output(exec("e"), Stream::Stderr, vec![b'c'; 200]);
@@ -1270,7 +1330,7 @@ mod tests {
         assert_eq!(
             frames.iter().map(|f| f["body"].clone()).collect::<Vec<_>>(),
             [
-                json!({ "execId": "e", "stream": "stderr", "data": "", "droppedBytes": 200 }),
+                json!({ "execId": "e", "stream": "stderr", "data": "h''", "droppedBytes": 200 }),
                 json!({ "execId": "e", "exit": { "kind": "signaled", "signal": 9 }, "logBytes": 304 }),
             ]
         );
@@ -1288,13 +1348,13 @@ mod tests {
             path: path.to_string(),
         };
         session.disconnected();
-        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 100]);
+        outbox.exec_output(exec("e"), Stream::Stdout, vec![b'a'; 200]);
         outbox.watch_changes(watch("w"), vec![change("/a")]);
         outbox.watch_changes(watch("w"), vec![change("/b")]);
         outbox.watch_overflow(watch("w"));
         outbox.watch_changes(watch("v"), vec![]);
 
-        session.connected();
+        session.connected(Wire::Plain);
         drain(&mut session);
         session.receive(&welcome(S1, true, None));
         let frames = drain(&mut session);
@@ -1319,9 +1379,9 @@ mod tests {
     fn replies_and_commands_are_messages() {
         let (mut session, outbox, _clock) = open_node(Limits::default());
         let to = MsgId(Uuid::parse_str(C1).unwrap());
-        outbox.reply(to, Ok(json!({ "execs": [] })));
+        outbox.reply(to, Ok(cbor(json!({ "execs": [] }))));
         outbox.reply(to, Err(Error::not_found("no exec `x`")));
-        let id = outbox.command("node.ping", json!({ "n": 1 }));
+        let id = outbox.command("node.ping", &cbor(json!({ "n": 1 })));
         let frames = drain(&mut session);
         assert_eq!(
             frames
@@ -1329,10 +1389,13 @@ mod tests {
                 .map(|f| (f["kind"].clone(), f["body"].clone()))
                 .collect::<Vec<_>>(),
             [
-                (json!("reply"), json!({ "to": C1, "ok": { "execs": [] } })),
                 (
                     json!("reply"),
-                    json!({ "to": C1, "error": { "kind": "not_found", "message": "no exec `x`" } })
+                    json!({ "to": u(C1), "ok": { "execs": [] } })
+                ),
+                (
+                    json!("reply"),
+                    json!({ "to": u(C1), "error": { "kind": "not_found", "message": "no exec `x`" } })
                 ),
                 (json!("node.ping"), json!({ "n": 1 })),
             ]
@@ -1340,8 +1403,7 @@ mod tests {
         assert_eq!(id_of(&frames[2]), id.to_string());
 
         session.receive(
-            &json!({ "t": "msg", "id": C1, "kind": "reply", "body": { "to": id, "error": { "kind": "unknown_kind", "message": "?" } } })
-                .to_string(),
+            &frame(json!({ "t": "msg", "id": u(C1), "kind": "reply", "body": { "to": u(&id.to_string()), "error": { "kind": "unknown_kind", "message": "?" } } })),
         );
         assert_eq!(
             incoming(&mut session),
@@ -1355,7 +1417,9 @@ mod tests {
     #[test]
     fn bye_and_protocol_errors_end_the_session() {
         let (mut session, _outbox, _clock) = open_node(Limits::default());
-        session.receive(r#"{"t":"bye","reason":"revoked","message":"node removed by admin"}"#);
+        session.receive(&frame(
+            json!({ "t": "bye", "reason": "revoked", "message": "node removed by admin" }),
+        ));
         assert_eq!(
             incoming(&mut session),
             [Incoming::Lost {
@@ -1367,10 +1431,10 @@ mod tests {
             }]
         );
         assert!(session.is_closing());
-        assert_eq!(drain(&mut session), [] as [Value; 0]);
+        assert_eq!(drain(&mut session), [] as [Json; 0]);
 
         let (mut session, _outbox, _clock) = open_node(Limits::default());
-        session.receive(r#"{"t":"welcome","session":"0193a3b4-0000-7000-8000-000000000001","resumed":true,"cursor":null,"resumeWindowMs":1}"#);
+        session.receive(&welcome(S1, true, None));
         assert_eq!(
             drain(&mut session),
             [
@@ -1386,9 +1450,9 @@ mod tests {
         );
 
         let (mut session, _outbox, _clock) = node_session(Limits::default());
-        session.connected();
+        session.connected(Wire::Plain);
         drain(&mut session);
-        session.receive("not json");
+        session.receive(b"not cbor");
         let bye = drain(&mut session);
         assert_eq!(bye[0]["reason"], "protocol_error");
         assert!(
@@ -1406,16 +1470,14 @@ mod tests {
             resume_window_ms: 1000,
         };
         let (mut cp, outbox) = Session::with_options(role, clock.clone(), Limits::default(), 9);
-        cp.connected();
-        assert_eq!(drain(&mut cp), [] as [Value; 0]);
-        cp.receive(&hello(None, None).to_string());
+        cp.connected(Wire::Plain);
+        assert_eq!(drain(&mut cp), [] as [Json; 0]);
+        cp.receive(&frame(hello(None, None)));
         let frames = drain(&mut cp);
-        let s = frames[0]["session"].as_str().unwrap().to_string();
+        let s = bare(&frames[0]["session"]);
         assert_eq!(
             frames,
-            [
-                json!({ "t": "welcome", "session": s, "resumed": false, "cursor": null, "resumeWindowMs": 1000 })
-            ]
+            [json!({ "t": "welcome", "session": u(&s), "resumed": false, "resumeWindowMs": 1000 })]
         );
         let Some(Incoming::Opened {
             resumed: false,
@@ -1427,24 +1489,24 @@ mod tests {
         };
         assert_eq!(hello_frame.node_id, "n_1");
 
-        outbox.command("exec.list", json!({}));
+        outbox.command("exec.list", &cbor(json!({})));
         let command = cp.poll_transmit().unwrap();
         cp.disconnected();
         clock.advance(999);
-        cp.connected();
-        cp.receive(&hello(Some(&s), None).to_string());
-        let resent: Vec<String> = std::iter::from_fn(|| cp.poll_transmit()).collect();
+        cp.connected(Wire::Plain);
+        cp.receive(&frame(hello(Some(&s), None)));
+        let resent: Vec<Vec<u8>> = std::iter::from_fn(|| cp.poll_transmit()).collect();
         assert_eq!(
-            serde_json::from_str::<Value>(&resent[0]).unwrap(),
-            json!({ "t": "welcome", "session": s, "resumed": true, "cursor": null, "resumeWindowMs": 1000 })
+            literal(&resent[0]),
+            json!({ "t": "welcome", "session": u(&s), "resumed": true, "resumeWindowMs": 1000 })
         );
         assert_eq!(resent[1..], [command]);
         incoming(&mut cp);
 
         cp.disconnected();
         clock.advance(1000);
-        cp.connected();
-        cp.receive(&hello(Some(&s), None).to_string());
+        cp.connected(Wire::Plain);
+        cp.receive(&frame(hello(Some(&s), None)));
         let events = incoming(&mut cp);
         assert_eq!(
             events[0],
@@ -1504,12 +1566,12 @@ mod tests {
                 break;
             }
         };
-        node.connected();
-        cp.connected();
+        node.connected(Wire::Plain);
+        cp.connected(Wire::Plain);
         pump(&mut node, &mut cp);
         assert!(node.needs_ready());
         node.ready(info(), vec![], vec![]).unwrap();
-        let command = cp_out.command("exec.list", json!({}));
+        let command = cp_out.command("exec.list", &cbor(json!({})));
         pump(&mut node, &mut cp);
 
         let at_node = incoming(&mut node);
@@ -1517,7 +1579,7 @@ mod tests {
             panic!("no command at the node: {at_node:?}");
         };
         assert_eq!((*id, kind.as_str()), (command, "exec.list"));
-        node_out.reply(*id, Ok(json!({ "execs": [] })));
+        node_out.reply(*id, Ok(cbor(json!({ "execs": [] }))));
         pump(&mut node, &mut cp);
 
         let at_cp = incoming(&mut cp);
@@ -1526,7 +1588,7 @@ mod tests {
             at_cp[2],
             Incoming::Reply {
                 to: command,
-                result: Ok(json!({ "execs": [] })),
+                result: Ok(cbor(json!({ "execs": [] }))),
             }
         );
         assert_eq!(node.session(), cp.session());
@@ -1537,8 +1599,8 @@ mod tests {
         pump(&mut node, &mut cp);
         node.disconnected();
         cp.disconnected();
-        node.connected();
-        cp.connected();
+        node.connected(Wire::Plain);
+        cp.connected(Wire::Plain);
         pump(&mut node, &mut cp);
         assert_eq!(node.poll_transmit(), None);
         assert!(matches!(

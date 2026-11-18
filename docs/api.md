@@ -76,7 +76,7 @@ Requests are handled concurrently, and responses may arrive in any order.
 ```json
 { "jsonrpc": "2.0", "id": 7, "method": "fs.read", "params": { … } }
 { "jsonrpc": "2.0", "id": 7, "result": { … } }
-{ "jsonrpc": "2.0", "id": 7, "error": { "code": -32001, "message": "…", "data": { "kind": "permission_denied" } } }
+{ "jsonrpc": "2.0", "id": 7, "error": { "code": -32003, "message": "…", "data": { "kind": "permission_denied" } } }
 { "jsonrpc": "2.0", "method": "exec.output", "params": { … } }
 ```
 
@@ -224,7 +224,7 @@ full (see Event delivery).
 ### `exec.exit` (notification)
 
 ```json
-{ "execId": "build-1", "exit": { "kind": "exited", "code": 0 } }
+{ "execId": "build-1", "exit": { "kind": "exited", "code": 0 }, "logBytes": 183022 }
 ```
 
 `exit` is one of:
@@ -235,8 +235,8 @@ full (see Event delivery).
 
 A backgrounded process that later exits reports `exited` or `signaled` as usual.
 
-`exec.exit` is sent after the last `exec.output` of the process, and is never dropped. Its
-`logBytes` field is the total output the process produced (`{ "execId", "exit", "logBytes" }`).
+`exec.exit` is sent after the last `exec.output` of the process, and is never dropped.
+`logBytes` is the total output the process produced.
 
 ### `exec.timedOut` (notification)
 
@@ -251,7 +251,8 @@ process. `logBytes` is the output produced so far.
 ### `exec.log`
 
 Params `{ "execId": "build-1", "offset": 0, "length": 65536 }`. Reads the process's log, running
-or exited. `offset` defaults to 0, and `length` to 1 MiB, the most per call.
+or exited. `offset` defaults to 0, and `length` to 1 MiB, the most per call (more is
+`too_large`).
 
 Result:
 
@@ -405,7 +406,7 @@ or the control plane reads slowly, the queue fills.
   carries the count in `droppedBytes`.
 * When full, new `watch.event` changes are dropped, and the watch's next event is
   `overflow: true`.
-* `exec.exit` is never dropped. There are at most as many as there are processes.
+* `exec.timedOut` and `exec.exit` are never dropped. There is at most one of each per process.
 
 On reconnect, `node.hello` is sent first, then the queue drains in order.
 

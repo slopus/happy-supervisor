@@ -460,6 +460,18 @@ fn policy_combinations_and_their_outcomes() {
             ok("keep\n"),
         ),
         (
+            "missing: a denied directory below a write grant cannot be made",
+            grants(&[], &[&t("out")]).write_deny(&t("out/later/deep")),
+            cmd(format!("mkdir {}", p("out/later/deep"))),
+            Denied,
+        ),
+        (
+            "missing: a denied file below a write grant cannot be written",
+            grants(&[], &[&t("out")]).write_deny(&t("out/never.txt")),
+            cmd(format!("echo x>{}", p("out/never.txt"))),
+            Denied,
+        ),
+        (
             "write: no rename out of a read grant",
             grants(&[&t("data")], &[&t("out")]),
             cmd(format!("move {} {}", p("data/file.txt"), p("out"))),
@@ -604,6 +616,11 @@ fn policy_combinations_and_their_outcomes() {
         std::fs::read_to_string(t("data/file.txt")).unwrap(),
         "data\n"
     );
+    assert!(
+        !t("out/later").exists(),
+        "the placeholder directory is gone"
+    );
+    assert!(!t("out/never.txt").exists(), "the placeholder file is gone");
     assert_eq!(
         std::fs::read_to_string(t("state/credentials.json")).unwrap(),
         "{}\n"

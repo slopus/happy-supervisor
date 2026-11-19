@@ -468,7 +468,7 @@ mod tests {
 
     use super::*;
     use crate::link::{ManualClock, NodeIdentity, Role, Session};
-    use crate::policy::Policy;
+    use crate::policy::allow_list;
     use crate::protocol::{Frame, SessionId, WatchEvent, Welcome};
     use crate::wire;
 
@@ -715,8 +715,8 @@ mod tests {
         let mut f = fixture(|root| {
             let state = root.join(".state");
             std::fs::create_dir(&state).unwrap();
-            let policy = Policy::new(vec![root.display().to_string()], vec![], false, false);
-            Some(ResolvedPolicy::resolve(&policy.unwrap(), &state))
+            let policy = allow_list([root], [] as [&str; 0], false, false);
+            Some(ResolvedPolicy::resolve(&policy, &state).unwrap())
         });
         let t0 = Instant::now();
         f.state.observe(created(&f.root.join(".state")), t0);

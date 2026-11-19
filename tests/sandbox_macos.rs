@@ -11,7 +11,7 @@ use std::process::Stdio;
 
 use happy_supervisor::ErrorKind;
 use happy_supervisor::helper::{self, Job, JobOp};
-use happy_supervisor::policy::{Policy, ResolvedPolicy};
+use happy_supervisor::policy::{ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{AbsPath, Argv, Mechanism, SandboxStatus};
 use happy_supervisor::sandbox;
 
@@ -81,19 +81,18 @@ impl Grants {
 /// machine's baseline added to the row's read grants.
 fn run(grants: &Grants, state: &Path, argv: &[&str]) -> Outcome {
     helper::set_exe(PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor")));
-    let read = sandbox::baseline_read()
+    let read: Vec<String> = sandbox::baseline_read()
         .into_iter()
         .chain(grants.read.iter().cloned())
         .collect();
-    let policy = Policy::new(
+    let policy = allow_list(
         read,
         grants.write.clone(),
         grants.local_bind,
         grants.unix_sockets,
-    )
-    .unwrap();
+    );
     let job = Job {
-        policy: ResolvedPolicy::resolve(&policy, state),
+        policy: ResolvedPolicy::resolve(&policy, state).unwrap(),
         op: JobOp::Exec {
             argv: Argv::try_from(argv.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
             cwd: AbsPath::try_from("/").unwrap(),
@@ -102,7 +101,13 @@ fn run(grants: &Grants, state: &Path, argv: &[&str]) -> Outcome {
     };
     let (mut status_reader, status_writer) = std::io::pipe().unwrap();
     let status_fd = status_writer.as_raw_fd();
-    let mut command = sandbox::prepare(&job).unwrap();
+    let exe = helper::exe().unwrap();
+    let plan = sandbox::Plan {
+        policy: &job.policy,
+        net: None,
+        exe: &exe,
+    };
+    let mut command = sandbox::prepare(&plan, &job).unwrap().command;
     // SAFETY: install_status_fd is async-signal-safe and runs in the forked child.
     unsafe {
         command.pre_exec(move || helper::install_status_fd(status_fd));

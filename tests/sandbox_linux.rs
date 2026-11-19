@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use happy_supervisor::helper::{self, Job, JobOp};
-use happy_supervisor::policy::{Policy, ResolvedPolicy};
+use happy_supervisor::policy::{ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{AbsPath, Argv, Mechanism, SandboxStatus};
 use happy_supervisor::{Error, ErrorKind, sandbox};
 
@@ -98,8 +98,8 @@ fn policy(
 ) -> ResolvedPolicy {
     let mut reads = sandbox::baseline_read();
     reads.extend(strings(read));
-    let policy = Policy::new(reads, strings(write), local_bind, unix_sockets).unwrap();
-    ResolvedPolicy::resolve(&policy, hidden)
+    let policy = allow_list(reads, strings(write), local_bind, unix_sockets);
+    ResolvedPolicy::resolve(&policy, hidden).unwrap()
 }
 
 fn run(policy: &ResolvedPolicy, argv: &[&str], env: &[(&str, &str)]) -> Run {
@@ -115,7 +115,13 @@ fn run(policy: &ResolvedPolicy, argv: &[&str], env: &[(&str, &str)]) -> Run {
                 .collect::<BTreeMap<_, _>>(),
         },
     };
-    let mut command = sandbox::prepare(&job).unwrap();
+    let exe = Path::new(EXE);
+    let plan = sandbox::Plan {
+        policy: &job.policy,
+        net: None,
+        exe,
+    };
+    let mut command = sandbox::prepare(&plan, &job).unwrap().command;
     let (mut status_reader, status_writer) = std::io::pipe().unwrap();
     let status_fd = status_writer.as_raw_fd();
     command
@@ -271,7 +277,12 @@ fn prepare_runs_this_binary_as_the_helper() {
             env: BTreeMap::new(),
         },
     };
-    let command = sandbox::prepare(&job).unwrap();
+    let plan = sandbox::Plan {
+        policy: &job.policy,
+        net: None,
+        exe: Path::new(EXE),
+    };
+    let command = sandbox::prepare(&plan, &job).unwrap().command;
     assert_eq!(command.get_program(), EXE);
     assert_eq!(command.get_args().collect::<Vec<_>>(), ["__sandbox"]);
 }
@@ -281,9 +292,10 @@ fn a_command_outside_every_grant_does_not_start() {
     helper::set_exe(EXE.into());
     let tree = Tree::new();
     let nothing = ResolvedPolicy::resolve(
-        &Policy::new(vec![], vec![], true, true).unwrap(),
+        &allow_list([] as [&str; 0], [] as [&str; 0], true, true),
         &tree.path("state"),
-    );
+    )
+    .unwrap();
     let run = run(&nothing, &["/bin/true"], &[]);
     assert_eq!(
         run.started,
@@ -455,14 +467,6 @@ fn missing_paths_are_ignored_and_never_created() {
         false,
         &tree.path("state"),
     );
-    assert_eq!(
-        p.ignored(),
-        [
-            missing_read.to_str().unwrap().to_string(),
-            missing_write.to_str().unwrap().to_string()
-        ]
-    );
-
     let before = tree.snapshot();
     assert_eq!(
         sh(&p, &format!("cat {}/present", parent.display())).stdout,

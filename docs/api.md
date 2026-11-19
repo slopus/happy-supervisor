@@ -285,6 +285,13 @@ a4 0c 67 "build-1" 0d 66 "stdout" 09 50 <16 bytes> 0e 00
 | 143 | `tcp.open` | kind |
 | 144 | `tcp.end` | kind |
 | 145 | `tcp.reset` | kind |
+| 146 | `filesystem` | key |
+| 147 | `allow` | key |
+| 148 | `deny` | key |
+| 149 | `default` | key |
+| 150 | `network` | key |
+| 151 | `egress` | key |
+| 152 | `ports` | key |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -538,7 +545,12 @@ Every exec, file and watch command carries `access`. It is one of two shapes:
 
 ```json
 { "mode": "raw" }
-{ "mode": "sandboxed", "policy": { "read": ["/usr", "/home/me/repo"], "write": ["/home/me/repo"], "localBind": false, "unixSockets": false } }
+{ "mode": "sandboxed", "policy": {
+    "filesystem": {
+      "read":  { "default": "deny", "allow": ["/usr", "/home/me/repo"], "deny": [] },
+      "write": { "default": "deny", "allow": ["/home/me/repo"], "deny": ["/home/me/repo/.git/hooks"] }
+    },
+    "network": { "mode": "host", "localBind": false, "unixSockets": false } } }
 ```
 
 `raw` runs with the supervisor's full rights. `sandboxed` runs confined by the policy, enforced
@@ -607,11 +619,8 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
 Result:
 
 ```json
-{ "execId": "build-1", "pid": 4242, "ignoredPaths": ["/home/me/.cache/nonexistent"] }
+{ "execId": "build-1", "pid": 4242 }
 ```
-
-`ignoredPaths` lists the policy paths that did not exist and therefore grant nothing (policy.md).
-It is empty for raw access.
 
 A process that cannot start (binary missing, `cwd` refused, log file refused, memory budget
 full) still gets its ID. The start replies with the error, and no `exec.exit` follows. It is

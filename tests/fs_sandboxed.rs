@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use happy_supervisor::fs::{self, FsRequest, FsResponse};
-use happy_supervisor::policy::{Confinement, Policy, ResolvedPolicy};
+use happy_supervisor::policy::{Confinement, ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{
     AbsPath, Bytes, DirEntry, FileKind, FsListResult, FsMkdirParams, FsPathParams, FsReadParams,
     FsReadResult, FsRemoveParams, FsWriteParams, WriteMode,
@@ -41,15 +41,14 @@ impl Tree {
     fn confinement(&self, write: &[&str]) -> Confinement {
         let mut read = sandbox::baseline_read();
         read.push(self.path("granted").to_str().unwrap().to_string());
-        let write = write
+        let write: Vec<String> = write
             .iter()
             .map(|rel| self.path(rel).to_str().unwrap().to_string())
             .collect();
-        let policy = Policy::new(read, write, false, false).unwrap();
-        Confinement::Sandboxed(ResolvedPolicy::resolve(
-            &policy,
-            &self.path("granted/.state"),
-        ))
+        let policy = allow_list(read, write, false, false);
+        Confinement::Sandboxed(
+            ResolvedPolicy::resolve(&policy, &self.path("granted/.state")).unwrap(),
+        )
     }
 }
 

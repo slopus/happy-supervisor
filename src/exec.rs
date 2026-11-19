@@ -84,7 +84,15 @@ struct Running {
     reaping: bool,
     /// The command's credential proxy. Dropped with this phase, so the proxy stops at the exit.
     _proxy: Option<ProxyLease>,
+    /// The sandbox's placeholders and network namespace, kept until the exit like the proxy.
+    _sandbox: Option<Held>,
 }
+
+/// What [`crate::sandbox::prepare`] returned besides the command.
+type Held = (
+    crate::sandbox::Placeholders,
+    Option<crate::sandbox::NetnsControl>,
+);
 
 impl Phase {
     fn ended(&self) -> Option<u64> {
@@ -161,11 +169,7 @@ impl ExecManager {
             if result.is_err() {
                 inner.fail(&exec_id);
             }
-            result.map(|pid| ExecStartResult {
-                exec_id,
-                pid,
-                ignored_paths: confinement.ignored_paths().to_vec(),
-            })
+            result.map(|pid| ExecStartResult { exec_id, pid })
         });
         started
             .await
@@ -410,10 +414,14 @@ impl Inner {
         }
         let program = resolve_program(argv.program(), &env)?;
         let log = open_log(&log, confinement)?;
+        let mut held = None;
         let Spawned { mut child, tree } = match confinement {
             Confinement::Raw => spawn_raw(&program, &argv, &cwd, &env, stdin)?,
             Confinement::Sandboxed(policy) => {
-                spawn_sandboxed(policy, &program, &argv, &cwd, env, stdin)?
+                let (spawned, sandbox) =
+                    spawn_sandboxed(policy, &program, &argv, &cwd, env, stdin)?;
+                held = Some(sandbox);
+                spawned
             }
         };
 
@@ -489,6 +497,7 @@ impl Inner {
             timed_out: false,
             reaping: false,
             _proxy: proxy,
+            _sandbox: held,
         });
         Ok(pid)
     }
@@ -815,7 +824,7 @@ fn spawn_sandboxed(
     cwd: &AbsPath,
     env: BTreeMap<String, String>,
     stdin: bool,
-) -> Result<Spawned> {
+) -> Result<(Spawned, Held)> {
     use crate::helper::{Job, JobOp};
 
     let mut resolved = vec![program.to_string_lossy().into_owned()];
@@ -828,8 +837,15 @@ fn spawn_sandboxed(
             env,
         },
     };
-    let command = crate::sandbox::prepare(&job)?;
-    spawn_helper(command, &crate::helper::encode_job(&job), stdin)
+    let exe = crate::helper::exe()?;
+    let plan = crate::sandbox::Plan {
+        policy,
+        net: None,
+        exe: &exe,
+    };
+    let prepared = crate::sandbox::prepare(&plan, &job)?;
+    let spawned = spawn_helper(prepared.command, &crate::helper::encode_job(&job), stdin)?;
+    Ok((spawned, (prepared.placeholders, prepared.netns)))
 }
 
 #[cfg(unix)]
@@ -877,7 +893,7 @@ fn spawn_sandboxed(
     _cwd: &AbsPath,
     _env: BTreeMap<String, String>,
     _stdin: bool,
-) -> Result<Spawned> {
+) -> Result<(Spawned, Held)> {
     Err(Error::sandbox_unavailable("Windows has no sandbox backend"))
 }
 

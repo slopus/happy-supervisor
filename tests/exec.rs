@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use happy_supervisor::exec::ExecManager;
 use happy_supervisor::link::{Incoming, ManualClock, NodeIdentity, Role, Session};
-use happy_supervisor::policy::{Confinement, Policy, ResolvedPolicy};
+use happy_supervisor::policy::{Confinement, ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{
     ByteRange, Event, ExecExit, ExecId, ExecLogParams, ExecStartParams, ExecState, ExecSummary,
     ExecWriteParams, ExitStatus, KillSignal, NodeInfo, Stream,
@@ -569,16 +569,16 @@ async fn a_sandboxed_command_runs_through_the_helper() {
     let work_path = work.path().to_str().unwrap().to_string();
     let mut read = sandbox.baseline_read.clone();
     read.push("/nonexistent-grant".to_string());
-    let policy = Policy::new(read, vec![work_path.clone()], false, false).unwrap();
-    let confinement = || Confinement::Sandboxed(ResolvedPolicy::resolve(&policy, state.path()));
+    let policy = allow_list(read, [work_path.clone()], false, false);
+    let confinement =
+        || Confinement::Sandboxed(ResolvedPolicy::resolve(&policy, state.path()).unwrap());
 
     let mut params = sh("sb", "echo inside; cat");
     params["cwd"] = json!(work_path);
     params["stdin"] = json!(true);
     params["log"] = json!({ "kind": "file", "path": format!("{work_path}/sb.log") });
     let params: ExecStartParams = serde_json::from_value(params).unwrap();
-    let started = node.exec.start(params, confinement(), None).await.unwrap();
-    assert_eq!(started.ignored_paths, ["/nonexistent-grant"]);
+    node.exec.start(params, confinement(), None).await.unwrap();
     node.write("sb", b"from stdin", true).await.unwrap();
     assert_eq!(node.exit("sb").await.exit, ExitStatus::Exited { code: 0 });
     assert_eq!(node.streamed("sb", Stream::Stdout), "inside\nfrom stdin");

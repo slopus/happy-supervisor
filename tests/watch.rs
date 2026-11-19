@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use happy_supervisor::link::{ManualClock, NodeIdentity, Role, Session};
-use happy_supervisor::policy::{Confinement, Policy, ResolvedPolicy};
+use happy_supervisor::policy::{Confinement, ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{
     AbsPath, Frame, SessionId, WatchEvent, WatchId, WatchStartParams, Welcome,
 };
@@ -269,8 +269,8 @@ async fn a_sandboxed_watch_hides_the_state_directory() {
     let state = root.join(".state");
     std::fs::create_dir(&state).unwrap();
     let canonical = std::fs::canonicalize(&root).unwrap();
-    let policy = Policy::new(vec![canonical.display().to_string()], vec![], false, false);
-    let resolved = ResolvedPolicy::resolve(&policy.unwrap(), &state);
+    let policy = allow_list([canonical], [] as [&str; 0], false, false);
+    let resolved = ResolvedPolicy::resolve(&policy, &state).unwrap();
     let (mut peer, manager) = Peer::new();
     manager
         .start(params("w-1", &root, true), Confinement::Sandboxed(resolved))
@@ -297,13 +297,8 @@ async fn a_sandboxed_watch_needs_a_readable_root() {
     std::fs::create_dir(root.join("granted")).unwrap();
     std::fs::create_dir(root.join("secret")).unwrap();
     let canonical = std::fs::canonicalize(&root).unwrap();
-    let policy = Policy::new(
-        vec![canonical.join("granted").display().to_string()],
-        vec![],
-        false,
-        false,
-    );
-    let resolved = ResolvedPolicy::resolve(&policy.unwrap(), &root.join("state"));
+    let policy = allow_list([canonical.join("granted")], [] as [&str; 0], false, false);
+    let resolved = ResolvedPolicy::resolve(&policy, &root.join("state")).unwrap();
     let (_peer, manager) = Peer::new();
     let secret = root.join("secret");
     assert_eq!(

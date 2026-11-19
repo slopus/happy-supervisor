@@ -96,7 +96,14 @@ async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsRespo
         policy,
         op: JobOp::Fs(request),
     };
-    let mut command = tokio::process::Command::from(crate::sandbox::prepare(&job)?);
+    let exe = crate::helper::exe()?;
+    let plan = crate::sandbox::Plan {
+        policy: &job.policy,
+        net: None,
+        exe: &exe,
+    };
+    let prepared = crate::sandbox::prepare(&plan, &job)?;
+    let mut command = tokio::process::Command::from(prepared.command);
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

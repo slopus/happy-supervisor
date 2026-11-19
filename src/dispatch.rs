@@ -116,7 +116,7 @@ impl Node {
                         .await
                         .map_err(|err| {
                             Error::new(ErrorKind::Io, format!("policy resolution failed: {err}"))
-                        })?;
+                        })??;
                 Ok(Confinement::Sandboxed(resolved))
             }
         }
@@ -201,7 +201,7 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
                         .start_for_exec(params.exec_id.clone(), spec)
                         .await?;
                     if let Confinement::Sandboxed(policy) = &mut confinement {
-                        policy.grant_read_file(lease.ca_bundle());
+                        policy.allow_read_file(lease.ca_bundle());
                     }
                     Some(lease)
                 }
@@ -392,7 +392,13 @@ mod tests {
     async fn sandboxed_access_is_refused_when_the_node_cannot_enforce_it() {
         let access = json!({
             "mode": "sandboxed",
-            "policy": { "read": ["/"], "write": [], "localBind": false, "unixSockets": false }
+            "policy": {
+                "filesystem": {
+                    "read": { "default": "allow", "allow": [], "deny": [] },
+                    "write": { "default": "deny", "allow": [], "deny": [] }
+                },
+                "network": { "mode": "host", "localBind": false, "unixSockets": false }
+            }
         });
         let err = call("fs.stat", json!({ "path": "/", "access": access }))
             .await

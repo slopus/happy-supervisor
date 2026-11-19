@@ -781,7 +781,6 @@ impl TryFrom<LogSpecWire> for LogSpec {
 pub struct ExecStartResult {
     pub exec_id: ExecId,
     pub pid: u32,
-    pub ignored_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1755,7 +1754,13 @@ mod tests {
     }
 
     fn policy_json() -> Json {
-        json!({ "read": ["/usr", "/home/me/repo"], "write": ["/home/me/repo"], "localBind": false, "unixSockets": false })
+        json!({
+          "filesystem": {
+            "read":  { "default": "deny", "allow": ["/usr", "/home/me/repo"], "deny": [] },
+            "write": { "default": "deny", "allow": ["/home/me/repo"], "deny": ["/home/me/repo/.git/hooks"] }
+          },
+          "network": { "mode": "host", "localBind": false, "unixSockets": false }
+        })
     }
 
     fn node_info_json() -> Json {
@@ -2030,7 +2035,10 @@ mod tests {
         else {
             panic!("not sandboxed");
         };
-        assert_eq!(policy.write(), ["/home/me/repo"]);
+        assert_eq!(
+            policy.write.allow,
+            [std::path::PathBuf::from("/home/me/repo")]
+        );
         assert!(
             rejects::<Access>(json!({ "mode": "sandboxed" })).contains("missing field `policy`")
         );
@@ -2107,9 +2115,7 @@ mod tests {
         );
         assert_eq!(ExecId::try_from("A-z_0.9").unwrap().as_str(), "A-z_0.9");
 
-        let result: ExecStartResult = round_trip(
-            json!({ "execId": "build-1", "pid": 4242, "ignoredPaths": ["/home/me/.cache/nonexistent"] }),
-        );
+        let result: ExecStartResult = round_trip(json!({ "execId": "build-1", "pid": 4242 }));
         assert_eq!(result.pid, 4242);
     }
 

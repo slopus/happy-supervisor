@@ -288,13 +288,13 @@ fn run_fs(policy: &ResolvedPolicy, request: &FsRequest) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::Policy;
     use crate::protocol::{Bytes, FileKind, FsPathParams, FsReadResult, FsStat};
 
     fn job() -> Job {
-        let policy = Policy::new(vec![], vec![], false, true).unwrap();
+        let policy = crate::policy::allow_list([] as [&str; 0], [] as [&str; 0], false, true);
         Job {
-            policy: ResolvedPolicy::resolve(&policy, std::path::Path::new("/nonexistent-state")),
+            policy: ResolvedPolicy::resolve(&policy, std::path::Path::new("/nonexistent-state"))
+                .unwrap(),
             op: JobOp::Exec {
                 argv: Argv::try_from(vec!["/bin/echo".to_string(), "hi".to_string()]).unwrap(),
                 cwd: AbsPath::try_from(if cfg!(windows) { r"C:\" } else { "/" }).unwrap(),

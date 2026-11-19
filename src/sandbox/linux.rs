@@ -20,9 +20,10 @@ use landlock::{
 };
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 
+use super::{Plan, Prepared};
 use crate::error::{Error, Result};
 use crate::helper::{self, Job, JobOp};
-use crate::policy::{Grant, GrantKind, Policy, ResolvedPolicy, Rights};
+use crate::policy::{Grant, GrantKind, ResolvedPolicy, Rights, allow_list};
 use crate::protocol::{AbsPath, Argv, Mechanism, SandboxInfo, SandboxStatus};
 
 pub fn probe() -> SandboxInfo {
@@ -66,21 +67,20 @@ pub fn gaps(abi: u32) -> Vec<String> {
     gaps.into_iter().map(str::to_string).collect()
 }
 
-pub fn prepare(job: &Job) -> Result<Command> {
+pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
     // Refuse what this kernel cannot enforce before anything is spawned.
-    Enforcement::plan(
-        kernel_abi()?,
-        job.policy.local_bind(),
-        job.policy.unix_sockets(),
-    )?;
-    let mut command = Command::new(helper::exe()?);
+    let network = job.policy.network();
+    Enforcement::plan(kernel_abi()?, network.local_bind(), network.unix_sockets())?;
+    plan.policy.grants()?;
+    let mut command = Command::new(plan.exe);
     command.arg("__sandbox");
-    Ok(command)
+    Ok(Prepared::command(command))
 }
 
 pub fn enter(policy: &ResolvedPolicy) -> Result<()> {
-    let plan = Enforcement::plan(kernel_abi()?, policy.local_bind(), policy.unix_sockets())?;
-    restrict(&plan, &landlock_grants(policy))?;
+    let network = policy.network();
+    let plan = Enforcement::plan(kernel_abi()?, network.local_bind(), network.unix_sockets())?;
+    restrict(&plan, &landlock_grants(policy)?)?;
     if plan.seccomp_denies_bind {
         deny_bind_and_listen()?;
     }
@@ -167,10 +167,10 @@ fn kernel_abi() -> Result<u32> {
 /// The grants as Landlock rules. Landlock only adds rights, so a directory grant that contains the
 /// hidden state directory becomes grants on every existing entry beside the path down to it.
 /// Symlinks among those entries are skipped: a grant applies to real locations only.
-fn landlock_grants(policy: &ResolvedPolicy) -> Vec<Grant> {
-    let hidden = policy.hidden();
+fn landlock_grants(policy: &ResolvedPolicy) -> Result<Vec<Grant>> {
+    let hidden = policy.state_dir();
     let mut grants = Vec::new();
-    for grant in policy.grants() {
+    for grant in policy.grants()? {
         let Ok(below) = hidden.strip_prefix(&grant.path) else {
             grants.push(grant.clone());
             continue;
@@ -201,7 +201,7 @@ fn landlock_grants(policy: &ResolvedPolicy) -> Vec<Grant> {
             dir = toward_hidden;
         }
     }
-    grants
+    Ok(grants)
 }
 
 fn restrict(plan: &Enforcement, grants: &[Grant]) -> Result<()> {
@@ -296,16 +296,22 @@ fn run_true() -> Result<()> {
         .ok_or_else(|| {
             Error::sandbox_unavailable("there is no `true` program to test the sandbox with")
         })?;
-    let policy = Policy::new(super::baseline_read(), vec![], false, false)?;
+    let policy = allow_list(super::baseline_read(), [] as [&str; 0], false, false);
     let job = Job {
-        policy: ResolvedPolicy::resolve(&policy, Path::new("/nonexistent/happy-supervisor-probe")),
+        policy: ResolvedPolicy::resolve(&policy, Path::new("/nonexistent/happy-supervisor-probe"))?,
         op: JobOp::Exec {
             argv: Argv::try_from(vec![program.to_string()])?,
             cwd: AbsPath::try_from("/")?,
             env: BTreeMap::new(),
         },
     };
-    let mut command = prepare(&job)?;
+    let exe = helper::exe()?;
+    let plan = Plan {
+        policy: &job.policy,
+        net: None,
+        exe: &exe,
+    };
+    let mut command = prepare(&plan, &job)?.command;
     let (mut status_reader, status_writer) = std::io::pipe()?;
     let status_fd = status_writer.as_raw_fd();
     command
@@ -451,15 +457,14 @@ mod tests {
         std::fs::create_dir(root.join("elsewhere")).unwrap();
 
         let s = |p: &Path| p.to_str().unwrap().to_string();
-        let policy = Policy::new(
-            vec![s(&root)],
-            vec![s(&root.join("home")), s(&root.join("elsewhere"))],
+        let policy = allow_list(
+            [s(&root)],
+            [s(&root.join("home")), s(&root.join("elsewhere"))],
             false,
             false,
-        )
-        .unwrap();
-        let resolved = ResolvedPolicy::resolve(&policy, &state);
-        let mut grants = landlock_grants(&resolved);
+        );
+        let resolved = ResolvedPolicy::resolve(&policy, &state).unwrap();
+        let mut grants = landlock_grants(&resolved).unwrap();
         grants.sort_by(|a, b| (&a.path, a.rights).cmp(&(&b.path, b.rights)));
 
         let grant = |path: &str, kind, rights| Grant {
@@ -496,8 +501,8 @@ mod tests {
 
     #[test]
     fn grants_without_the_state_dir_pass_through() {
-        let policy = Policy::new(vec!["/usr".into()], vec![], true, true).unwrap();
-        let resolved = ResolvedPolicy::resolve(&policy, Path::new("/nonexistent/state"));
+        let policy = allow_list(["/usr"], [] as [&str; 0], true, true);
+        let resolved = ResolvedPolicy::resolve(&policy, Path::new("/nonexistent/state")).unwrap();
         assert_eq!(landlock_grants(&resolved), resolved.grants());
     }
 }

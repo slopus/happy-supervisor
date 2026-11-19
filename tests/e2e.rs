@@ -184,9 +184,14 @@ impl Node {
     fn sandboxed(&self, read: &[&Path], write: &[&Path]) -> Json {
         let mut reads = self.baseline_read();
         reads.extend(read.iter().map(|p| path(p)));
+        let write: Vec<String> = write.iter().map(|p| path(p)).collect();
+        reads.extend(write.iter().cloned());
         json!({ "mode": "sandboxed", "policy": {
-            "read": reads, "write": write.iter().map(|p| path(p)).collect::<Vec<_>>(),
-            "localBind": false, "unixSockets": false } })
+            "filesystem": {
+                "read": { "default": "deny", "allow": reads, "deny": [] },
+                "write": { "default": "deny", "allow": write, "deny": [] },
+            },
+            "network": { "mode": "host", "localBind": false, "unixSockets": false } } })
     }
 }
 
@@ -290,7 +295,7 @@ async fn a_sandboxed_command_writes_only_where_its_policy_allows() {
     std::fs::create_dir(&out).unwrap();
     let missing = work.path().join("missing");
     let mut access = node.sandboxed(&[work.path()], &[&out]);
-    access["policy"]["write"]
+    access["policy"]["filesystem"]["write"]["allow"]
         .as_array_mut()
         .unwrap()
         .push(json!(format!("{}/missing", path(work.path()))));
@@ -299,10 +304,7 @@ async fn a_sandboxed_command_writes_only_where_its_policy_allows() {
     let started = node
         .ok("exec.start", sh("sbx", script, work.path(), access))
         .await;
-    assert_eq!(
-        started["ignoredPaths"],
-        json!([format!("{}/missing", path(work.path()))])
-    );
+    assert_eq!(started["execId"], "sbx");
     let (exit, stdout, _) = node.exit("sbx").await;
     assert_eq!(exit.exit, ExitStatus::Exited { code: 0 });
     assert_eq!(stdout, "written\nrefused\n");

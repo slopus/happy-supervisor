@@ -204,6 +204,13 @@ pub const REGISTRY: &[(u64, &str, Role)] = &[
     (143, "tcp.open", Role::Kind),
     (144, "tcp.end", Role::Kind),
     (145, "tcp.reset", Role::Kind),
+    (146, "filesystem", Role::Key),
+    (147, "allow", Role::Key),
+    (148, "deny", Role::Key),
+    (149, "default", Role::Key),
+    (150, "network", Role::Key),
+    (151, "egress", Role::Key),
+    (152, "ports", Role::Key),
 ];
 
 struct Names {

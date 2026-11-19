@@ -1,180 +1,135 @@
-# happy-supervisor sandbox policy
+# happy-supervisor sandbox policy (v2)
 
-A **policy** is the manifest a sandboxed command carries. It says which paths the operation may
-read, which it may write, and whether it may bind local ports or Unix sockets. Everything not
-granted is denied, and the operating system enforces it, not the supervisor's own checks. The
-same policy means the same thing for a command (`exec.start`), a file command (`fs.*`) and a
-watch (`watch.start`). The wire format of commands is in [api.md](api.md).
+A **policy** is the manifest a sandboxed command, file operation or watch carries. It says, explicitly,
+what the operation may read, write and reach on the network. The supervisor adds no defaults of
+its own: every policy states its own default for reads, for writes and for network egress, and
+the exceptions to it. The operating system enforces it, through bubblewrap and seccomp on Linux,
+Seatbelt on macOS, and a restricted token with ACLs and a firewall on Windows.
 
 ```json
 {
-  "read": ["/usr", "/lib", "/etc/ssl", "/home/me/repo"],
-  "write": ["/home/me/repo/target", "/tmp/job-17"],
+  "filesystem": {
+    "read":  { "default": "allow", "allow": [], "deny": ["/home/me/.ssh", "/home/me/.aws"] },
+    "write": { "default": "deny",  "allow": ["/home/me/repo", "/tmp/job-17"], "deny": ["/home/me/repo/.git/hooks"] }
+  },
+  "network": {
+    "mode": "isolated",
+    "egress": { "default": "deny", "allow": ["github.com", "*.githubusercontent.com"], "deny": [] },
+    "ports": [443, 22],
+    "localBind": false,
+    "unixSockets": false
+  }
+}
+```
+
+Every field shown is required. There is no implicit grant and no implicit denial except the two
+fixed rules in "Fixed rules".
+
+## Filesystem
+
+`filesystem.read` and `filesystem.write` are each a **rule set**:
+
+| Field | Meaning |
+|---|---|
+| `default` | `"allow"` or `"deny"`: what applies to a path no entry matches. |
+| `allow` | Absolute paths that are allowed, with everything below them. |
+| `deny` | Absolute paths that are denied, with everything below them. |
+
+**The most specific entry wins.** For a path P, the entry whose path is the longest prefix of P
+(by whole components) decides. When `allow` and `deny` name the same path, deny wins. When no
+entry matches, `default` decides. The rule is the same for reads and writes.
+
+**Writing implies reading.** A path the write rules allow is also readable, whatever the read rules
+say about it. A path the read rules deny but the write rules allow is a contradiction the policy
+must not contain; it is `invalid_params`.
+
+Examples, with `read.default: "deny"`, `read.allow: ["/home/me"]`, `read.deny: ["/home/me/.ssh"]`:
+`/home/me/repo/a.rs` is readable, `/home/me/.ssh/id_ed25519` is not, `/etc/passwd` is not.
+
+Paths are absolute and normalized (no `.` or `..` or empty components, no NUL); a trailing
+separator is ignored. Each list holds at most 1024 paths. Paths are matched after resolving
+symlinks in the policy's own entries when they exist; a path that does not exist is matched by
+name.
+
+### Paths that do not exist
+
+* An `allow` entry that does not exist grants its name: if the operation creates it (and its parent
+  is writable), it is allowed.
+* A `deny` entry that does not exist is still denied. Where the mechanism needs something to
+  mount over (bubblewrap) or attach an ACL to (Windows), the supervisor creates a **placeholder**:
+  an empty, read-only file or directory at the first missing component. It records every
+  placeholder it creates and removes it after the operation ends if it is still empty and still
+  the one it created. Placeholders appear only inside directories the policy makes writable,
+  which is the only place the operation could otherwise create the denied path.
+
+## Fixed rules
+
+1. **The supervisor's private state directory** (its credentials and keys) is denied for read and
+   write whatever the policy says.
+2. **Devices and procfs** are the sandbox's own, not host paths: on Linux the sandbox gets a
+   private `/dev` (null, zero, full, random, urandom, tty, ptmx, shm) and a private `/proc` for its
+   own PID namespace; the policy does not govern them. On macOS, where there is no private `/dev`,
+   exactly those device nodes are readable and writable. On Windows the equivalent named devices
+   (`NUL`, console) are available.
+
+## Network
+
+`network` is one of two shapes.
+
+**Host** networking: the sandbox shares the machine's network, unrestricted outbound.
+
+```json
+{ "mode": "host", "localBind": true, "unixSockets": true }
+```
+
+**Isolated** networking: the sandbox has no route out except the node's proxies, which apply the
+egress rules.
+
+```json
+{
+  "mode": "isolated",
+  "egress": { "default": "deny", "allow": ["github.com", "*.npmjs.org"], "deny": [] },
+  "ports": [443],
   "localBind": false,
   "unixSockets": false
 }
 ```
 
-## Fields
+| Field | Meaning |
+|---|---|
+| `egress.default` | `"allow"` or `"deny"`: hosts no entry matches. `{ "default": "deny", "allow": [], "deny": [] }` is no network at all. |
+| `egress.allow`, `egress.deny` | Host patterns: an exact DNS name, or `*.` and a suffix (matches names under it, not the suffix itself). An IP literal matches only that address. The most specific match wins; on a tie, deny. At most 1024 each. |
+| `ports` | The destination ports allowed, or `null` for any port. |
+| `localBind` | May bind and listen on TCP and UDP ports. In isolated mode those listeners are in the sandbox's own network, reachable only from inside it and through `tcp.open` with the command's `execId` (tunnels.md). |
+| `unixSockets` | May create Unix domain sockets (bind or connect). Filesystem sockets also need their directory writable. |
 
-| Field | Type | Meaning |
+How isolated networking works (proxy.md, "Egress proxy"):
+
+* The sandbox can reach exactly two endpoints: an HTTP proxy and a SOCKS5 proxy, both run by the
+  node outside the sandbox. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (and lowercase forms) point
+  at them. Everything else is unreachable: on Linux the sandbox has its own network namespace with
+  only loopback; on macOS Seatbelt allows outbound connections only to the two proxy ports; on
+  Windows a firewall filter keyed on the sandbox's identity allows only those ports on loopback.
+* The proxies resolve the name themselves, check the host against `egress` and the port against
+  `ports`, and then refuse any resolved address that is loopback, private, link-local, CGNAT,
+  multicast or the node's own, unless the policy names that literal IP in `egress.allow`.
+* UDP (including direct DNS) and other protocols have no route in isolated mode. Name resolution
+  happens in the proxy.
+* Hosts listed in the command's credential `proxy.hosts` (proxy.md) go to the control plane, which
+  can inject credentials. They must also pass `egress`.
+
+## What each platform requires
+
+| Platform | Requirement | Reported in |
 |---|---|---|
-| `read` | array of absolute paths | May be read, listed, and executed. |
-| `write` | array of absolute paths | May also be created, modified, renamed and removed. Write implies read. |
-| `localBind` | bool | May bind and listen on TCP and UDP ports, on any local address. |
-| `unixSockets` | bool | May create (bind) Unix domain sockets. A filesystem socket also needs its directory in `write`. |
+| Linux | `bwrap` 0.8+ on `PATH` (or at a configured path), unprivileged user namespaces (or a setuid `bwrap`), kernel seccomp. On Ubuntu 24.04+, an AppArmor profile that allows `bwrap` user namespaces (the installer writes one). | NodeInfo `sandbox.available`, `sandbox.reason` |
+| macOS | `/usr/bin/sandbox-exec`. | same |
+| Windows | Windows 10 1809+ / Server 2019+, the supervisor installed once with administrator rights to create the sandbox account and firewall filters. | same |
 
-All four fields are required. Each list holds at most 256 paths.
-
-## Paths
-
-* A path must be absolute and normalized: no `.` or `..` components, no empty components, no NUL.
-  A trailing separator is ignored. A path that breaks these rules makes the command
-  `invalid_params`.
-* A directory grant covers the directory and everything below it. A file grant covers that
-  file only.
-* Grants are resolved when the operation starts. Each path is canonicalized, so symlinks are
-  followed and the grant applies to the real location. On macOS, `/tmp` grants `/private/tmp`.
-  A symlink created later inside a granted directory does not extend the grant: the OS checks the
-  real path of every access.
-* **A path that does not exist grants nothing.** It is skipped and reported in `ignoredPaths`. A
-  directory created later at that path stays inaccessible to the running operation. To let an
-  operation create `out/`, grant its existing parent.
-* There are no deny lists. The narrowest way to express "everything but X" is to grant X's
-  siblings.
-
-## The supervisor never creates anything to sandbox
-
-The supervisor never creates a file, directory, mount point or placeholder in order to apply a
-policy. It does not bind-mount, does not create empty files to mask paths, and does not
-pre-create granted paths. A sandboxed operation leaves the filesystem exactly as a raw operation
-with the same effects would. The only things that change are the ones the operation itself
-writes. This is why missing paths are skipped rather than created, and why the Linux backend
-uses Landlock, a path-access LSM, rather than mount namespaces.
-
-## Always granted
-
-So that ordinary programs run, every sandbox also gets:
-
-* `/dev/null`: read and write.
-* `/dev/zero`, `/dev/random`, `/dev/urandom`: read.
-
-Nothing else is implicit. Executables, shared libraries, certificate stores and locale data
-must be granted by the policy. NodeInfo's `sandbox.baselineRead` lists the system paths this
-machine needs to run ordinary programs, for the control plane to copy into policies
-(node-info.md). The supervisor reports that list as a fact. It never adds it on its own.
-
-## Always denied
-
-The private part of the supervisor's state directory (`private/`, which holds its credentials and
-its proxy CA key) is neither readable nor writable by any sandboxed operation, even when a
-granted path contains it. The one exception to "nothing implicit" is the node's CA bundle
-(`public/ca-bundle.pem`), readable by sandboxed commands that use a proxy (proxy.md).
-
-## Outbound network
-
-Outbound connections are not restricted by this version of the policy. A sandboxed process may
-connect to any address the machine can reach, including loopback services. `localBind` and
-`unixSockets` govern only what the process may *listen on*.
-
-## Processes
-
-A sandboxed process, and every process it starts, stays in the sandbox. It cannot raise its
-privileges (setuid and file capabilities are ignored). It cannot debug, or signal, processes
-outside its own sandbox where the platform can prevent it (table below).
-
-## Enforcement by platform
-
-The node reports what it can enforce in NodeInfo's `sandbox` section. A command whose policy
-needs a restriction the node cannot enforce replies `sandbox_unavailable` and does not run. The
-supervisor never weakens a policy silently.
-
-### Linux: Landlock and seccomp
-
-Requires Landlock ABI 1 or newer (kernel 5.13+) enabled in the running LSM list. The sandboxed
-operation runs in a fresh helper process that restricts itself and then execs the command or
-performs the file operation.
-
-| Policy | Mechanism |
-|---|---|
-| `read` | Landlock read-file, read-dir and execute on each granted path. |
-| `write` | Landlock write, create (regular, directory, symlink, FIFO), remove, truncate (ABI 3+) and cross-directory rename and link (ABI 2+). Device-node creation is never granted. A file grant gets only the rights that apply to a file (read, execute, write, truncate). |
-| state directory | Landlock is allow-only, so when a granted directory contains the state directory, that grant is replaced by grants on each existing entry beside the path to it. The directories on that path are not granted themselves: they cannot be listed, and entries created in them later are denied. Symlinks among those entries are skipped. |
-| `localBind: false` | Landlock denies TCP bind (ABI 4+, kernel 6.7+). When `unixSockets` is also false, seccomp denies `bind` and `listen` outright with `EPERM`, which also covers UDP and every other socket family, netlink included. |
-| `unixSockets: false` | Landlock withholds socket creation in every directory. When `localBind` is also false, seccomp's `bind` denial also covers abstract-namespace sockets. |
-| processes | `no_new_privs`. Landlock confines ptrace to the sandbox. ABI 6+ also scopes signals and abstract Unix socket connections to the sandbox. |
-
-Every requested restriction must be fully enforced. The helper asks Landlock for exactly the
-rights its kernel's ABI supports and fails with `sandbox_unavailable` rather than run under a
-weaker ruleset. Landlock's device ioctl (ABI 5) and Unix socket connect (ABI 9) rights are not
-handled, so ioctl on an opened device and connecting to a socket work as without a sandbox.
-
-The seccomp filter only allows system calls of the native architecture. A 32-bit (compat)
-program is killed at its first system call when the filter applies, because its socket calls
-cannot be filtered reliably.
-
-Gaps the node reports, as one sentence each in NodeInfo's `sandbox.gaps` (node-info.md), for
-its own kernel's ABI:
-
-* With `localBind: false, unixSockets: true`, UDP ports can still be bound, and a TCP socket can
-  still listen on an ephemeral port by calling `listen` without `bind`. Landlock controls only
-  explicit TCP `bind`, and seccomp cannot tell a TCP `listen` from a Unix socket one.
-* With `localBind: true, unixSockets: false`, abstract-namespace Unix sockets can still be
-  bound. Filesystem sockets are denied.
-* On ABI 1 to 3 kernels, `localBind: false` is enforced only with `unixSockets: false` (the
-  seccomp path). Other combinations reply `sandbox_unavailable`.
-* On ABI 1 and 2, `truncate(2)` on a readable file is not restricted by Landlock. File
-  permissions still apply.
-* `ioctl` on an opened device and connecting to a Unix socket are not restricted (above).
-
-### macOS: Seatbelt
-
-The parent spawns the helper as `/usr/bin/sandbox-exec -p <profile> <helper> __sandbox`, so the
-helper starts already confined. The profile is generated from the resolved policy and starts
-with `(deny default)`. Seatbelt applies the last matching rule.
-
-| Policy | Mechanism |
-|---|---|
-| `read` | `file-read*`, `file-map-executable` and `process-exec` on each grant: `subpath` for a directory, `literal` for a file. |
-| `write` | The same, plus `file-write*`. |
-| state directory | `file-read*`, `file-write*`, `file-map-executable` and `process-exec` denied on its `subpath`, after every grant, so it overrides any grant that contains it. |
-| `localBind: true` | `network-bind` and `network-inbound` on any local IP address, TCP and UDP. |
-| `unixSockets: true` | `network-bind` of Unix sockets inside each `write` grant. A `read` grant cannot hold a socket. |
-| processes | `process-fork`. Executing needs a grant (`process-exec` comes with `read`). Signals and process inspection reach only processes in the same sandbox. |
-
-Every profile also allows these, whatever the policy says. `tests/sandbox_macos.rs` fails on
-macOS 27 without each of the first five.
-
-* The helper binary, read and executed by its canonical path, because `sandbox-exec` runs it
-  after the profile is applied.
-* `/` itself, its metadata and listing (not what is below it). dyld reads it before any program
-  starts.
-* The metadata (`stat`, not the listing or the contents) of every directory above a grant, and of
-  the system symlinks `/etc`, `/tmp`, `/var`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`.
-  `realpath`, `pwd -P` and the `git` and `python3` shims stat each component, and DNS goes
-  through `/var/run/mDNSResponder`. This exposes those directories' existence, owner, mode, size
-  and times.
-* `sysctl-read`. The Rust runtime and the C library read kernel parameters at startup.
-* The Mach service `com.apple.system.opendirectoryd.libinfo`, for user and group names.
-* The Mach services the C library looks up for logging, notifications and DNS:
-  `com.apple.system.logger`, `com.apple.logd`, `com.apple.system.notification_center` and
-  `com.apple.dnssd.service`. The tests pass without them, but they are read-only lookups that
-  ordinary programs make.
-* `network-outbound`, to any address and to any Unix socket (Outbound network, above).
-
-The node reports one gap in `sandbox.gaps`: the directory metadata above every grant is
-readable (above).
-
-A grant applies to the real path only. Opening a granted file through a symlink fails
-unless the symlink itself is readable, because Seatbelt checks reading the link. Linux follows
-the link without checking it. The system symlinks listed above are the exception.
-
-### Windows
-
-No sandbox. Sandboxed commands reply `sandbox_unavailable`. Raw commands work.
+A node that cannot enforce a policy replies `sandbox_unavailable` and never runs the operation
+with less.
 
 ## Raw access
 
-`{ "mode": "raw" }` runs with the supervisor's own rights and no policy. It is for the control
-plane's trusted maintenance. Raw processes still run in their own process group or Job Object
-so they can be killed as a tree.
+`{ "mode": "raw" }` access carries no policy and runs with the supervisor's rights. Raw processes
+are still killed as a tree.

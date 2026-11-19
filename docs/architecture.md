@@ -72,8 +72,8 @@ nothing past the job is consumed. Then:
 * A job that cannot be read exits 125.
 
 The parent resolves the policy and sends the `ResolvedPolicy` in the job, so the parent's view
-(`ignoredPaths`, the macOS profile, watch filtering) and the helper's Landlock rules come from
-the same canonical grants.
+(the macOS profile, watch filtering) and the helper's rules come from the same resolved
+entries.
 
 Raw operations never use the helper. Raw file commands run `fs::perform` in-process on a
 blocking thread. Raw commands are spawned directly.

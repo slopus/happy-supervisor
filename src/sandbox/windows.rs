@@ -1,7 +1,5 @@
 //! Windows has no sandbox backend (policy.md, Windows): sandboxed requests are refused.
 
-use std::process::Command;
-
 use crate::error::{Error, Result};
 use crate::helper::Job;
 use crate::protocol::{Mechanism, SandboxInfo, SandboxStatus};
@@ -19,7 +17,7 @@ pub fn probe() -> SandboxInfo {
     }
 }
 
-pub fn prepare(job: &Job) -> Result<Command> {
-    let _ = job;
+pub fn prepare(plan: &super::Plan, job: &Job) -> Result<super::Prepared> {
+    let _ = (plan, job);
     Err(Error::sandbox_unavailable(REASON))
 }

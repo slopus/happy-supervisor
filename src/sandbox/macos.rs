@@ -9,7 +9,7 @@ use std::process::Command;
 
 use crate::error::{Error, Result};
 use crate::helper::Job;
-use crate::policy::{GrantKind, ResolvedPolicy, Rights};
+use crate::policy::{Grant, GrantKind, Network, ResolvedPolicy, Rights};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -68,17 +68,15 @@ fn run_true() -> std::result::Result<(), String> {
     use std::process::Stdio;
 
     use crate::helper::{JobOp, encode_job, install_status_fd, parse_exec_status};
-    use crate::policy::Policy;
     use crate::protocol::{AbsPath, Argv};
 
     let text = |err: Error| err.to_string();
     let io = |err: std::io::Error| err.to_string();
-    let policy =
-        Policy::new(vec!["/usr/bin/true".to_string()], vec![], false, false).map_err(text)?;
+    let policy = crate::policy::allow_list(["/usr/bin/true"], [] as [&str; 0], false, false);
     let job = Job {
         // The probe has no state directory. `/var/empty` exists and is empty, so the deny rule
         // is rendered and parsed like a real one.
-        policy: ResolvedPolicy::resolve(&policy, Path::new("/var/empty")),
+        policy: ResolvedPolicy::resolve(&policy, Path::new("/var/empty")).map_err(text)?,
         op: JobOp::Exec {
             argv: Argv::try_from(vec!["/usr/bin/true".to_string()]).map_err(text)?,
             cwd: AbsPath::try_from("/").map_err(text)?,
@@ -87,7 +85,13 @@ fn run_true() -> std::result::Result<(), String> {
     };
     let (mut status_reader, status_writer) = std::io::pipe().map_err(io)?;
     let status_fd = status_writer.as_raw_fd();
-    let mut command = prepare(&job).map_err(text)?;
+    let exe = crate::helper::exe().map_err(text)?;
+    let plan = super::Plan {
+        policy: &job.policy,
+        net: None,
+        exe: &exe,
+    };
+    let mut command = prepare(&plan, &job).map_err(text)?.command;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -120,21 +124,30 @@ fn run_true() -> std::result::Result<(), String> {
 }
 
 /// `/usr/bin/sandbox-exec -p <profile> <helper> __sandbox`.
-pub fn prepare(job: &Job) -> Result<Command> {
+pub fn prepare(plan: &super::Plan, job: &Job) -> Result<super::Prepared> {
     // Seatbelt matches real paths, so the helper is granted, and run, by its canonical path.
-    let helper = std::fs::canonicalize(crate::helper::exe()?)?;
+    let helper = std::fs::canonicalize(plan.exe)?;
     let mut command = Command::new(SANDBOX_EXEC);
     command
         .arg("-p")
         .arg(profile(&job.policy, &helper)?)
         .arg(&helper)
         .arg("__sandbox");
-    Ok(command)
+    Ok(super::Prepared::command(command))
 }
 
 /// The SBPL profile for `policy`. Seatbelt applies the last matching rule, so the state
 /// directory's deny comes after every grant.
 fn profile(policy: &ResolvedPolicy, helper: &Path) -> Result<String> {
+    render(
+        &policy.grants()?,
+        policy.network(),
+        policy.state_dir(),
+        helper,
+    )
+}
+
+fn render(grants: &[Grant], network: &Network, state_dir: &Path, helper: &Path) -> Result<String> {
     let mut out = String::from(
         "(version 1)\n\
          (deny default)\n\
@@ -155,7 +168,7 @@ fn profile(policy: &ResolvedPolicy, helper: &Path) -> Result<String> {
     // The ancestors of each grant expose their own metadata, not their listing, so `realpath`
     // and `pwd -P` work (they stat each component, and `/Volumes` crosses a mount point).
     let mut ancestors = BTreeSet::new();
-    for grant in policy.grants() {
+    for grant in grants {
         ancestors.extend(
             grant
                 .path
@@ -173,7 +186,7 @@ fn profile(policy: &ResolvedPolicy, helper: &Path) -> Result<String> {
             Rights::ReadWrite => "file-read* file-write* file-map-executable process-exec",
         };
         writeln!(out, "(allow {ops} ({filter} {path}))").expect("writing to a String");
-        if grant.rights == Rights::ReadWrite && policy.unix_sockets() {
+        if grant.rights == Rights::ReadWrite && network.unix_sockets() {
             writeln!(
                 out,
                 "(allow network-bind (local unix-socket ({filter} {path})))"
@@ -199,14 +212,14 @@ fn profile(policy: &ResolvedPolicy, helper: &Path) -> Result<String> {
         "(allow network-outbound)
 ",
     );
-    if policy.local_bind() {
+    if network.local_bind() {
         out.push_str("(allow network-bind network-inbound (local ip))\n");
     }
 
     writeln!(
         out,
         "(deny file-read* file-write* file-map-executable process-exec (subpath {}))",
-        quote(policy.hidden())?
+        quote(state_dir)?
     )
     .expect("writing to a String");
     Ok(out)
@@ -234,25 +247,24 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
 
-    fn policy(local_bind: bool, unix_sockets: bool) -> ResolvedPolicy {
-        serde_json::from_value(serde_json::json!({
-            "grants": [
-                { "path": "/dev/null", "kind": "File", "rights": "ReadWrite" },
-                { "path": "/usr", "kind": "Directory", "rights": "Read" },
-                { "path": "/Users/me/repo", "kind": "Directory", "rights": "ReadWrite" },
-                { "path": "/Users/me/repo/say \"hi\"\\.txt", "kind": "File", "rights": "Read" },
-            ],
-            "ignored": ["/missing"],
-            "hidden": "/Users/me/.happy",
-            "local_bind": local_bind,
-            "unix_sockets": unix_sockets,
-        }))
-        .unwrap()
+    fn profile(network: (bool, bool), helper: &Path) -> Result<String> {
+        let grants: Vec<Grant> = serde_json::from_value(serde_json::json!([
+            { "path": "/dev/null", "kind": "File", "rights": "ReadWrite" },
+            { "path": "/usr", "kind": "Directory", "rights": "Read" },
+            { "path": "/Users/me/repo", "kind": "Directory", "rights": "ReadWrite" },
+            { "path": "/Users/me/repo/say \"hi\"\\.txt", "kind": "File", "rights": "Read" },
+        ]))
+        .unwrap();
+        let network = Network::Host {
+            local_bind: network.0,
+            unix_sockets: network.1,
+        };
+        render(&grants, &network, Path::new("/Users/me/.happy"), helper)
     }
 
     #[test]
     fn full_profile() {
-        let text = profile(&policy(true, true), Path::new("/opt/hs/happy-supervisor")).unwrap();
+        let text = profile((true, true), Path::new("/opt/hs/happy-supervisor")).unwrap();
         assert_eq!(
             text,
             r#"(version 1)
@@ -280,14 +292,14 @@ mod tests {
 
     #[test]
     fn binding_rules_follow_the_flags() {
-        let text = profile(&policy(false, false), Path::new("/hs")).unwrap();
+        let text = profile((false, false), Path::new("/hs")).unwrap();
         let binds: Vec<&str> = text
             .lines()
             .filter(|l| l.contains("network-bind"))
             .collect();
         assert_eq!(binds, [] as [&str; 0]);
 
-        let text = profile(&policy(false, true), Path::new("/hs")).unwrap();
+        let text = profile((false, true), Path::new("/hs")).unwrap();
         let binds: Vec<&str> = text
             .lines()
             .filter(|l| l.contains("network-bind"))
@@ -303,14 +315,14 @@ mod tests {
 
     #[test]
     fn unusable_paths_are_invalid_params() {
-        let err = profile(&policy(false, false), Path::new("/a\nb")).unwrap_err();
+        let err = profile((false, false), Path::new("/a\nb")).unwrap_err();
         assert_eq!(
             err,
             Error::invalid_params(r#"sandbox path "/a\nb" has a control character"#)
         );
         use std::os::unix::ffi::OsStrExt as _;
         let latin1 = Path::new(std::ffi::OsStr::from_bytes(b"/caf\xe9"));
-        let err = profile(&policy(false, false), latin1).unwrap_err();
+        let err = profile((false, false), latin1).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidParams);
         assert_eq!(err.message, r#"sandbox path "/caf\xE9" is not UTF-8"#);
     }

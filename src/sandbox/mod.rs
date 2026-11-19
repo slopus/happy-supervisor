@@ -1,17 +1,22 @@
-//! OS sandbox backends (docs/policy.md, Enforcement by platform). `linux.rs` is owned by the
-//! Linux track, `macos.rs` by the macOS track. Windows has no sandbox.
+//! OS sandbox backends (docs/policy.md). `linux.rs` is owned by the Linux track, `macos.rs` by
+//! the macOS track, `windows.rs` by the Windows track; this file holds the seam they implement.
 //!
 //! Each backend exports:
 //!
 //! * `probe() -> SandboxInfo`: what this node can enforce, decided by running a sandboxed
 //!   `true` (node-info.md). Called once at startup.
-//! * `prepare(&Job) -> Result<std::process::Command>`: the command whose stdin receives
-//!   [`encode_job`](crate::helper::encode_job). Linux: `<exe> __sandbox`. macOS:
-//!   `/usr/bin/sandbox-exec -p <profile> <exe> __sandbox`. Windows: `sandbox_unavailable`.
+//! * `prepare(&Plan, &Job) -> Result<Prepared>`: the command whose stdin receives
+//!   [`encode_job`](crate::helper::encode_job), with what must live until the operation ends.
 //!   The caller adds stdio, the process group, and for exec jobs the status pipe.
 //! * Linux only, `enter(&ResolvedPolicy) -> Result<()>`: confines the calling helper process.
 
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use crate::policy::ResolvedPolicy;
+
+mod placeholders;
+pub use placeholders::Placeholders;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -27,6 +32,70 @@ pub use macos::{prepare, probe};
 mod windows;
 #[cfg(windows)]
 pub use windows::{prepare, probe};
+
+/// Where a command proxy listens, as the node sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+/// The command proxy of an exec with isolated networking (proxy.md, Egress proxy): the only
+/// network its sandbox may reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetPlan {
+    pub http: Endpoint,
+    pub socks: Endpoint,
+}
+
+/// What [`prepare`] confines one operation to.
+#[derive(Clone, Debug)]
+pub struct Plan<'a> {
+    pub policy: &'a ResolvedPolicy,
+    /// Present exactly when the policy's network is isolated and the operation is an exec.
+    pub net: Option<NetPlan>,
+    /// The supervisor binary that runs as the helper (`<exe> __sandbox`).
+    pub exe: &'a Path,
+}
+
+/// A prepared operation. Keep it until the operation has ended: dropping it removes the
+/// placeholders and closes the control socket.
+#[derive(Debug)]
+pub struct Prepared {
+    /// Its stdin gets [`encode_job`](crate::helper::encode_job).
+    pub command: std::process::Command,
+    pub placeholders: Placeholders,
+    /// Linux, isolated with `localBind`: how `tcp.open` with this exec's `execId` reaches its
+    /// network namespace (tunnels.md).
+    pub netns: Option<NetnsControl>,
+}
+
+impl Prepared {
+    pub fn command(command: std::process::Command) -> Prepared {
+        Prepared {
+            command,
+            placeholders: Placeholders::default(),
+            netns: None,
+        }
+    }
+}
+
+/// The node's side of the control socket to a sandbox helper that owns a network namespace.
+#[derive(Debug)]
+pub struct NetnsControl {
+    _private: (),
+}
+
+impl NetnsControl {
+    /// Connects to `127.0.0.1:port` inside the namespace. Blocking: call it from
+    /// `spawn_blocking`.
+    pub fn connect(&self, port: u16) -> std::io::Result<std::net::TcpStream> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("no network namespace to reach port {port} in"),
+        ))
+    }
+}
 
 /// The existing system paths ordinary programs need to read here (node-info.md,
 /// `baselineRead`). Reported to the control plane; never added to a policy.

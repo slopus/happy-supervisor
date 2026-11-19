@@ -11,8 +11,8 @@ Windows, on x86_64 and aarch64.
 
 ```
 happy-supervisor join --url https://control.example.com/api/nodes/join --token <join token> [--name <name>] [--state-dir <dir>]
-happy-supervisor run [--state-dir <dir>]
-happy-supervisor serve --listen 127.0.0.1:7777 --token-file <file> [--state-dir <dir>]
+happy-supervisor run [--state-dir <dir>] [--workload-user <user>]
+happy-supervisor serve --listen 127.0.0.1:7777 --token-file <file> [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor info [--state-dir <dir>]
 happy-supervisor install-sandbox        # Windows, once, as an administrator
 ```
@@ -20,7 +20,9 @@ happy-supervisor install-sandbox        # Windows, once, as an administrator
 `join` exchanges a single-use join token at the join endpoint for a long-lived node credential
 and the endpoint to connect to. `run` connects and serves the control plane until the
 credential is revoked (exit code 3). `serve` listens instead of dialing, for tests and local
-programs that drive the node with `happy_supervisor::Controller`. `info` prints this
+programs that drive the node with `happy_supervisor::Controller`. With `--workload-user`, a
+supervisor running as root runs every command and file operation as that user
+([docs/policy.md](docs/policy.md), Workload user). `info` prints this
 machine's NodeInfo as JSON. On Windows, `install-sandbox` creates the sandbox's accounts, groups
 and firewall filters; without it the sandbox reports unavailable.
 

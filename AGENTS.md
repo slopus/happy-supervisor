@@ -19,7 +19,7 @@ protocol rule in `client` or `testing`.
 
 | Module | Owner |
 |---|---|
-| `protocol`, `wire`, `ws`, `error`, `policy`, `helper`, `link`, `dispatch`, `serve`, `server`, `controller`, `testkit`, `lib.rs`, `sandbox/mod.rs`, `Cargo.toml`, `Cargo.lock`, CI | scaffold |
+| `protocol`, `wire`, `ws`, `error`, `policy`, `helper`, `identity`, `link`, `dispatch`, `serve`, `server`, `controller`, `testkit`, `lib.rs`, `sandbox/mod.rs`, `Cargo.toml`, `Cargo.lock`, CI | scaffold |
 | `state`, `enroll`, `client`, `testing`, `main.rs` | transport track |
 | `exec`, `process/*` | exec track |
 | `sandbox/linux/*`, `sandbox/placeholders.rs`, `connect` | Linux sandbox track |

@@ -46,6 +46,12 @@ jobs:
       - run: cargo test --all-features --test sandbox_windows -- --nocapture
         if: runner.os == 'Windows'
       - run: cargo test --all-features
+      # The workload user (identity.rs) needs a supervisor running as root.
+      - name: workload user, as root
+        if: runner.os != 'Windows'
+        run: |
+          cargo test --all-features --test workload --no-run
+          sudo "$(ls -t target/debug/deps/workload-* | grep -v '\.d$' | head -1)" --nocapture
       # Timing tests, alone so nothing else competes for the CPU, and in release as shipped.
       - run: cargo test --release --all-features --test e2e -- --ignored --nocapture
         if: runner.os != 'Windows'

@@ -4,6 +4,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::helper::{Job, JobOp};
+use crate::identity::Workload;
 use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
     AbsPath, Bytes, DirEntry, Empty, FileKind, FsListResult, FsMkdirParams, FsPathParams,
@@ -70,15 +72,35 @@ pub fn perform(request: &FsRequest) -> Result<FsResponse> {
 
 /// Runs a file request under its confinement: raw in-process, sandboxed through the helper.
 pub async fn handle(request: FsRequest, confinement: Confinement) -> Result<FsResponse> {
-    match confinement {
-        Confinement::Raw => tokio::task::spawn_blocking(move || perform(&request))
+    handle_as(request, confinement, None).await
+}
+
+/// [`handle`], as `workload` when there is one: a raw request then runs in the helper too, as
+/// that user and unconfined (`__sandbox fs`).
+pub async fn handle_as(
+    request: FsRequest,
+    confinement: Confinement,
+    workload: Option<Arc<Workload>>,
+) -> Result<FsResponse> {
+    match (confinement, workload) {
+        (Confinement::Raw, None) => tokio::task::spawn_blocking(move || perform(&request))
             .await
             .map_err(|err| Error::new(ErrorKind::Io, format!("file operation failed: {err}")))?,
-        Confinement::Sandboxed(policy) => sandboxed(request, policy).await,
+        (Confinement::Raw, Some(workload)) => {
+            let mut command = std::process::Command::new(crate::helper::exe()?);
+            command.args([crate::helper::HELPER_ARG, crate::helper::UNCONFINED_FS_ARG]);
+            crate::identity::run_as(&mut command, Some(&*workload), None)?;
+            run_helper(command, &crate::helper::encode_fs_job(&request)).await
+        }
+        (Confinement::Sandboxed(policy), workload) => sandboxed(request, policy, workload).await,
     }
 }
 
-async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsResponse> {
+async fn sandboxed(
+    request: FsRequest,
+    policy: ResolvedPolicy,
+    workload: Option<Arc<Workload>>,
+) -> Result<FsResponse> {
     // The sandbox shows a path the policy hides as missing (bubblewrap) or lets metadata through
     // (Seatbelt), so the policy decides first and every platform answers permission_denied.
     // A rename acts on its two paths' directory entries, so their last components are not
@@ -137,8 +159,17 @@ async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsRespo
         net: None,
         exe: &exe,
     };
-    let prepared = crate::sandbox::prepare(&plan, &job)?;
-    let mut command = tokio::process::Command::from(prepared.command);
+    let mut prepared = crate::sandbox::prepare(&plan, &job)?;
+    crate::identity::run_as(&mut prepared.command, workload.as_deref(), None)?;
+    let frame = crate::helper::encode_job(&job);
+    let reply = run_helper(prepared.command, &frame).await;
+    drop(prepared.placeholders);
+    reply
+}
+
+/// Runs a helper with `frame` on its stdin and reads the one reply it writes to stdout.
+async fn run_helper(command: std::process::Command, frame: &[u8]) -> Result<FsResponse> {
+    let mut command = tokio::process::Command::from(command);
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -147,7 +178,7 @@ async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsRespo
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     // A helper that dies before reading its job closes the pipe; its output says why.
-    let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &crate::helper::encode_job(&job)).await;
+    let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, frame).await;
     drop(stdin);
     let output = child.wait_with_output().await?;
     if output.stdout.is_empty() {

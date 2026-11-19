@@ -32,6 +32,14 @@ use crate::protocol::{AbsPath, Argv};
 /// Bigger than any valid job: a 16 MiB `fs.write` plus a full policy.
 pub const MAX_JOB_BYTES: usize = 32 << 20;
 
+/// The argument that makes the supervisor binary the helper.
+pub const HELPER_ARG: &str = "__sandbox";
+
+/// After [`HELPER_ARG`]: perform one file request as this process's user, unconfined. Raw
+/// `fs.*` runs this way as the workload user (identity.rs). Its stdin holds the [`FsRequest`],
+/// framed like a job, and it replies like a file job.
+pub const UNCONFINED_FS_ARG: &str = "fs";
+
 /// The helper's fd for the exec status pipe.
 pub const STATUS_FD: i32 = 3;
 
@@ -82,6 +90,15 @@ fn encode_frame<T: Serialize>(value: &T) -> Vec<u8> {
 /// Reads exactly one frame from `reader`. Pass an unbuffered reader, or bytes past the frame are
 /// consumed too.
 pub fn read_job(reader: &mut impl Read) -> Result<Job> {
+    read_frame(reader)
+}
+
+/// The frame the parent writes to an unconfined file helper's stdin ([`UNCONFINED_FS_ARG`]).
+pub fn encode_fs_job(request: &FsRequest) -> Vec<u8> {
+    encode_frame(request)
+}
+
+fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     let mut len = [0u8; 4];
     reader.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -191,6 +208,12 @@ pub fn main() -> ! {
 
 #[cfg(unix)]
 fn unix_main() -> ! {
+    if std::env::args_os()
+        .nth(2)
+        .is_some_and(|arg| arg == UNCONFINED_FS_ARG)
+    {
+        unconfined_fs()
+    }
     let Job { policy, op } = match read_stdin_job() {
         Ok(job) => job,
         Err(err) => {
@@ -211,6 +234,19 @@ fn read_stdin_job() -> Result<Job> {
     // stay in the pipe for the command.
     let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
     read_job(&mut std::fs::File::from(fd))
+}
+
+/// [`UNCONFINED_FS_ARG`]: the parent made this process the workload user.
+#[cfg(unix)]
+fn unconfined_fs() -> ! {
+    let request: FsRequest = match read_frame(&mut std::io::stdin().lock()) {
+        Ok(request) => request,
+        Err(err) => {
+            eprintln!("happy-supervisor __sandbox fs: {err}");
+            std::process::exit(EXIT_BAD_JOB)
+        }
+    };
+    reply_fs(crate::fs::perform(&request))
 }
 
 #[cfg(unix)]
@@ -295,7 +331,12 @@ pub fn encode_fs_reply(result: Result<FsResponse>) -> Vec<u8> {
 
 #[cfg(unix)]
 fn run_fs(policy: &ResolvedPolicy, request: &FsRequest) -> ! {
-    let frame = encode_fs_reply(confine(policy).and_then(|()| crate::fs::perform(request)));
+    reply_fs(confine(policy).and_then(|()| crate::fs::perform(request)))
+}
+
+#[cfg(unix)]
+fn reply_fs(result: Result<FsResponse>) -> ! {
+    let frame = encode_fs_reply(result);
     let mut stdout = std::io::stdout().lock();
     let written = stdout.write_all(&frame).and_then(|()| stdout.flush());
     std::process::exit(if written.is_ok() { 0 } else { 1 })

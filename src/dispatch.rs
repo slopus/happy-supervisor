@@ -1,6 +1,7 @@
 //! The message boundary: parses each command's body, resolves `access` once, and calls the
 //! module that owns the command. Stream messages from the control plane go to the proxy.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
@@ -10,6 +11,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::exec::ExecManager;
 use crate::exec::TunnelRoute;
 use crate::fs::{self, FsRequest};
+use crate::identity::Identity;
 use crate::link::Outbox;
 use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::protocol::{
@@ -35,6 +37,7 @@ pub struct Node {
     /// The joined name. `None` before joining, when NodeInfo falls back to the hostname.
     name: Option<String>,
     sandbox: SandboxInfo,
+    identity: Arc<Identity>,
     exec: ExecManager,
     watch: WatchManager,
     proxy: ProxyManager,
@@ -44,9 +47,13 @@ pub struct Node {
 }
 
 impl Node {
-    /// Reads the installation ID and the joined name from `state`, loads the proxy CA (writing
-    /// `public/ca-bundle.pem`) and probes the sandbox. Blocking.
+    /// Reads the installation ID and the joined name from `state`, resolves the workload user,
+    /// loads the proxy CA (writing `public/ca-bundle.pem`) and probes the sandbox. Blocking.
     pub fn open(state: StateDir, outbox: Outbox) -> Result<Node> {
+        let identity = Identity::resolve(state.workload_user()?.as_deref())?;
+        if identity.workload().is_some() {
+            state.open_to_workload()?;
+        }
         let installation_id = state.installation_id()?;
         let name = state.credentials()?.map(|c| c.name);
         let ca = NodeCa::load_or_create(&state.private_dir(), &state.public_dir())?;
@@ -63,6 +70,7 @@ impl Node {
             installation_id,
             name,
             sandbox,
+            identity,
             outbox,
             proxy,
         ))
@@ -73,6 +81,7 @@ impl Node {
         installation_id: String,
         name: Option<String>,
         sandbox: SandboxInfo,
+        identity: Identity,
         outbox: Outbox,
         proxy: ProxyManager,
     ) -> Node {
@@ -81,7 +90,8 @@ impl Node {
             installation_id,
             name,
             sandbox,
-            exec: ExecManager::new(outbox.clone()),
+            exec: ExecManager::new(outbox.clone()).run_as(identity.workload().cloned()),
+            identity: Arc::new(identity),
             watch: WatchManager::new(outbox),
             tunnels: TunnelManager::new(&proxy),
             proxy,
@@ -98,8 +108,9 @@ impl Node {
         let installation_id = self.installation_id.clone();
         let name = self.name.clone();
         let sandbox = self.sandbox.clone();
+        let identity = self.identity.clone();
         tokio::task::spawn_blocking(move || {
-            crate::node_info::collect(&installation_id, name.as_deref(), &sandbox)
+            crate::node_info::collect(&installation_id, name.as_deref(), &sandbox, &identity)
         })
         .await
         .map_err(|err| Error::new(ErrorKind::Io, format!("node info collection failed: {err}")))
@@ -164,6 +175,9 @@ impl Node {
             credential,
         };
         let proxy = egress::start(config, &self.proxy).await?;
+        if self.identity.workload().is_some() {
+            open_sockets_to_sandbox(&proxy)?;
+        }
         if let (Confinement::Sandboxed(policy), Some(bundle)) = (confinement, proxy.ca_bundle()) {
             policy.allow_read_file(bundle);
         }
@@ -225,8 +239,27 @@ impl Node {
 
     async fn fs(&self, request: FsRequest, access: Access) -> Result<Value> {
         let confinement = self.confine(access).await?;
-        Ok(fs::handle(request, confinement).await?.into_value())
+        let workload = self.identity.workload().cloned();
+        Ok(fs::handle_as(request, confinement, workload)
+            .await?
+            .into_value())
     }
+}
+
+/// With a workload user, the sandbox's bridge connects to the proxy sockets as that user. They
+/// stay in `private/`, which only the supervisor's user can reach; bubblewrap binds them into
+/// that one sandbox by descriptor (policy.md, Workload user).
+fn open_sockets_to_sandbox(proxy: &CommandProxy) -> Result<()> {
+    #[cfg(unix)]
+    for endpoint in [&proxy.http, &proxy.socks] {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let crate::sandbox::Endpoint::Unix(path) = endpoint {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+        }
+    }
+    #[cfg(windows)]
+    let _ = proxy;
+    Ok(())
 }
 
 /// Handles one message from the control plane. A command's result is the reply's `ok` or
@@ -329,6 +362,13 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
         }
         CommandKind::WatchStart => {
             let WithAccess { params, access } = parse::<WithAccess<WatchStartParams>>(params)?;
+            if let Some(workload) = node.identity.workload() {
+                return Err(Error::sandbox_unavailable(format!(
+                    "this node runs its work as {:?}, and watching as that user is not \
+                     supported yet",
+                    workload.name()
+                )));
+            }
             let confinement = node.confine(access).await?;
             node.watch.start(params, confinement).await?;
             to_value(Empty {})
@@ -395,7 +435,16 @@ mod tests {
         let ca = NodeCa::load_or_create(&state.private_dir(), &state.public_dir()).unwrap();
         let proxy = ProxyManager::new(outbox.clone(), ca, |_| {});
         let installation_id = "tz4a98xxat96iws9zmbrgj3a".to_string();
-        let node = Node::new(state, installation_id, None, sandbox, outbox, proxy);
+        let identity = Identity::resolve(None).unwrap();
+        let node = Node::new(
+            state,
+            installation_id,
+            None,
+            sandbox,
+            identity,
+            outbox,
+            proxy,
+        );
         (node, dir)
     }
 

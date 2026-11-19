@@ -44,6 +44,7 @@ the rest of the collection, and each is cut off at 3 seconds.
       "32-bit x86 and x32 programs cannot run in the sandbox"
     ]
   },
+  "identity": { "supervisorUser": "root", "workloadUser": "happy-workload", "root": true },
   "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
   "collectedAtMs": 1763496000000
 }
@@ -162,13 +163,23 @@ What this node can enforce for `{ "mode": "sandboxed" }` commands (policy.md).
 * macOS: `/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/private/etc`, `/private/var/db/timezone`, `/private/var/select`, `/dev/fd`, `/dev/tty`, `/opt/homebrew`, and the app bundle of the selected developer directory (`/Applications/Xcode.app` by default). `/bin/sh` reads `/private/var/select/sh`. `/usr/bin/git`, `/usr/bin/python3` and the other developer shims run their tool from the Xcode bundle (Command Line Tools live under `/Library`). The shims also cache their lookups in `TMPDIR`. They work without writing it, only slower.
 * Windows: empty.
 
+### `identity`
+
+Who the supervisor runs as, and who its work runs as (policy.md, Workload user).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `supervisorUser` | string | The supervisor process's user name (its uid on Unix if it has none). |
+| `workloadUser` | string \| null | With `--workload-user`, the user every command and file operation runs as. `null` when they run as `supervisorUser`. |
+| `root` | bool | The supervisor runs as root (Unix) or with an elevated administrator token (Windows). With `workloadUser` null, its raw work does too. |
+
 ### `defaultEnv`
 
 The environment a command would usually get on this machine, for the control plane to copy into
 `exec.start`. It holds `PATH`, `HOME` (`USERPROFILE` on Windows), `USER` (`USERNAME` on
 Windows), `LANG` and `TMPDIR` (`TEMP` and `TMP` on Windows) when set in the supervisor's
-environment, and also `SystemRoot` on Windows. Nothing else of the supervisor's environment is
-reported.
+environment, and also `SystemRoot` on Windows. With a workload user, `HOME` and `USER` are that
+user's home directory and name. Nothing else of the supervisor's environment is reported.
 
 ### `collectedAtMs`
 

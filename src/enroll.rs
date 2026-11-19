@@ -25,10 +25,12 @@ pub async fn join(
         tokio::task::spawn_blocking(move || {
             let installation_id = state.installation_id()?;
             let sandbox = crate::sandbox::probe();
+            let identity = crate::identity::Identity::resolve(state.workload_user()?.as_deref())?;
             Ok::<_, Error>(crate::node_info::collect(
                 &installation_id,
                 name.as_deref(),
                 &sandbox,
+                &identity,
             ))
         })
         .await

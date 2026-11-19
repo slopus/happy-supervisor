@@ -220,6 +220,10 @@ pub const REGISTRY: &[(u64, &str, Role)] = &[
     (159, "rows", Role::Key),
     (160, "cols", Role::Key),
     (161, "exec.resize", Role::Kind),
+    (162, "identity", Role::Key),
+    (163, "supervisorUser", Role::Key),
+    (164, "workloadUser", Role::Key),
+    (165, "root", Role::Key),
 ];
 
 struct Names {

@@ -10,6 +10,7 @@ use crate::error::{Error, ErrorKind, Result};
 
 const INSTALLATION_ID: &str = "installation-id";
 const CREDENTIALS: &str = "credentials.json";
+const WORKLOAD_USER: &str = "workload-user";
 
 /// A running node's hold on its state directory. Released on drop, or when the process ends.
 #[derive(Debug)]
@@ -20,6 +21,8 @@ pub struct StateLock {
 #[derive(Clone, Debug)]
 pub struct StateDir {
     root: PathBuf,
+    /// `--workload-user`, which overrides `private/workload-user`.
+    workload_user: Option<String>,
 }
 
 impl StateDir {
@@ -30,7 +33,10 @@ impl StateDir {
             Some(dir) => dir,
             None => default_root()?,
         };
-        let state = StateDir { root };
+        let state = StateDir {
+            root,
+            workload_user: None,
+        };
         create_dir(&state.root, 0o700)?;
         create_dir(&state.private_dir(), 0o700)?;
         create_dir(&state.public_dir(), 0o755)?;
@@ -40,11 +46,49 @@ impl StateDir {
     /// A state directory at `root`, as is. For unit tests that need a `StateDir` without I/O.
     #[cfg(all(test, unix))]
     pub(crate) fn at(root: PathBuf) -> StateDir {
-        StateDir { root }
+        StateDir {
+            root,
+            workload_user: None,
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Runs the node's work as `user` (`--workload-user`) instead of the one in
+    /// `private/workload-user`.
+    pub fn with_workload_user(mut self, user: Option<String>) -> StateDir {
+        if user.is_some() {
+            self.workload_user = user;
+        }
+        self
+    }
+
+    /// The user every command, file operation and watch runs as: `--workload-user`, else the
+    /// first line of `private/workload-user`, which an installer writes. `None` runs them as
+    /// the supervisor's user.
+    pub fn workload_user(&self) -> Result<Option<String>> {
+        if let Some(user) = &self.workload_user {
+            return Ok(Some(user.clone()));
+        }
+        let path = self.private_dir().join(WORKLOAD_USER);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(text
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|user| !user.is_empty())
+                .map(str::to_owned)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(io_error(&path, err)),
+        }
+    }
+
+    /// Lets other users pass through the state directory (`0711`) to `public/`, which a
+    /// workload user's commands read. `private/` stays `0700`.
+    pub fn open_to_workload(&self) -> Result<()> {
+        create_dir(&self.root, 0o711)
     }
 
     /// Takes the directory for one running node (`run` or `serve`) until the [`StateLock`] is

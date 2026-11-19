@@ -159,6 +159,19 @@ fn network(policy: &ResolvedPolicy) -> (bool, bool, bool) {
     }
 }
 
+/// An `O_PATH` descriptor of `path`, for `--ro-bind-fd`.
+fn open_path(path: &Path) -> Result<OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(path)
+        .map_err(|err| {
+            Error::sandbox_unavailable(format!("cannot open {}: {err}", path.display()))
+        })?;
+    Ok(file.into())
+}
+
 fn unix_socket(endpoint: &Endpoint) -> Result<PathBuf> {
     match endpoint {
         Endpoint::Unix(path) => Ok(path.clone()),
@@ -181,12 +194,19 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
     let is_exec = matches!(job.op, JobOp::Exec { .. });
     let (isolated, local_bind, _) = network(policy);
     let mut args = HelperArgs::default();
-    let mut extra = vec![plan.exe.to_path_buf()];
+    let extra = [plan.exe.to_path_buf()];
+    let mut sockets = Vec::new();
     if let (Some(net), true) = (&plan.net, is_exec && isolated) {
         let (http, socks) = (unix_socket(&net.http)?, unix_socket(&net.socks)?);
-        extra.extend([http.clone(), socks.clone()]);
+        for path in [&http, &socks] {
+            sockets.push((open_path(path)?, path.clone()));
+        }
         args.bridge = Some((http, socks));
     }
+    let by_fd: Vec<(RawFd, PathBuf)> = sockets
+        .iter()
+        .map(|(fd, path)| (fd.as_raw_fd(), path.clone()))
+        .collect();
     let (netns, control) = if is_exec && isolated && local_bind {
         let (netns, control) = netns::pair()?;
         args.control = Some(control.as_raw_fd());
@@ -194,7 +214,7 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
     } else {
         (None, None)
     };
-    let mounts = mounts::Mounts::new(policy, placeholders.held(), &extra)?;
+    let mounts = mounts::Mounts::new(policy, placeholders.held(), &extra, &by_fd)?;
 
     let mut command = Command::new(&bwrap.path);
     command.args(["--unshare-user"]);
@@ -227,8 +247,9 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            if let Some(control) = &control {
-                let fd = control.as_raw_fd();
+            let inherited = control.iter().chain(sockets.iter().map(|(fd, _)| fd));
+            for fd in inherited {
+                let fd = fd.as_raw_fd();
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
                     return Err(std::io::Error::last_os_error());

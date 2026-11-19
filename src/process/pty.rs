@@ -70,6 +70,18 @@ impl Pty {
     }
 }
 
+impl Pty {
+    /// Makes the workload user the terminal's owner, as `grantpt` would have for that user, so a
+    /// command that reopens its terminal by name can.
+    pub(crate) fn give_to(&self, workload: &crate::identity::Workload) -> io::Result<()> {
+        // SAFETY: fchown acts on the descriptor only.
+        if unsafe { libc::fchown(self.slave.as_raw_fd(), workload.uid(), libc::gid_t::MAX) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 /// Sets the terminal's size; the command gets `SIGWINCH`.
 pub(crate) fn resize(master: &File, size: TtySize) -> io::Result<()> {
     let winsize = libc::winsize {

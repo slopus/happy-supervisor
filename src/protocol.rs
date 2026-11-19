@@ -1595,8 +1595,21 @@ pub struct NodeInfo {
     pub disks: Vec<DiskInfo>,
     pub gpus: Vec<GpuInfo>,
     pub sandbox: SandboxInfo,
+    pub identity: IdentityInfo,
     pub default_env: BTreeMap<String, String>,
     pub collected_at_ms: u64,
+}
+
+/// NodeInfo's `identity`: who the supervisor runs as, and who its work runs as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityInfo {
+    pub supervisor_user: String,
+    /// `--workload-user`: every command, file operation and watch runs as this user. `null`
+    /// when they run as the supervisor's user.
+    pub workload_user: Option<String>,
+    /// The supervisor runs as root (Unix) or with an elevated administrator token (Windows).
+    pub root: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1897,6 +1910,7 @@ mod tests {
               "32-bit x86 and x32 programs cannot run in the sandbox"
             ]
           },
+          "identity": { "supervisorUser": "root", "workloadUser": "happy-workload", "root": true },
           "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
           "collectedAtMs": 1763496000000u64
         })
@@ -2068,6 +2082,14 @@ mod tests {
         assert_eq!(info.sandbox.require_available(), Ok(()));
         assert_eq!(info.os.arch, Arch::X86_64);
         assert_eq!(info.gpus[0].vendor, GpuVendor::Nvidia);
+        assert_eq!(
+            info.identity,
+            IdentityInfo {
+                supervisor_user: "root".to_string(),
+                workload_user: Some("happy-workload".to_string()),
+                root: true
+            }
+        );
 
         let ready = json!({ "kind": "node.ready", "body": {
             "info": node_info_json(),

@@ -225,5 +225,27 @@ Task Scheduler) leave the Job Object.
 
 ## Raw access
 
-`{ "mode": "raw" }` access carries no policy and runs with the supervisor's rights. Raw processes
-are still killed as a tree.
+`{ "mode": "raw" }` access carries no policy and runs with the supervisor's rights, or with the
+workload user's when the node has one (below). Raw processes are still killed as a tree.
+
+## Workload user
+
+A supervisor running as root can run all of its work as one unprivileged user: `run` or `serve`
+with `--workload-user <name>`, or the name on the first line of `private/workload-user` in the
+state directory, which an installer writes. Every command, raw or sandboxed, and every file
+operation then runs with that user's uid, gid and supplementary groups, so the OS checks what
+it may read, write and run as that user, beneath any policy. NodeInfo `identity` reports it
+(node-info.md), so a control plane can refuse to share a node whose work would run as root.
+
+* The node refuses to start if the user does not exist, is root (uid 0), or the supervisor is
+  not root.
+* A command enters its `cwd` as that user. A raw file operation runs in the sandbox helper, as
+  that user and without a policy. A `tty` command's terminal belongs to that user.
+* The supervisor itself stays root. Its private state directory stays `0700`, and the state
+  directory becomes `0711` so the user can reach `public/ca-bundle.pem`. On Linux, bubblewrap
+  runs as the user, so unprivileged user namespaces must be allowed for it, and an isolated
+  command's proxy sockets are bound into its sandbox by descriptor, so no other process of the
+  user can reach them.
+* Not supported yet, and refused rather than run as root: watches (`sandbox_unavailable`),
+  `log.kind: "file"`, which the supervisor would write (`invalid_params`), and a workload user
+  on Windows, where the node does not start with one.

@@ -301,6 +301,10 @@ a4 0c 67 "build-1" 0d 66 "stdout" 09 50 <16 bytes> 0e 00
 | 159 | `rows` | key |
 | 160 | `cols` | key |
 | 161 | `exec.resize` | kind |
+| 162 | `identity` | key |
+| 163 | `supervisorUser` | key |
+| 164 | `workloadUser` | key |
+| 165 | `root` | key |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -562,8 +566,9 @@ Every exec, file and watch command carries `access`. It is one of two shapes:
     "network": { "mode": "host", "localBind": false, "unixSockets": false } } }
 ```
 
-`raw` runs with the supervisor's full rights. `sandboxed` runs confined by the policy, enforced
-by the operating system. The full policy rules are in policy.md. A node that cannot enforce
+`raw` runs with the supervisor's full rights, or with its workload user's when it has one
+(policy.md, Workload user; NodeInfo `identity`). `sandboxed` runs confined by the policy,
+enforced by the operating system, as the same user. The full policy rules are in policy.md. A node that cannot enforce
 sandboxing replies to sandboxed commands with `sandbox_unavailable`. It never falls back to raw.
 
 ## Node
@@ -783,7 +788,8 @@ output is the least useful.
   to 64 MiB and may be at most 1 GiB. The parent directory must exist. The node never creates
   directories for a log. The file is created, or truncated if it exists. Under a sandbox, `path`
   must be writable by the policy, and the node checks that against the policy before starting.
-  The node writes the log itself, not the sandboxed process. When the middle is dropped, the
+  The node writes the log itself, not the sandboxed process. A node with a workload user does
+  not support file logs yet and replies `invalid_params`. When the middle is dropped, the
   node rewrites the file as the head, one line `[happy-supervisor: N bytes omitted]` (`N` is
   every byte dropped so far), then the tail, by writing `<name>.happy-supervisor-tmp` beside it
   and renaming it over. The line follows the head's last byte directly, even mid-line.
@@ -890,6 +896,8 @@ runs through a symlink (on macOS, `/tmp/x` is reported as `/tmp/x/…`, not `/pr
 On Linux each watch holds one inotify instance and, when recursive, one inotify watch per
 directory. The OS caps both per user (`fs.inotify.max_user_instances`, by default 128, and
 `fs.inotify.max_user_watches`). A start that hits a cap replies `io`.
+
+A node with a workload user does not support watches yet and replies `sandbox_unavailable`.
 
 ### `watch.stop`
 

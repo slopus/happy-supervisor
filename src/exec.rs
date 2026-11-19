@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use self::log::{FileLog, Log, MemoryLog};
 use crate::error::{Error, ErrorKind, Result};
+use crate::identity::Workload;
 use crate::link::Outbox;
 use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::process::{self, Tree};
@@ -46,6 +47,8 @@ struct Inner {
     outbox: Outbox,
     table: Mutex<Table>,
     memory_budget: u64,
+    /// Every command runs as this user (`--workload-user`).
+    workload: Option<Arc<Workload>>,
 }
 
 #[derive(Default)]
@@ -174,8 +177,17 @@ impl ExecManager {
                 outbox,
                 table: Mutex::default(),
                 memory_budget,
+                workload: None,
             }),
         }
+    }
+
+    /// Runs every command as `workload` (identity.rs). Call before the first start.
+    pub fn run_as(mut self, workload: Option<Arc<Workload>>) -> ExecManager {
+        Arc::get_mut(&mut self.inner)
+            .expect("run_as is called on a new ExecManager")
+            .workload = workload;
+        self
     }
 
     /// Starts a command. Sandboxed ones go through `sandbox::prepare` and the helper.
@@ -499,6 +511,14 @@ impl Inner {
             env.extend(proxy.env(&crate::helper::exe()?));
         }
         let program = resolve_program(argv.program(), &env)?;
+        let workload = self.workload.as_deref();
+        if let (Some(workload), LogSpec::File { .. }) = (workload, &log) {
+            return Err(Error::invalid_params(format!(
+                "this node runs its commands as {:?}, and file logs, which the supervisor \
+                 writes, are not supported with a workload user yet: use a memory log",
+                workload.name()
+            )));
+        }
         let log = open_log(&log, confinement)?;
         let (
             Spawned {
@@ -510,7 +530,7 @@ impl Inner {
             tunnel,
         ) = match confinement {
             Confinement::Raw => (
-                spawn_raw(&program, &argv, &cwd, &env, io)?,
+                spawn_raw(&program, &argv, &cwd, &env, io, workload)?,
                 None,
                 Some(TunnelRoute::Loopback),
             ),
@@ -522,8 +542,11 @@ impl Inner {
                     }),
                     _ => None,
                 };
+                let mut resolved = vec![program.to_string_lossy().into_owned()];
+                resolved.extend(argv.args().iter().cloned());
+                let argv = Argv::try_from(resolved)?;
                 let (spawned, (placeholders, netns)) =
-                    spawn_sandboxed(policy, net, &program, &argv, &cwd, env, io)?;
+                    spawn_sandboxed(policy, net, argv, &cwd, env, io, workload)?;
                 let tunnel = policy.network().local_bind().then(|| match netns {
                     Some(netns) => TunnelRoute::Netns(Arc::new(netns)),
                     None => TunnelRoute::Loopback,
@@ -886,6 +909,7 @@ fn spawn_raw(
     cwd: &AbsPath,
     env: &BTreeMap<String, String>,
     io: Io,
+    workload: Option<&Workload>,
 ) -> Result<Spawned> {
     if !cwd.as_path().is_dir() {
         return Err(Error::not_found(format!(
@@ -896,9 +920,12 @@ fn spawn_raw(
     let mut command = Command::new(program);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::arg0(&mut command, argv.program());
+    command.args(argv.args());
+    // A workload user enters `cwd` itself, after becoming that user.
+    if workload.is_none() {
+        command.current_dir(cwd.as_path());
+    }
     command
-        .args(argv.args())
-        .current_dir(cwd.as_path())
         .env_clear()
         .envs(env)
         .stdin(match io {
@@ -916,6 +943,11 @@ fn spawn_raw(
     if let Some(pty) = &pty {
         pty.attach(&mut command, false)?;
     }
+    #[cfg(unix)]
+    if let (Some(workload), Some(pty)) = (workload, &pty) {
+        pty.give_to(workload)?;
+    }
+    crate::identity::run_as(&mut command, workload, Some(cwd.as_path()))?;
     let child = command.spawn().map_err(|err| {
         let message = format!("cannot run {}: {err}", program.display());
         Error::new(Error::from(err).kind, message)
@@ -951,20 +983,18 @@ fn adopt(mut child: Child) -> Result<Spawned> {
 fn spawn_sandboxed(
     policy: &ResolvedPolicy,
     net: Option<NetPlan>,
-    program: &Path,
-    argv: &Argv,
+    argv: Argv,
     cwd: &AbsPath,
     env: BTreeMap<String, String>,
     io: Io,
+    workload: Option<&Workload>,
 ) -> Result<(Spawned, Held)> {
     use crate::helper::{Job, JobOp};
 
-    let mut resolved = vec![program.to_string_lossy().into_owned()];
-    resolved.extend(argv.args().iter().cloned());
     let job = Job {
         policy: policy.clone(),
         op: JobOp::Exec {
-            argv: Argv::try_from(resolved)?,
+            argv,
             cwd: cwd.clone(),
             env,
         },
@@ -976,14 +1006,20 @@ fn spawn_sandboxed(
         exe: &exe,
     };
     let prepared = crate::sandbox::prepare(&plan, &job)?;
-    let spawned = spawn_helper(prepared.command, &crate::helper::encode_job(&job), io)?;
+    let frame = crate::helper::encode_job(&job);
+    let spawned = spawn_helper(prepared.command, &frame, io, workload)?;
     Ok((spawned, (prepared.placeholders, prepared.netns)))
 }
 
 /// With `tty`, the terminal is the helper's stdout and stderr and its controlling terminal; the
 /// helper makes it the command's stdin too, once it has read the job.
 #[cfg(unix)]
-fn spawn_helper(mut command: Command, frame: &[u8], io: Io) -> Result<Spawned> {
+fn spawn_helper(
+    mut command: Command,
+    frame: &[u8],
+    io: Io,
+    workload: Option<&Workload>,
+) -> Result<Spawned> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
@@ -1002,6 +1038,10 @@ fn spawn_helper(mut command: Command, frame: &[u8], io: Io) -> Result<Spawned> {
     if let Some(pty) = &pty {
         pty.attach(&mut command, true)?;
     }
+    if let (Some(workload), Some(pty)) = (workload, &pty) {
+        pty.give_to(workload)?;
+    }
+    crate::identity::run_as(&mut command, workload, None)?;
     let child = command.spawn();
     drop((status_writer, command));
     let Spawned {
@@ -1032,7 +1072,15 @@ fn spawn_helper(mut command: Command, frame: &[u8], io: Io) -> Result<Spawned> {
 /// Windows passes the status pipe's write end by duplicating it into the suspended helper and
 /// telling it the handle in a preamble on stdin (`helper::STATUS_MAGIC`).
 #[cfg(windows)]
-fn spawn_helper(mut command: Command, frame: &[u8], io: Io) -> Result<Spawned> {
+fn spawn_helper(
+    mut command: Command,
+    frame: &[u8],
+    io: Io,
+    workload: Option<&Workload>,
+) -> Result<Spawned> {
+    if let Some(workload) = workload {
+        match *workload {}
+    }
     let (mut status, status_writer) = std::io::pipe()?;
     command
         .stdin(Stdio::piped())
@@ -1179,7 +1227,7 @@ mod tests {
         std::fs::write(&status, crate::wire::to_cbor(&reported)).unwrap();
         let mut fails = Command::new("/bin/sh");
         fails.args(["-c", r#"cat "$0" >&3; exit 127"#]).arg(&status);
-        let err = spawn_helper(fails, b"frame", Io::Pipes { stdin: false })
+        let err = spawn_helper(fails, b"frame", Io::Pipes { stdin: false }, None)
             .err()
             .unwrap();
         assert_eq!(err, Error::not_found("no such program"));
@@ -1187,7 +1235,7 @@ mod tests {
         let mut execs = Command::new("/bin/sh");
         execs.args(["-c", "exec 3>&-; dd bs=5 count=1 >/dev/null 2>&1; exec cat"]);
         let Spawned { mut child, .. } =
-            spawn_helper(execs, b"frame", Io::Pipes { stdin: true }).unwrap();
+            spawn_helper(execs, b"frame", Io::Pipes { stdin: true }, None).unwrap();
         child
             .stdin
             .take()

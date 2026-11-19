@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
+use crate::identity::Identity;
 use crate::protocol::{Arch, CpuInfo, MemoryInfo, NodeInfo, SandboxInfo};
 
 /// The cutoff for every external probe (`nvidia-smi`, `system_profiler`, PowerShell).
@@ -33,7 +34,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Collects NodeInfo. Blocking, at most 5 s; call it from `spawn_blocking`. `name` defaults to
 /// the hostname. Probes that fail leave their field null or empty.
-pub fn collect(installation_id: &str, name: Option<&str>, sandbox: &SandboxInfo) -> NodeInfo {
+pub fn collect(
+    installation_id: &str,
+    name: Option<&str>,
+    sandbox: &SandboxInfo,
+    identity: &Identity,
+) -> NodeInfo {
     let gpus = std::thread::spawn(gpu::probe);
     let os = platform::os();
     let disks = platform::disks();
@@ -69,14 +75,16 @@ pub fn collect(installation_id: &str, name: Option<&str>, sandbox: &SandboxInfo)
         disks,
         gpus: gpus.join().unwrap_or_default(),
         sandbox: sandbox.clone(),
-        default_env: default_env(),
+        identity: identity.info(),
+        default_env: default_env(identity),
         collected_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64),
     }
 }
 
-fn default_env() -> BTreeMap<String, String> {
+/// With a workload user, `HOME` and `USER` are that user's.
+fn default_env(identity: &Identity) -> BTreeMap<String, String> {
     let keys: &[&str] = if cfg!(windows) {
         &[
             "PATH",
@@ -92,6 +100,7 @@ fn default_env() -> BTreeMap<String, String> {
     };
     keys.iter()
         .filter_map(|key| Some((key.to_string(), std::env::var(key).ok()?)))
+        .chain(identity.workload_env())
         .collect()
 }
 

@@ -8,6 +8,7 @@
 //! empty read-only file (`/dev/null`).
 
 use std::ffi::OsString;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -43,6 +44,10 @@ pub enum Mount {
     EmptyDir(PathBuf),
     /// `--ro-bind /dev/null`, which a bind mount makes `nodev`: opening it fails with `EACCES`.
     EmptyFile(PathBuf),
+    /// `--ro-bind-fd`: the host file the supervisor opened, bound by descriptor, so bubblewrap
+    /// needs no access to the path it came from (the proxy sockets in the private state
+    /// directory, when bubblewrap runs as the workload user).
+    BindFd { fd: RawFd, path: PathBuf },
     /// `--symlink`: a symlink at the top of an empty root, copied from the host's, such as
     /// `/bin -> usr/bin`. The policy names canonical paths, so it never mounts these itself.
     Symlink { path: PathBuf, target: PathBuf },
@@ -52,6 +57,7 @@ impl Mount {
     fn path(&self) -> &Path {
         match self {
             Mount::Bind { path, .. }
+            | Mount::BindFd { path, .. }
             | Mount::EmptyDir(path)
             | Mount::EmptyFile(path)
             | Mount::Symlink { path, .. } => path,
@@ -98,12 +104,13 @@ pub fn missing_denies(policy: &ResolvedPolicy) -> Vec<PathBuf> {
 
 impl Mounts {
     /// The mounts for `policy`, with `placeholders` standing in for missing denied paths, and
-    /// `extra` host files bound read-only on top of everything (the helper binary, the proxy
-    /// sockets).
+    /// `extra` host files (the helper binary) and `by_fd` opened ones (the proxy sockets) bound
+    /// read-only on top of everything.
     pub fn new(
         policy: &ResolvedPolicy,
         placeholders: &[Placeholder],
         extra: &[PathBuf],
+        by_fd: &[(RawFd, PathBuf)],
     ) -> Result<Mounts> {
         let mut mounts = Vec::new();
         for path in rule_paths(policy) {
@@ -148,6 +155,12 @@ impl Mounts {
                 writable: false,
             });
         }
+        for (fd, path) in by_fd {
+            mounts.push(Mount::BindFd {
+                fd: *fd,
+                path: path.clone(),
+            });
+        }
         let root = Access::of(policy, Path::new("/"));
         if root == Access::Hidden {
             mounts.extend(root_symlinks(policy));
@@ -169,6 +182,10 @@ impl Mounts {
                 Mount::Bind { path, writable } => {
                     let flag = if *writable { "--bind" } else { "--ro-bind" };
                     push(&[flag.as_ref(), path.as_os_str(), path.as_os_str()]);
+                }
+                Mount::BindFd { fd, path } => {
+                    let fd = fd.to_string();
+                    push(&["--ro-bind-fd".as_ref(), fd.as_ref(), path.as_os_str()])
                 }
                 Mount::EmptyDir(path) => push(&["--tmpfs".as_ref(), path.as_os_str()]),
                 Mount::EmptyFile(path) => {

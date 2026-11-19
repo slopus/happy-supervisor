@@ -1,3 +1,4 @@
+use happy_supervisor::identity::Identity;
 use happy_supervisor::node_info::collect;
 use happy_supervisor::protocol::{Mechanism, SandboxInfo, SandboxStatus};
 
@@ -12,13 +13,23 @@ fn unavailable_sandbox() -> SandboxInfo {
     }
 }
 
+fn identity() -> Identity {
+    Identity::resolve(None).unwrap()
+}
+
 #[test]
 fn identity_and_sandbox_pass_through_unchanged() {
     let sandbox = unavailable_sandbox();
-    let info = collect("tz4a98xxat96iws9zmbrgj3a", Some("build-box-3"), &sandbox);
+    let info = collect(
+        "tz4a98xxat96iws9zmbrgj3a",
+        Some("build-box-3"),
+        &sandbox,
+        &identity(),
+    );
     assert_eq!(info.installation_id, "tz4a98xxat96iws9zmbrgj3a");
     assert_eq!(info.name, "build-box-3");
     assert_eq!(info.sandbox, sandbox);
+    assert_eq!(info.identity, identity().info());
     assert_eq!(info.supervisor_version, env!("CARGO_PKG_VERSION"));
 }
 
@@ -43,7 +54,12 @@ mod on_this_machine {
             .unwrap()
             .as_millis() as u64;
         let started = Instant::now();
-        let info = collect("tz4a98xxat96iws9zmbrgj3a", None, &unavailable_sandbox());
+        let info = collect(
+            "tz4a98xxat96iws9zmbrgj3a",
+            None,
+            &unavailable_sandbox(),
+            &identity(),
+        );
         let elapsed = started.elapsed();
         assert!(elapsed.as_secs_f64() < 5.0, "collection took {elapsed:?}");
         let after = SystemTime::now()

@@ -3,11 +3,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use happy_supervisor::client::{self, RunExit};
+use happy_supervisor::identity::Identity;
 use happy_supervisor::state::StateDir;
 use happy_supervisor::{Error, ErrorKind, enroll, helper, node_info, sandbox, serve};
 
-/// The argument that makes this binary the sandbox helper.
-const HELPER_ARG: &str = "__sandbox";
 /// The argument that makes this binary an isolated command's SSH `ProxyCommand` (proxy.md).
 const CONNECT_ARG: &str = "__connect";
 
@@ -41,6 +40,10 @@ enum Command {
     Run {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Run every command, file operation and watch as this user (Unix, supervisor running
+        /// as root). Overrides `private/workload-user` in the state directory.
+        #[arg(long)]
+        workload_user: Option<String>,
     },
     /// Listen for a control plane instead of dialing one (docs/serve.md). Prints
     /// `listening <addr>` once connections are accepted.
@@ -53,6 +56,9 @@ enum Command {
         token_file: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// As for `run`.
+        #[arg(long)]
+        workload_user: Option<String>,
     },
     /// Create the Windows sandbox's accounts and firewall filters. Run once, as an
     /// administrator, as the account that runs the supervisor.
@@ -69,7 +75,7 @@ fn main() -> ExitCode {
     // The helper must start before any runtime or thread exists (docs/architecture.md).
     if std::env::args_os()
         .nth(1)
-        .is_some_and(|arg| arg == HELPER_ARG)
+        .is_some_and(|arg| arg == helper::HELPER_ARG)
     {
         helper::main();
     }
@@ -119,7 +125,11 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Run { state_dir } => match client::run(StateDir::open(state_dir)?).await? {
+        Command::Run {
+            state_dir,
+            workload_user,
+        } => match client::run(StateDir::open(state_dir)?.with_workload_user(workload_user)).await?
+        {
             RunExit::Revoked => {
                 eprintln!("happy-supervisor: the control plane revoked this node's credential");
                 Ok(ExitCode::from(3))
@@ -130,10 +140,11 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
             listen,
             token_file,
             state_dir,
+            workload_user,
         } => {
             let listen = listen.parse()?;
             let token = serve::read_token(&token_file)?;
-            let state = StateDir::open(state_dir)?;
+            let state = StateDir::open(state_dir)?.with_workload_user(workload_user);
             let listening = |addr: String| {
                 use std::io::Write as _;
                 println!("listening {addr}");
@@ -150,10 +161,12 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
                 let installation_id = state.installation_id()?;
                 let name = state.credentials()?.map(|c| c.name);
                 let sandbox = sandbox::probe();
+                let identity = Identity::resolve(state.workload_user()?.as_deref())?;
                 Ok::<_, Error>(node_info::collect(
                     &installation_id,
                     name.as_deref(),
                     &sandbox,
+                    &identity,
                 ))
             })
             .await

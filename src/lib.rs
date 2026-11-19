@@ -21,6 +21,8 @@ pub mod exec;
 pub mod fs;
 #[cfg(feature = "node")]
 pub mod helper;
+#[cfg(feature = "node")]
+pub mod identity;
 pub mod link;
 #[cfg(feature = "node")]
 pub mod node_info;

@@ -78,6 +78,9 @@ pub struct Prepared {
     /// Linux, isolated with `localBind`: how `tcp.open` with this exec's `execId` reaches its
     /// network namespace (tunnels.md).
     pub netns: Option<NetnsControl>,
+    /// Linux, an exec without `localBind`: the addresses its sandbox refused to bind
+    /// (api.md, `net.bindDenied`).
+    pub binds: Option<BindReports>,
 }
 
 impl Prepared {
@@ -86,12 +89,25 @@ impl Prepared {
             command,
             placeholders: Placeholders::default(),
             netns: None,
+            binds: None,
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::NetnsControl;
+pub use linux::{BindReports, NetnsControl};
+
+/// The addresses an exec's sandbox refused to bind. Only Linux reports them.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub enum BindReports {}
+
+#[cfg(not(target_os = "linux"))]
+impl BindReports {
+    pub fn next(&self) -> Option<SocketAddr> {
+        match *self {}
+    }
+}
 
 /// The node's side of the control socket to a sandbox helper that owns a network namespace.
 /// Only Linux isolates an exec's network in a namespace of its own.

@@ -4,10 +4,11 @@
 //! [`prepare`] makes the placeholders the policy needs and returns
 //! `bwrap <namespaces> <mounts> -- <exe> __sandbox [helper args]`. Inside, the helper calls
 //! [`enter`]: in an isolated exec it first starts the proxy bridge and the `tcp.open` control
-//! server and forks, the parent staying to serve them; then it joins the command's limits cgroup
-//! (`Plan::cgroup`), so bubblewrap and the bridge stay outside it, restores `SIGTERM`, denies TCP
-//! binding with Landlock where the policy asks, installs the seccomp filters, and returns so the
-//! helper execs the command or performs the file operation.
+//! server, and in an exec whose binds seccomp refuses it takes the report socket (`binds`); with
+//! any of those it forks, the parent staying to serve them. Then it joins the command's limits
+//! cgroup (`Plan::cgroup`), so bubblewrap and the bridge stay outside it, restores `SIGTERM`,
+//! denies TCP binding with Landlock where the policy asks, installs the seccomp filters, and
+//! returns so the helper execs the command or performs the file operation.
 //!
 //! The sandbox stays in the node's process group (no `--new-session`), so the node's `killpg`
 //! reaches the command. bubblewrap forwards no signal, so [`prepare`] has it ignore `SIGTERM`
@@ -16,6 +17,7 @@
 //! node already made bubblewrap a session leader with no controlling terminal, and seccomp
 //! refuses `TIOCSTI`, so sharing the session gives the command no terminal to type into.
 
+mod binds;
 mod bridge;
 mod mounts;
 mod netns;
@@ -38,6 +40,7 @@ use crate::protocol::{Mechanism, SandboxInfo, SandboxStatus};
 use crate::sandbox::placeholders::Placeholders;
 use crate::sandbox::{Endpoint, Plan, Prepared};
 
+pub use binds::BindReports;
 pub use netns::NetnsControl;
 
 /// The oldest bubblewrap with `--disable-userns`.
@@ -54,6 +57,8 @@ struct HelperArgs {
     control: Option<RawFd>,
     /// `cgroup.procs` of the command's limits cgroup, written to just before the exec.
     cgroup: Option<RawFd>,
+    /// The helper's end of the socket that reports refused binds to the node (`binds`).
+    binds: Option<RawFd>,
 }
 
 impl HelperArgs {
@@ -73,6 +78,9 @@ impl HelperArgs {
         if let Some(fd) = self.cgroup {
             args.extend(["--cgroup".into(), fd.to_string().into()]);
         }
+        if let Some(fd) = self.binds {
+            args.extend(["--binds".into(), fd.to_string().into()]);
+        }
         args
     }
 
@@ -91,6 +99,7 @@ impl HelperArgs {
                 "--socks" => socks = Some(fd),
                 "--control" => parsed.control = Some(fd),
                 "--cgroup" => parsed.cgroup = Some(fd),
+                "--binds" => parsed.binds = Some(fd),
                 _ => return Err(bad("an unknown flag")),
             }
         }
@@ -226,7 +235,7 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
     .map_err(|err| Error::sandbox_unavailable(format!("cannot make a placeholder: {err}")))?;
 
     let is_exec = matches!(job.op, JobOp::Exec { .. });
-    let (isolated, local_bind, _) = network(policy);
+    let (isolated, local_bind, unix_sockets) = network(policy);
     let mut args = HelperArgs::default();
     let mut sockets = Vec::new();
     if let (Some(net), true) = (&plan.net, is_exec && isolated) {
@@ -250,6 +259,18 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
         (Some(netns), Some(control))
     } else {
         (None, None)
+    };
+    // Only where seccomp refuses bind does a listener decide it (binds.rs).
+    let seccomp_binds =
+        BindDenial::plan(local_bind, unix_sockets, landlock_abi()) == BindDenial::Seccomp;
+    let binds = if is_exec && seccomp_binds {
+        let (binds, helper) = binds::pair()?;
+        let helper = high(helper.as_fd())?;
+        args.binds = Some(helper.as_raw_fd());
+        sockets.push(helper);
+        Some(binds)
+    } else {
+        None
     };
     let mounts = mounts::Mounts::new(policy, placeholders.held(), &[plan.exe.to_path_buf()])?;
 
@@ -299,6 +320,7 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
         command,
         placeholders,
         netns,
+        binds,
     })
 }
 
@@ -335,26 +357,48 @@ pub fn enter(policy: &ResolvedPolicy) -> Result<()> {
     if let Some(control) = &control {
         set_cloexec(control.as_raw_fd())?;
     }
+    // SAFETY: as for `control`.
+    let reports = args.binds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
     for fd in args
         .bridge
         .iter()
         .flat_map(|(http, socks)| [*http, *socks])
         .chain(args.cgroup)
+        .chain(args.binds)
     {
         set_cloexec(fd)?;
     }
-    if args.bridge.is_some() || control.is_some() {
+    let (isolated, local_bind, unix_sockets) = network(policy);
+    let denial = BindDenial::plan(local_bind, unix_sockets, landlock_abi());
+    // Only where seccomp refuses bind does a listener decide it (binds.rs).
+    let reports = reports.filter(|_| denial == BindDenial::Seccomp);
+    let (handoff, mut hand_over) = match reports {
+        Some(_) => {
+            let (parent, child) = binds::handoff()?;
+            (Some(parent), Some(child))
+        }
+        None => (None, None),
+    };
+    if args.bridge.is_some() || control.is_some() || reports.is_some() {
         let bridge = match args.bridge {
             Some((http, socks)) => Some(bridge::Bridge::bind(http, socks).map_err(|err| {
                 Error::sandbox_unavailable(format!("cannot start the proxy bridge: {err}"))
             })?),
             None => None,
         };
+        // Not dumpable from before the fork: the command, as the same user, could otherwise
+        // write the parent half's memory through /proc, or take its descriptors (pidfd_getfd)
+        // before it got there. The command's exec makes it dumpable again.
+        // SAFETY: prctl on this process's own attribute has no memory effects.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
         // SAFETY: the helper has started no thread, so the child may run any code.
         match unsafe { libc::fork() } {
             -1 => return Err(std::io::Error::last_os_error().into()),
-            0 => drop((bridge, control)),
-            child => supervise(child, bridge, control),
+            0 => drop((bridge, control, reports, handoff)),
+            child => {
+                drop(hand_over);
+                supervise(child, bridge, control, reports.zip(handoff))
+            }
         }
     }
     if let Some(fd) = args.cgroup {
@@ -364,15 +408,15 @@ pub fn enter(policy: &ResolvedPolicy) -> Result<()> {
     }
     // SAFETY: restoring the default action has no memory effects.
     unsafe { libc::signal(libc::SIGTERM, libc::SIG_DFL) };
-    let (isolated, local_bind, unix_sockets) = network(policy);
-    let denial = BindDenial::plan(local_bind, unix_sockets, landlock_abi());
     if denial == BindDenial::Landlock {
         deny_tcp_bind()?;
     }
+    let bind_notified = hand_over.take().is_some_and(binds::hand_over);
     seccomp::apply(seccomp::NetRules {
         isolated,
         unix_sockets,
         deny_bind: denial == BindDenial::Seccomp,
+        bind_notified,
     })
 }
 
@@ -386,25 +430,32 @@ fn set_cloexec(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// The helper's parent half in an isolated exec. Never returns.
-fn supervise(child: libc::pid_t, bridge: Option<bridge::Bridge>, control: Option<OwnedFd>) -> ! {
-    // SAFETY: plain calls on descriptor numbers and process attributes. The status pipe on fd 3
-    // belongs to the child now; this process never returns to the code that owns its File.
-    // Not dumpable: the command, as the same user, could otherwise write this unfiltered
-    // process's memory through /proc.
+/// The helper's parent half, outside every filter: serves the bridge and the control socket of
+/// an isolated exec, and answers the binds the command makes (`reports`, the node's socket and
+/// the listener's handoff). Never returns.
+fn supervise(
+    child: libc::pid_t,
+    bridge: Option<bridge::Bridge>,
+    control: Option<OwnedFd>,
+    reports: Option<(OwnedFd, OwnedFd)>,
+) -> ! {
+    // SAFETY: plain calls on descriptor numbers. The status pipe on fd 3 belongs to the child
+    // now; this process never returns to the code that owns its File.
     unsafe {
         libc::close(helper::STATUS_FD);
         let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         for fd in 0..3 {
             libc::dup2(null, fd);
         }
-        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
     if let Some(bridge) = bridge {
         bridge.spawn();
     }
     if let Some(control) = control {
         std::thread::spawn(move || netns::serve(control));
+    }
+    if let Some((node, handoff)) = reports {
+        std::thread::spawn(move || binds::serve(handoff, node));
     }
     let mut status = 0;
     loop {
@@ -651,6 +702,7 @@ mod tests {
             bridge: Some((10, 12)),
             control: Some(11),
             cgroup: Some(13),
+            binds: Some(14),
         };
         let args = both.to_args();
         assert_eq!(
@@ -663,7 +715,9 @@ mod tests {
                 "--control",
                 "11",
                 "--cgroup",
-                "13"
+                "13",
+                "--binds",
+                "14"
             ]
         );
         assert_eq!(HelperArgs::parse(args).unwrap(), both);

@@ -142,7 +142,7 @@ union ControlBuffer {
     bytes: [u8; 64],
 }
 
-fn send(fd: RawFd, data: &[u8], pass: Option<RawFd>) -> io::Result<()> {
+pub(super) fn send(fd: RawFd, data: &[u8], pass: Option<RawFd>) -> io::Result<()> {
     let mut iov = libc::iovec {
         iov_base: data.as_ptr().cast_mut().cast(),
         iov_len: data.len(),
@@ -183,7 +183,7 @@ fn send(fd: RawFd, data: &[u8], pass: Option<RawFd>) -> io::Result<()> {
 }
 
 /// Receives one message into `data`, and the descriptor it carried, if any.
-fn recv(fd: RawFd, data: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
+pub(super) fn recv(fd: RawFd, data: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr().cast(),
         iov_len: data.len(),

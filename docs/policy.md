@@ -190,6 +190,18 @@ What a command sees on Linux:
 * Creating, renaming or removing an entry in a write-denied directory fails with `EROFS`.
 * A missing deny path behaves the same at its placeholder: a file placeholder as a read-denied
   file, a directory placeholder as a read- and write-denied directory.
+* With `localBind: false`, `bind` fails with `EPERM` where seccomp refuses it (`unixSockets:
+  false`, or a kernel before 6.7), and with `EACCES` where Landlock does. Where seccomp refuses it,
+  the node also sends `net.bindDenied` with the TCP or UDP address and port (api.md), so the
+  control plane can tell the command it needs `localBind`. To do that, `bind` goes to a seccomp
+  user notification that the sandbox helper's parent half, outside the filter, answers with
+  `EPERM`; if that listener is gone, `bind` fails with `ENOSYS` instead. A process whose seccomp
+  filters already have a listener (Linux allows one), or a kernel before 5.0, gets the plain
+  refusal and no event.
+* In isolated mode, connecting to `127.0.0.1` or `::1` reaches the sandbox's own loopback, where
+  nothing but the proxies listens unless the command does, so a client that bypasses the proxy
+  for loopback (`NO_PROXY`) gets `ECONNREFUSED`. The node does not report it: that would put
+  every `connect`, each one to the proxies included, through a seccomp notification.
 * If bubblewrap itself fails to set up the sandbox, the command is reported as exiting with
   code 1.
 

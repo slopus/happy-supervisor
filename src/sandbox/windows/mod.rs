@@ -165,6 +165,7 @@ pub fn prepare(plan: &Plan, _job: &Job) -> Result<Prepared> {
         command,
         placeholders,
         netns: None,
+        binds: None,
     })
 }
 

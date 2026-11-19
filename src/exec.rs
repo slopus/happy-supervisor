@@ -1,8 +1,9 @@
 //! Running commands (`exec.*`). Owned by the exec track; the scaffold froze the signatures.
 //!
-//! Each started process gets two reader threads (stdout, stderr) and one waiter thread. The
-//! readers append to the process's [`Output`] and stream chunks through the [`Outbox`]. The
-//! waiter reports the exit once both readers are done. The [`Table`] maps IDs to [`Phase`]s.
+//! Each started process gets two reader threads (stdout, stderr) and one waiter thread, and a
+//! sandboxed one whose binds the sandbox reports a third reader. The readers append to the
+//! process's [`Output`] and stream chunks, or send `net.bindDenied`, through the [`Outbox`]. The
+//! waiter reports the exit once every reader is done. The [`Table`] maps IDs to [`Phase`]s.
 //! Locks are always taken table first, then a process's output.
 
 pub(crate) mod log;
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use self::log::{FileLog, Log, MemoryLog};
 use crate::error::{Error, ErrorKind, Result};
@@ -26,10 +27,11 @@ use crate::protocol::{
     AbsPath, Argv, Bytes, ExecId, ExecLogParams, ExecLogResult, ExecResizeParams, ExecStartParams,
     ExecStartResult, ExecState, ExecSummary, ExecWriteParams, ExitStatus, KillSignal, Limits,
     LogSpec, MAX_EXEC_LOG_READ_BYTES, MAX_EXEC_WRITE_BYTES, MAX_OUTPUT_CHUNK_BYTES,
-    MEMORY_LOG_BUDGET_BYTES, RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction, TtySize,
+    MEMORY_LOG_BUDGET_BYTES, NetBindDenied, RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction,
+    TtySize,
 };
-use crate::proxy::egress::CommandProxy;
-use crate::sandbox::{NetPlan, NetnsControl, Placeholders};
+use crate::proxy::egress::{Admit, CommandProxy, Limiter};
+use crate::sandbox::{BindReports, NetPlan, NetnsControl, Placeholders};
 
 /// What `exec.write` with `eof` sends to a terminal: Ctrl-D, its default end-of-file character.
 const EOF_CHARACTER: u8 = 0x04;
@@ -101,7 +103,7 @@ struct Running {
 }
 
 /// What [`crate::sandbox::prepare`] returned besides the command.
-type Held = (Placeholders, Option<NetnsControl>);
+type Held = (Placeholders, Option<NetnsControl>, Option<BindReports>);
 
 /// How `tcp.open` with a process's `execId` reaches `127.0.0.1` as the process sees it
 /// (tunnels.md).
@@ -544,11 +546,13 @@ impl Inner {
             },
             placeholders,
             tunnel,
+            binds,
         ) = match confinement {
             Confinement::Raw => (
                 spawn_raw(&program, &argv, &cwd, &env, io, workload, bounds)?,
                 None,
                 Some(TunnelRoute::Loopback),
+                None,
             ),
             Confinement::Sandboxed(policy) => {
                 let net = match (policy.network(), &proxy) {
@@ -566,13 +570,13 @@ impl Inner {
                     env,
                     limits,
                 };
-                let (spawned, (placeholders, netns)) =
+                let (spawned, (placeholders, netns, binds)) =
                     spawn_sandboxed(policy, net, op, io, workload, bounds)?;
                 let tunnel = policy.network().local_bind().then(|| match netns {
                     Some(netns) => TunnelRoute::Netns(Arc::new(netns)),
                     None => TunnelRoute::Loopback,
                 });
-                (spawned, Some(placeholders), tunnel)
+                (spawned, Some(placeholders), tunnel, binds)
             }
         };
 
@@ -592,6 +596,7 @@ impl Inner {
                 (Stream::Stderr, boxed(child.stderr.take().expect("piped"))),
             ],
         };
+        let mut readers = pipes.len();
         for (stream, pipe) in pipes {
             let reader = Reader {
                 outbox: self.outbox.clone(),
@@ -609,6 +614,20 @@ impl Inner {
                 return Err(err.into());
             }
         }
+        if let Some(binds) = binds {
+            let outbox = self.outbox.clone();
+            let exec_id = exec_id.clone();
+            let done = done_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("exec-binds".to_string())
+                .spawn(move || report_binds(&binds, &outbox, &exec_id, &done));
+            if let Err(err) = spawned {
+                let _ = tree.signal(KillSignal::Kill);
+                let _ = child.wait();
+                return Err(err.into());
+            }
+            readers += 1;
+        }
         drop(done_tx);
 
         let pid = child.id();
@@ -619,6 +638,7 @@ impl Inner {
             exec_id: exec_id.clone(),
             output: output.clone(),
             done: done_rx,
+            readers,
             cgroup,
         };
         if let Err(err) = std::thread::Builder::new()
@@ -748,12 +768,32 @@ impl Reader {
     }
 }
 
+/// Sends `net.bindDenied` for every bind the process's sandbox refused, rate-limited like
+/// `net.denied` (20 a second, the rest counted in `dropped`), until the sandbox closes its end. Each report reaches it before the command learns of the refusal, so the
+/// waiter's drain sends it before the exit.
+fn report_binds(binds: &BindReports, outbox: &Outbox, exec_id: &ExecId, done: &Sender<()>) {
+    let mut limiter = Limiter::default();
+    while let Some(addr) = binds.next() {
+        if let Admit::Send { dropped } = limiter.admit(Instant::now()) {
+            outbox.net_bind_denied(NetBindDenied {
+                exec_id: exec_id.clone(),
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                dropped,
+            });
+        }
+    }
+    let _ = done.send(());
+}
+
 /// Waits for a process to exit and reports it after its output.
 struct Waiter {
     inner: Arc<Inner>,
     exec_id: ExecId,
     output: Arc<Mutex<Output>>,
     done: Receiver<()>,
+    /// The readers that signal `done` when they finish: the output's, and the bind reports'.
+    readers: usize,
     /// The command's cgroup, for `memoryBytes` and `processes` on Linux. Removed after the exit.
     cgroup: Option<process::Cgroup>,
 }
@@ -818,10 +858,10 @@ impl Waiter {
         self.inner.forget_oldest(&mut table);
     }
 
-    /// Waits for both readers to reach the end of their pipes, or for the output to stay
-    /// silent for [`DRAIN_IDLE`].
+    /// Waits for every reader to reach the end of its pipe, or for the output to stay silent
+    /// for [`DRAIN_IDLE`].
     fn drain(&self) {
-        let mut open = 2;
+        let mut open = self.readers;
         let mut seen = lock(&self.output).log.total();
         while open > 0 {
             match self.done.recv_timeout(DRAIN_IDLE) {
@@ -1052,7 +1092,10 @@ fn spawn_sandboxed(
     let prepared = crate::sandbox::prepare(&plan, &job)?;
     let frame = crate::helper::encode_job(&job);
     let spawned = spawn_helper(prepared.command, &frame, io, workload, bounds.limits)?;
-    Ok((spawned, (prepared.placeholders, prepared.netns)))
+    Ok((
+        spawned,
+        (prepared.placeholders, prepared.netns, prepared.binds),
+    ))
 }
 
 /// With `tty`, the terminal is the helper's stdout and stderr and its controlling terminal; the

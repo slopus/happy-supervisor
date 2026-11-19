@@ -9,8 +9,9 @@
 //! helper execs the command or performs the file operation.
 //!
 //! The sandbox stays in the node's process group (no `--new-session`), so the node's `killpg`
-//! reaches the command. bubblewrap forwards no signal, so [`prepare`] has it ignore `SIGTERM`,
-//! which would otherwise kill it and, through `--die-with-parent`, `SIGKILL` the command. The
+//! reaches the command. bubblewrap forwards no signal, so [`prepare`] has it ignore `SIGTERM`
+//! and `SIGINT`, which would otherwise kill it and, through `--die-with-parent`, `SIGKILL` the
+//! command; the helper restores both before it execs the command. The
 //! node already made bubblewrap a session leader with no controlling terminal, and seccomp
 //! refuses `TIOCSTI`, so sharing the session gives the command no terminal to type into.
 
@@ -221,8 +222,10 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
     // which are async-signal-safe.
     unsafe {
         command.pre_exec(move || {
-            if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
-                return Err(std::io::Error::last_os_error());
+            for signal in [libc::SIGTERM, libc::SIGINT] {
+                if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             if let Some(control) = &control {
                 let fd = control.as_raw_fd();

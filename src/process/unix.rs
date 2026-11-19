@@ -21,6 +21,19 @@ pub(crate) fn isolate(command: &mut Command) {
     }
 }
 
+/// Gives the command SIGINT's default action, which an ignored SIGINT in the supervisor (a
+/// background job of a shell) would otherwise pass on, so `interrupt` reaches it.
+pub(crate) fn default_interrupt(command: &mut Command) {
+    // SAFETY: the closure runs in the forked child and only calls signal, which is
+    // async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+}
+
 /// The process group a child leads.
 #[derive(Debug)]
 pub(crate) struct Tree {
@@ -37,6 +50,7 @@ impl Tree {
     /// Signals every process in the group. A group that is already gone is not an error.
     pub(crate) fn signal(&self, signal: KillSignal) -> io::Result<()> {
         let signal = match signal {
+            KillSignal::Interrupt => libc::SIGINT,
             KillSignal::Terminate => libc::SIGTERM,
             KillSignal::Kill => libc::SIGKILL,
         };

@@ -647,10 +647,12 @@ stdin pipe.
 
 ### `exec.kill`
 
-Params `{ "execId": "…", "signal": "terminate" }`, where `signal` is `terminate` (SIGTERM to the
-process group, or `TerminateJobObject` on Windows) or `kill` (SIGKILL to the group, or
-`TerminateJobObject`). Replies `{}` immediately. The exit arrives as `exec.exit`. Killing an
-exited process replies `{}` and does nothing. On Windows both end the tree with exit code 1.
+Params `{ "execId": "…", "signal": "terminate" }`, where `signal` is `interrupt` (SIGINT to the
+process group, as Ctrl-C at a terminal), `terminate` (SIGTERM to the group, or
+`TerminateJobObject` on Windows) or `kill` (SIGKILL to the group, or `TerminateJobObject`).
+Replies `{}` immediately. The exit arrives as `exec.exit`; a command may handle `interrupt` and
+keep running. Killing an exited process replies `{}` and does nothing. On Windows `terminate`
+and `kill` end the tree with exit code 1, and `interrupt` replies `io` (not supported yet).
 
 ### `exec.list`
 

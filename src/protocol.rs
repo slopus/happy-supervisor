@@ -801,6 +801,8 @@ pub struct ExecWriteParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KillSignal {
+    /// SIGINT, as Ctrl-C at a terminal.
+    Interrupt,
     Terminate,
     Kill,
 }
@@ -2433,6 +2435,8 @@ mod tests {
 
         let kill: ExecKillParams = round_trip(json!({ "execId": "e", "signal": "terminate" }));
         assert_eq!(kill.signal, KillSignal::Terminate);
+        let interrupt: ExecKillParams = round_trip(json!({ "execId": "e", "signal": "interrupt" }));
+        assert_eq!(interrupt.signal, KillSignal::Interrupt);
 
         let list: ExecListResult = round_trip(json!({ "execs": [
             { "execId": "a", "state": "running", "logBytes": 1200 },

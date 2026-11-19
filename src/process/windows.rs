@@ -75,7 +75,13 @@ impl Tree {
 
     /// Ends every process in the job. Windows has no gentle signal for a tree, so `terminate`
     /// and `kill` both use `TerminateJobObject`.
-    pub(crate) fn signal(&self, _signal: KillSignal) -> io::Result<()> {
+    pub(crate) fn signal(&self, signal: KillSignal) -> io::Result<()> {
+        if signal == KillSignal::Interrupt {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows commands cannot be interrupted yet",
+            ));
+        }
         // SAFETY: the job handle is open while `self` lives.
         if unsafe { TerminateJobObject(self.handle(), KILLED_EXIT_CODE) } == 0 {
             return Err(io::Error::last_os_error());

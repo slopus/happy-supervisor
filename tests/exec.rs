@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use happy_supervisor::exec::ExecManager;
 use happy_supervisor::link::{Incoming, ManualClock, NodeIdentity, Role, Session};
-use happy_supervisor::policy::{Confinement, ResolvedPolicy, allow_list};
+use happy_supervisor::policy::{Confinement, HostRules, Network, ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{
     ByteRange, Event, ExecExit, ExecId, ExecLogParams, ExecStartParams, ExecState, ExecSummary,
     ExecWriteParams, ExitStatus, KillSignal, NodeInfo, Stream,
@@ -345,6 +345,65 @@ async fn kill_reaches_grandchildren() {
             .kind,
         ErrorKind::NotFound
     );
+}
+
+/// `interrupt` is SIGINT to the group, which a shell can trap, raw and sandboxed alike.
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupt_reaches_a_trap_raw_and_sandboxed() {
+    happy_supervisor::helper::set_exe(env!("CARGO_BIN_EXE_happy-supervisor").into());
+    let sandbox = happy_supervisor::sandbox::probe();
+    let mut node = Node::new();
+    let state = tempfile::tempdir().unwrap();
+    let policy = allow_list(
+        sandbox.baseline_read.clone(),
+        Vec::<String>::new(),
+        false,
+        false,
+    );
+    let mut runs = vec![("int-raw", Confinement::Raw)];
+    if sandbox.require_available().is_ok() {
+        let resolved = ResolvedPolicy::resolve(&policy, state.path()).unwrap();
+        runs.push(("int-sbx", Confinement::Sandboxed(resolved)));
+    }
+    // On Linux an isolated sandbox keeps a second helper process, which must not die of it.
+    // (Elsewhere an isolated exec needs the command proxy, which dispatch starts.)
+    if cfg!(target_os = "linux") && sandbox.require_available().is_ok() {
+        let mut isolated = policy.clone();
+        isolated.network = Network::Isolated {
+            egress: HostRules {
+                default: happy_supervisor::policy::Default::Deny,
+                allow: vec![],
+                deny: vec![],
+            },
+            ports: None,
+            local_bind: true,
+            unix_sockets: false,
+        };
+        let resolved = ResolvedPolicy::resolve(&isolated, state.path()).unwrap();
+        runs.push(("int-iso", Confinement::Sandboxed(resolved)));
+    }
+    for (exec_id, confinement) in runs {
+        let script =
+            "trap 'echo interrupted; exit 7' INT; echo ready; while :; do sleep 0.05; done";
+        node.start_with(sh(exec_id, script), confinement)
+            .await
+            .unwrap();
+        while node.streamed(exec_id, Stream::Stdout) != "ready\n" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            node.pump();
+        }
+        node.exec.kill(&id(exec_id), KillSignal::Interrupt).unwrap();
+        assert_eq!(
+            node.exit(exec_id).await.exit,
+            ExitStatus::Exited { code: 7 },
+            "{exec_id}"
+        );
+        assert_eq!(
+            node.streamed(exec_id, Stream::Stdout),
+            "ready\ninterrupted\n"
+        );
+    }
 }
 
 #[tokio::test]

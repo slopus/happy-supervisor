@@ -239,6 +239,9 @@ fn run_exec(
 #[cfg(unix)]
 fn exec(argv: &Argv, cwd: &AbsPath, env: &BTreeMap<String, String>) -> Error {
     use std::os::unix::process::CommandExt as _;
+    // After confining: on Linux the helper's other half, which keeps SIGINT ignored, has forked.
+    // SAFETY: restoring the default action has no memory effects.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
     let err = std::process::Command::new(argv.program())
         .args(argv.args())
         .current_dir(cwd.as_path())

@@ -830,6 +830,8 @@ fn spawn_raw(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     process::isolate(&mut command);
+    #[cfg(unix)]
+    process::default_interrupt(&mut command);
     let child = command.spawn().map_err(|err| {
         let message = format!("cannot run {}: {err}", program.display());
         Error::new(Error::from(err).kind, message)

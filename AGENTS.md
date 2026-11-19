@@ -22,8 +22,8 @@ protocol rule in `client` or `testing`.
 | `protocol`, `wire`, `ws`, `error`, `policy`, `helper`, `link`, `dispatch`, `serve`, `controller`, `testkit`, `lib.rs`, `sandbox/mod.rs`, `Cargo.toml`, `Cargo.lock`, CI | scaffold |
 | `state`, `enroll`, `client`, `testing`, `main.rs` | transport track |
 | `exec`, `process/*` | exec track |
-| `sandbox/linux.rs`, `sandbox/placeholders.rs` | Linux sandbox track |
-| `sandbox/macos.rs` | macOS sandbox track |
+| `sandbox/linux/*`, `sandbox/placeholders.rs`, `connect` | Linux sandbox track |
+| `sandbox/macos/*` | macOS sandbox track |
 | `sandbox/windows.rs` | Windows sandbox track |
 | `fs` (bodies of `perform` and `handle`), `watch` | files track |
 | `proxy/*`, `streams`, `tunnel` | proxy track |

@@ -40,6 +40,7 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | `Streams`: the node's one stream table for proxy streams and tunnels. A stream is a `Kind` (`Http` with its command, or `Tcp`), an `Outbound` side (window, uncredited bytes, ended) and an `Inbound` side (awaiting a proxy response head, open, ended); one lock, one 1024-stream limit, one 32 MiB budget of uncredited bytes. `Upstream` (implemented by `Outbox`) is where its `proxy.*` and `tcp.*` messages go | `streams` | proxy track |
 | `NodeCa` (the CA and `public/ca-bundle.pem`), `ProxyManager` (what every command proxy shares: streams, CA, resolver, the `net.denied` sink; `on_event`, `session_lost`), `egress::start` → `CommandProxy` (one command's HTTP and SOCKS5 proxies in `http`, `socks5`, its decisions and environment; proxy.md), `address` (the internal-address filter) | `proxy/*` | proxy track |
 | `TunnelManager` (`open` for `tcp.open`, `on_event`, `session_lost`): one task per tunnel moving bytes between its loopback socket and its stream | `tunnel` | proxy track |
+| `connect::main` (`happy-supervisor __connect <host> <port>`, the SSH `ProxyCommand` of an isolated command: one connection through the SOCKS5 proxy in `ALL_PROXY`, over stdio) | `connect` | Linux track |
 | `node_info::collect(installation_id, name, &SandboxInfo) -> NodeInfo` | `node_info/*` | node-info track |
 | `Node`, `dispatch(&Node, kind, body) -> Option<Result<Value>>`: a reply for every command kind, `None` for a `proxy.*` or `tcp.*` stream message | `dispatch` | scaffold wires kinds to the functions above |
 
@@ -47,9 +48,10 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 IDs, argv, absolute paths, policies and log limits as they parse. It turns `access` into a
 `Confinement` once: `raw` stays raw, and `sandboxed` replies `sandbox_unavailable` unless the
 probed `SandboxInfo` is available, then resolves the policy with `private/` as the hidden path.
-For an `exec.start` with `proxy` it starts the command's proxy, grants a sandboxed command read
-access to the CA bundle, and hands the `ProxyLease` to `ExecManager::start`, which holds it until
-the command exits. Code behind it trusts those types and does not validate them again.
+For an `exec.start` with `proxy` or an isolated policy it starts the command proxy (proxy.md),
+grants a sandboxed command read access to the CA bundle, and hands the `CommandProxy` to
+`ExecManager::start`, which builds the sandbox's `NetPlan` from it and holds it until the command
+exits. Code behind it trusts those types and does not validate them again.
 
 ## The sandbox helper
 
@@ -58,9 +60,10 @@ invoked as `happy-supervisor __sandbox`. The child reads one job from stdin as a
 big-endian length followed by that many bytes of CBOR, the same encoding as the link. It reads the job with unbuffered reads, so
 nothing past the job is consumed. Then:
 
-* Linux: the helper calls `sandbox::enter(&job.policy)` (Landlock + `no_new_privs` + seccomp) on itself.
-  It is a fresh single-threaded process, so it may allocate freely. It never forks a
-  multi-threaded server.
+* Linux: the parent spawned it as `bwrap <namespaces> <mounts> -- <exe> __sandbox`, and the helper
+  calls `sandbox::enter(&job.policy)` on itself: in an isolated exec it forks a parent that
+  bridges the proxy sockets and serves `tcp.open`, then the child installs seccomp. It is a fresh
+  single-threaded process, so it may allocate freely.
 * macOS: the parent spawned it as `/usr/bin/sandbox-exec -p <profile> <exe> __sandbox`, so it is
   already confined.
 * Then `JobOp::Exec` execs the command (`execve`, so the PID stays the same and the rest of stdin

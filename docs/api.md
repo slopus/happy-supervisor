@@ -790,8 +790,9 @@ Params `{ "path", "access" }`. Result:
 only from `fs.list`.
 
 Under a sandbox the supervisor also checks the path, with symlinks resolved, against the
-policy's read set before the helper runs, because Landlock governs opening files but not
-reading their metadata.
+policy before the helper runs. A sandbox shows a hidden path as missing (bubblewrap) or lets its
+metadata through (Seatbelt), so the policy decides first and every platform answers
+`permission_denied`.
 
 ### `fs.list`
 

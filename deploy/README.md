@@ -133,3 +133,6 @@ triggers and `release.yml` do.
   platforms (0.2.0-linux.3 never built: release.yml checked the version by grepping the binary).
 * **0.2.0-linux.5.** The same code; 0.2.0-linux.4 never built either (its commit lacked the
   check fix it described).
+* **0.2.1.** The code of 0.2.0-linux.5, for all five platforms (Linux x86_64 and aarch64, macOS
+  aarch64 and x86_64, Windows x86_64), under a version without a platform suffix. Versions from
+  here on name one build for every platform.

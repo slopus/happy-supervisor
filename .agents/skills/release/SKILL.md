@@ -1,6 +1,6 @@
 ---
 name: release
-description: Release a new happy-supervisor version for all five platforms, from the VERSION bump through CI, the publish approval, the promote, and verification. Use when asked to release, publish, deploy, ship or promote the supervisor, or to "build a new supervisor version".
+description: Release a new happy-supervisor version for all five platforms, from the VERSION bump through CI, the automatic publish, the promote, and verification. Use when asked to release, publish, deploy, ship or promote the supervisor, or to "build a new supervisor version".
 ---
 
 # Releasing happy-supervisor
@@ -15,7 +15,7 @@ Everything you commit, every issue, every release note and every workflow log is
   a release note, a log line or a workflow. The signing key exists only in Secret Manager and
   only the publish trigger reads it. No job here may hold it, and no JSON service-account key may
   be added to Actions.
-- Never paste command output from the operator's side (approval responses, build logs, tokens)
+- Never paste command output from the operator's side (build logs, tokens)
   into the repository.
 - Do not add workflows or automatic triggers, and do not loosen `release.yml`'s permissions or the
   identity it signs in with, without the owner's explicit instruction. Actions that run with a
@@ -50,30 +50,19 @@ Everything you commit, every issue, every release note and every workflow log is
      until the publish step below, so a failed version can be fixed and released again, or skipped
      with a new bump.
 
-4. **Publish: an operator approves it.** When `SHA256SUMS` is staged, Cloud Build trigger
-   `happy-supervisor-publish` starts and **waits for a person's approval**. Say so to whoever
-   asked; do not poll silently. It runs none of this repository's code. It checks the five
-   binaries against `SHA256SUMS` and their attestations (this repository's `release.yml` on
-   `refs/heads/main`, at that commit), then signs and publishes `releases/<v>/` without moving
-   `latest`. The approver uses the Cloud Build console, or the REST `:approve` call with the body
-   in a file (inline JSON quoting tends to come back as HTTP 400):
-
-   ```
-   echo '{"approvalResult":{"decision":"APPROVED","comment":"publish <v>"}}' > approve.json
-   curl -sS -X POST -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-     -H 'Content-Type: application/json' --data @approve.json \
-     "https://cloudbuild.googleapis.com/v1/projects/<project>/locations/us-central1/builds/<build id>:approve"
-   ```
-
-   It takes a minute or two. Then the workflow's `github-release` job sees the signed list served
-   and creates GitHub Release `v<v>` with the same files. It waits up to six hours; after a later
-   approval, rerun that job.
+4. **Publish runs by itself.** When `SHA256SUMS` is staged, Cloud Build trigger
+   `happy-supervisor-publish` starts with no approval. It runs none of this repository's code. It
+   checks the five binaries against `SHA256SUMS` and their attestations (this repository's
+   `release.yml` on `refs/heads/main`, at that commit), then signs and publishes `releases/<v>/`
+   without moving `latest`. It takes a minute or two. The workflow's `github-release` job then sees
+   the signed list served and creates GitHub Release `v<v>` with the same files. If publish fails,
+   its Cloud Build log says why; nothing is published.
 
 5. **Promote: an operator moves `latest`.** Publishing never changes what a new install gets.
-   Someone allowed to publish to topic `happy-supervisor-promote` runs
-   `gcloud pubsub topics publish happy-supervisor-promote --attribute=version=<v> --project <project>`,
-   then approves the `happy-supervisor-promote` build the same way. It verifies the served
-   release, copies that release's own `install.sh` and `install.ps1` to the root, and points
+   Someone allowed to publish to topic `happy-supervisor-promote` (the project's owners) runs
+   `gcloud pubsub topics publish happy-supervisor-promote --attribute=version=<v> --project <project>`.
+   The `happy-supervisor-promote` build starts with no approval, verifies the served release,
+   copies that release's own `install.sh` and `install.ps1` to the root, and points
    `releases/latest` at it.
 
 6. **Verify** on GitHub and every host that serves releases:
@@ -85,10 +74,13 @@ Everything you commit, every issue, every release note and every workflow log is
    - a binary for this machine runs: `happy-supervisor info --state-dir <scratch>` reports
      `supervisorVersion` `<v>`.
 
+   Check `releases/latest` and the GitHub Release first; they answer in seconds. Downloading
+   every binary from every host takes minutes, so say that you are doing it.
+
 7. **Tell the control plane's maintainers.** The control plane pins this crate by commit, and its
    tests fetch the release of the pinned commit, so the pin moves to the released commit.
 
 ## Timing
 
-The tests and builds take about 15 minutes, and each approval and its build take a minute or two
-more. Report where the release stands while you wait, and name the approval it is blocked on.
+The tests and builds take about 15 minutes; publish and promote take a minute or two each. Report
+where the release stands while you wait instead of polling silently.

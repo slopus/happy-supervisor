@@ -73,7 +73,8 @@ Push a change to `VERSION` to `main`. `.github/workflows/release.yml` then:
 6. once the publish trigger serves the signed `SHA256SUMS`, checks it is this run's list under the
    release key and creates GitHub Release `v<version>` with the same files.
 
-A person approves the publish in Cloud Build, and later moves `latest` with the promote trigger:
+The publish trigger signs and publishes it with no approval; a project owner later moves `latest`
+with the promote trigger:
 publishing a version never changes what a new install gets.
 
 ### Google Cloud
@@ -85,7 +86,7 @@ Held in happy-terraform:
   `.github/workflows/release.yml` on `main` only.
 * Service account `happy-supervisor-github`, impersonable only through that provider, allowed to
   create objects in the staging bucket and nothing else (no read, no replace).
-* Trigger `happy-supervisor-publish`, approval required, run by `happy-supervisor-publish`, the
+* Trigger `happy-supervisor-publish`, no approval, run by `happy-supervisor-publish`, the
   only identity that may read secret `happy-supervisor-signing-key`. A Pub/Sub notification of the
   staging bucket starts it when a `<commit>/<run id>-<attempt>/SHA256SUMS` arrives. Its steps are
   inline and run none of the repository's code: copy that prefix; check that the five binaries
@@ -94,7 +95,8 @@ Held in happy-terraform:
   without `--latest`, with `RELEASE_BUCKET=<the bucket behind get.happy.engineering>`,
   `MINISIGN_PUBLIC_KEY=RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr` and
   `MINISIGN_SECRET_KEY_B64` from the secret.
-* Trigger `happy-supervisor-promote`, run by hand with the version, approval required: checks the
+* Trigger `happy-supervisor-promote`, started by publishing the version to its topic (project
+  owners only), no approval: checks the
   served release against the release key, then copies its installers from
   `releases/<version>/` to the root and points `releases/latest` at it.
 

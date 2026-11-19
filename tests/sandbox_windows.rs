@@ -369,7 +369,7 @@ fn the_probe_reports_an_installed_sandbox() {
     let info = sandbox::probe();
     assert_eq!(info.status, SandboxStatus::Available);
     assert_eq!(info.mechanism, Mechanism::Windows);
-    assert_eq!(info.gaps.len(), 11);
+    assert_eq!(info.gaps.len(), 13);
     assert_eq!(sandbox::windows::proxy_ports(), Some(47800..=47999));
 }
 
@@ -551,6 +551,21 @@ fn policy_combinations_and_their_outcomes() {
             none().isolated(),
             curl(&[&out_url]),
             Outcome::Exit(7),
+        ),
+        (
+            "isolated with localBind: loopback outside the proxy range (a gap)",
+            none().isolated().local_bind(),
+            curl(&[&out_url]),
+            ok("ok\n"),
+        ),
+        (
+            "isolated: names still resolve (a gap)",
+            none().isolated(),
+            cmd(
+                "ping -n 1 -w 500 example.com | findstr /b Pinging >NUL && echo resolved"
+                    .to_string(),
+            ),
+            ok("resolved\n"),
         ),
         (
             "listen: without localBind",

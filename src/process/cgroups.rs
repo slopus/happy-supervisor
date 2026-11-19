@@ -73,9 +73,11 @@ fn delegate() -> Result<Delegated, String> {
         ));
     }
     let pid = std::process::id().to_string();
+    // The supervisor's own init, as PID 1 of a container, moves to the leaf with it.
+    let init = crate::init::pid().map(|pid| pid.to_string());
     let others = read("cgroup.procs")?
         .lines()
-        .filter(|line| *line != pid)
+        .filter(|line| *line != pid && Some(*line) != init.as_deref())
         .count();
     if others > 0 {
         return Err(format!(
@@ -89,7 +91,11 @@ fn delegate() -> Result<Delegated, String> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(format!("cannot create {}: {err}", leaf.display())),
     }
-    if let Err(err) = fs::write(leaf.join("cgroup.procs"), &pid) {
+    let moved = init
+        .iter()
+        .chain([&pid])
+        .try_for_each(|pid| fs::write(leaf.join("cgroup.procs"), pid));
+    if let Err(err) = moved {
         let _ = fs::remove_dir(&leaf);
         return Err(format!("cannot move into {}: {err}", leaf.display()));
     }

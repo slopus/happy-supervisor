@@ -23,6 +23,8 @@ pub mod fs;
 pub mod helper;
 #[cfg(feature = "node")]
 pub mod identity;
+#[cfg(all(feature = "node", unix))]
+pub mod init;
 pub mod link;
 #[cfg(feature = "node")]
 pub mod node_info;

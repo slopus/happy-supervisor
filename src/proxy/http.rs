@@ -19,8 +19,8 @@ use hyper_util::rt::TokioIo;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 
-use super::egress::{Command, DenyReason, Io, Route, Via, connect, normalize};
-use crate::protocol::{Bytes, ProxyRequest, ProxyResponse, Scheme, StreamId};
+use super::egress::{Command, Io, Route, connect, explain, normalize};
+use crate::protocol::{Bytes, DenyReason, ProxyRequest, ProxyResponse, Scheme, StreamId, Via};
 use crate::streams::{Piece, StreamGuard, Streams};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -403,9 +403,11 @@ fn connection_tokens<'a>(values: impl Iterator<Item = &'a [u8]>) -> Vec<String> 
 /// `403` with the one-line reason.
 fn refused(reason: DenyReason, target: &Target) -> Response<Body> {
     let mut response = Response::new(
-        Full::new(bytes::Bytes::from(
-            reason.explain(&target.host, target.port),
-        ))
+        Full::new(bytes::Bytes::from(explain(
+            reason,
+            &target.host,
+            target.port,
+        )))
         .map_err(|never| match never {})
         .boxed(),
     );

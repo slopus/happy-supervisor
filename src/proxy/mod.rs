@@ -16,10 +16,9 @@ use std::sync::{Arc, OnceLock};
 
 use rustls::crypto::CryptoProvider;
 
-use crate::protocol::ProxyMessage;
+use crate::protocol::{NetDenied, ProxyMessage};
 use crate::streams::{Streams, Upstream};
 pub use ca::NodeCa;
-pub use egress::NetDenied;
 
 use crate::error::{Error, ErrorKind, Result};
 

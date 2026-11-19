@@ -9,12 +9,11 @@ use std::time::Duration;
 
 use happy_supervisor::policy::{Default, HostRules};
 use happy_supervisor::protocol::{
-    Bytes, ExecId, HostPattern, ProxyEnd, ProxyMessage, ProxyResponse, ProxySpec, ProxyToken,
-    Scheme, TcpMessage,
+    Bytes, DenyReason, ExecId, HostPattern, NetDenied, ProxyEnd, ProxyMessage, ProxyResponse,
+    ProxySpec, ProxyToken, Scheme, TcpMessage, Via,
 };
 use happy_supervisor::proxy::egress::{
-    self, CommandEnv, CommandProxy, CommandProxyConfig, CredentialEnv, DenyReason, ListenOn,
-    NetDenied, Via, command_env,
+    self, CommandEnv, CommandProxy, CommandProxyConfig, CredentialEnv, ListenOn, command_env,
 };
 use happy_supervisor::proxy::{NodeCa, ProxyManager, Resolver, socks5};
 use happy_supervisor::sandbox::Endpoint;

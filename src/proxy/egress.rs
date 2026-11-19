@@ -11,14 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
 use super::{ProxyManager, address, http, socks5};
 use crate::policy::{HostRules, host_allowed};
-use crate::protocol::{ExecId, HostPattern, ProxyToken, TCP_CONNECT_TIMEOUT_MS};
+use crate::protocol::{
+    DenyReason, ExecId, HostPattern, NetDenied, ProxyToken, TCP_CONNECT_TIMEOUT_MS, Via,
+};
 use crate::sandbox::Endpoint;
 
 pub use crate::protocol::ProxySpec as CredentialRoute;
@@ -50,54 +51,16 @@ pub enum ListenOn {
     UnixDir(PathBuf),
 }
 
-/// `net.denied` (v2 proxy.md). Moves to `protocol.rs` when the integrator lands it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NetDenied {
-    pub exec_id: ExecId,
-    pub host: String,
-    pub port: u16,
-    pub via: Via,
-    pub reason: DenyReason,
-    /// Refusals not reported since the previous event, because of the rate limit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dropped: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Via {
-    Http,
-    Socks5,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DenyReason {
-    /// The host does not pass `egress`.
-    Egress,
-    /// The port is not in `ports`.
-    Port,
-    /// Every address the name resolved to is internal.
-    Address,
-    /// The name resolved to nothing.
-    Resolve,
-    /// A credential-route host through SOCKS5, where the node cannot rewrite the request.
-    Credential,
-}
-
-impl DenyReason {
-    /// The one line an HTTP client gets with `403`.
-    pub(crate) fn explain(self, host: &str, port: u16) -> String {
-        let why = match self {
-            DenyReason::Egress => "the host is not allowed by the network policy",
-            DenyReason::Port => "the port is not allowed by the network policy",
-            DenyReason::Address => "the host resolves only to internal addresses",
-            DenyReason::Resolve => "the host does not resolve",
-            DenyReason::Credential => "credential-route hosts are reachable only over HTTP",
-        };
-        format!("happy-supervisor refused {host}:{port}: {why}\n")
-    }
+/// The one line an HTTP client gets with `403`.
+pub(crate) fn explain(reason: DenyReason, host: &str, port: u16) -> String {
+    let why = match reason {
+        DenyReason::Egress => "the host is not allowed by the network policy",
+        DenyReason::Port => "the port is not allowed by the network policy",
+        DenyReason::Address => "the host resolves only to internal addresses",
+        DenyReason::Resolve => "the host does not resolve",
+        DenyReason::Credential => "credential-route hosts are reachable only over HTTP",
+    };
+    format!("happy-supervisor refused {host}:{port}: {why}\n")
 }
 
 /// What happens to one outbound request.

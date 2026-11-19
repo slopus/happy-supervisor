@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::egress::{Command, Io, Route, Via, connect as connect_upstream};
+use super::egress::{Command, Io, Route, connect as connect_upstream};
+use crate::protocol::Via;
 
 const VERSION: u8 = 5;
 const NO_AUTH: u8 = 0x00;

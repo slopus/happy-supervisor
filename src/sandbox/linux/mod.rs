@@ -159,18 +159,29 @@ fn network(policy: &ResolvedPolicy) -> (bool, bool, bool) {
     }
 }
 
-/// An `O_PATH` descriptor of `path`, for `--ro-bind-fd`.
+/// An `O_PATH` descriptor of `path`, for `--ro-bind-fd`. Numbered above the descriptors the
+/// child sets up itself (stdio and the status pipe, [`helper::STATUS_FD`]), which would
+/// otherwise replace it.
 fn open_path(path: &Path) -> Result<OwnedFd> {
     use std::os::unix::fs::OpenOptionsExt as _;
+    let unavailable =
+        |err| Error::sandbox_unavailable(format!("cannot open {}: {err}", path.display()));
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH)
         .open(path)
-        .map_err(|err| {
-            Error::sandbox_unavailable(format!("cannot open {}: {err}", path.display()))
-        })?;
-    Ok(file.into())
+        .map_err(unavailable)?;
+    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor or -1, and nothing else owns it.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, FIRST_FREE_FD) };
+    if fd < 0 {
+        return Err(unavailable(std::io::Error::last_os_error()));
+    }
+    // SAFETY: as above.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
+
+/// The lowest descriptor the child leaves alone: above stdio and the status pipe.
+const FIRST_FREE_FD: libc::c_int = 10;
 
 fn unix_socket(endpoint: &Endpoint) -> Result<PathBuf> {
     match endpoint {

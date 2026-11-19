@@ -50,8 +50,9 @@ jobs:
       - name: workload user, as root
         if: runner.os != 'Windows'
         run: |
-          cargo test --all-features --test workload --no-run
-          sudo "$(ls -t target/debug/deps/workload-* | grep -v '\.d$' | head -1)" --nocapture
+          bin=$(cargo test --all-features --test workload --no-run --message-format=json \
+            | jq -r 'select(.target.name == "workload" and .executable != null) | .executable')
+          sudo "$bin" --nocapture
       # Timing tests, alone so nothing else competes for the CPU, and in release as shipped.
       - run: cargo test --release --all-features --test e2e -- --ignored --nocapture
         if: runner.os != 'Windows'

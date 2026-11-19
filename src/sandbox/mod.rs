@@ -33,6 +33,12 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{prepare, probe};
 
+/// Where the placeholders of operations whose policy has `state_dir` are recorded, so a node
+/// that crashed removes them at its next start.
+pub fn placeholder_records(state_dir: &Path) -> PathBuf {
+    state_dir.join("placeholders")
+}
+
 /// Where a command proxy listens, as the node sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Endpoint {

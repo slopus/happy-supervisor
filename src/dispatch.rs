@@ -42,6 +42,10 @@ impl Node {
         let name = state.credentials()?.map(|c| c.name);
         let ca = NodeCa::load_or_create(&state.private_dir(), &state.public_dir())?;
         let proxy = ProxyManager::new(outbox.clone(), ca);
+        let records = crate::sandbox::placeholder_records(&state.private_dir());
+        if let Err(err) = crate::sandbox::Placeholders::sweep(&records) {
+            tracing::warn!("removing a previous run's placeholders failed: {err}");
+        }
         let sandbox = crate::sandbox::probe();
         Ok(Node::new(
             state,

@@ -150,9 +150,10 @@ What this node can enforce for `{ "mode": "sandboxed" }` commands (policy.md).
 
 | Field | Type | Meaning |
 |---|---|---|
-| `mechanism` | `"landlock"` \| `"seatbelt"` \| `"none"` | The backend. |
+| `mechanism` | `"bubblewrap"` \| `"seatbelt"` \| `"windows"` \| `"landlock"` \| `"none"` | The backend: bubblewrap and seccomp on Linux, Seatbelt on macOS, a restricted token with ACLs and a firewall on Windows (policy.md). `landlock` is the v1 Linux backend, reported until bubblewrap replaces it. |
+| `version` | string \| null | Bubblewrap only: what `bwrap --version` printed. |
 | `available` | bool | Whether sandboxed commands can run. Decided by actually running a sandboxed `true` at startup, not by checking for features. |
-| `reason` | string \| null | Why it is unavailable, in one sentence (for example "Landlock is not in the kernel's active LSM list"). |
+| `reason` | string \| null | Why it is unavailable, in one sentence (for example "bwrap is not on PATH", or "unprivileged user namespaces are disabled"). |
 | `landlockAbi` | integer \| null | Linux only. The Landlock ABI version the kernel supports. It determines the gaps listed in policy.md. |
 | `baselineRead` | array of paths | Existing system paths that ordinary programs need to read on this machine. The supervisor never adds these to a policy itself. |
 | `gaps` | array of strings | What this node's sandbox does not enforce, one sentence each, so the control plane can see it without knowing kernels. The Linux list depends on `landlockAbi` (policy.md, Gaps the node reports). Empty when `available` is false. |

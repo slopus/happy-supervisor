@@ -1,0 +1,28 @@
+; The device nodes every sandbox may read and write (policy.md, Fixed rules). macOS has no
+; private /dev, and no /dev/full or /dev/shm. /dev/dtracehelper is opened by dyld, and /dev/fd
+; reopens descriptors the process already holds (`echo > /dev/stdout`).
+(allow file-read* file-write* file-ioctl
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper"))
+(allow file-read* file-write* (subpath "/dev/fd"))
+(allow file-read-metadata
+  (literal "/dev")
+  (literal "/dev/stdin")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr"))
+
+; From Codex's seatbelt_base_policy.sbpl at ab1ad92 (Apache-2.0).
+; allow openpty()
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-read* file-write*
+  (require-all
+    (regex #"^/dev/ttys[0-9]+")
+    (extension "com.apple.sandbox.pty")))
+; PTYs created before entering seatbelt may lack the extension; allow ioctl
+; on those slave ttys so interactive shells detect a TTY and remain functional.
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+"))

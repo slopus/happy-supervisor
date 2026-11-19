@@ -1,0 +1,10 @@
+happy-supervisor
+
+This project includes code derived from OpenAI Codex
+(https://github.com/openai/codex, codex-rs/windows-sandbox-rs), licensed under the
+Apache License, Version 2.0 (src/sandbox/windows/LICENSE-codex).
+OpenAI Codex
+Copyright 2025 OpenAI
+
+The derived files are under src/sandbox/windows/; each says at its top what it took and
+what it changed.

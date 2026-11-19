@@ -29,7 +29,7 @@ mod macos;
 pub use macos::{prepare, probe};
 
 #[cfg(windows)]
-mod windows;
+pub mod windows;
 #[cfg(windows)]
 pub use windows::{prepare, probe};
 

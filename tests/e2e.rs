@@ -278,7 +278,7 @@ async fn node_info_is_collected_fresh() {
     assert_eq!(info["sandbox"]["available"], true, "{}", info["sandbox"]);
     let gaps = info["sandbox"]["gaps"].to_string();
     let expected = if cfg!(target_os = "macos") {
-        "the metadata (not the listing or contents) of every directory above a grant is readable"
+        "the metadata (not the listing or contents) of every directory above a readable policy entry is readable"
     } else {
         "a TCP socket can listen on an ephemeral port without bind"
     };

@@ -61,7 +61,9 @@ name.
   an empty, read-only file or directory at the first missing component. It records every
   placeholder it creates and removes it after the operation ends if it is still empty and still
   the one it created. Placeholders appear only inside directories the policy makes writable,
-  which is the only place the operation could otherwise create the denied path.
+  which is the only place the operation could otherwise create the denied path. Seatbelt matches
+  paths rather than files, so macOS needs no placeholder: it denies writing the first missing
+  component by name.
 
 ## Fixed rules
 
@@ -114,6 +116,9 @@ How isolated networking works (proxy.md, "Egress proxy"):
 * The proxies resolve the name themselves, check the host against `egress` and the port against
   `ports`, and then refuse any resolved address that is loopback, private, link-local, CGNAT,
   multicast or the node's own, unless the policy names that literal IP in `egress.allow`.
+* Seatbelt cannot tell loopback from other local addresses, so on macOS an isolated command
+  with `localBind` may listen on any local address and accept connections from other hosts, and
+  it cannot connect to its own listeners. The macOS probe lists this in `gaps`.
 * UDP (including direct DNS) and other protocols have no route in isolated mode. Name resolution
   happens in the proxy.
 * Hosts listed in the command's credential `proxy.hosts` (proxy.md) go to the control plane, which

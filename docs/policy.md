@@ -128,12 +128,54 @@ How isolated networking works (proxy.md, "Egress proxy"):
 
 | Platform | Requirement | Reported in |
 |---|---|---|
-| Linux | `bwrap` 0.8+ on `PATH` (or at a configured path), unprivileged user namespaces (or a setuid `bwrap`), kernel seccomp. On Ubuntu 24.04+, an AppArmor profile that allows `bwrap` user namespaces (the installer writes one). | NodeInfo `sandbox.available`, `sandbox.reason` |
+| Linux | `bwrap` 0.8+ on `PATH` (or at a configured path), unprivileged user namespaces (or a setuid `bwrap`), kernel seccomp. On Ubuntu 24.04+, an AppArmor profile that allows `bwrap` user namespaces (below). | NodeInfo `sandbox.available`, `sandbox.reason` |
 | macOS | `/usr/bin/sandbox-exec`. | same |
 | Windows | Windows 10 1809+ / Server 2019+, the supervisor installed once with administrator rights to create the sandbox account and firewall filters. | same |
 
 A node that cannot enforce a policy replies `sandbox_unavailable` and never runs the operation
 with less.
+
+Ubuntu 24.04 and later restrict unprivileged user namespaces through AppArmor. Allow them for
+`bwrap` with `/etc/apparmor.d/bwrap`, then `sudo apparmor_parser -r /etc/apparmor.d/bwrap`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}
+```
+
+### Linux: gaps and errors
+
+The Linux probe lists these in `gaps`:
+
+* With `localBind: false`, TCP `bind` is refused (Landlock ABI 4, Linux 6.7), but a TCP socket
+  can still listen on an ephemeral port without binding, and a UDP socket that sends first gets
+  an ephemeral port and receives replies on it. On older kernels, `localBind: false` with
+  `unixSockets: true` also refuses binding Unix sockets.
+* Connecting to an existing Unix socket needs only that the socket be readable, not its
+  directory writable.
+* 32-bit x86 and x32 programs cannot run in the sandbox.
+* A command killed by a signal is reported as exiting with 128 plus the signal number.
+
+What a command sees on Linux:
+
+* Reading a read-denied file fails with `EACCES`. The path is still there, as the host's
+  `/dev/null` bound `nodev` in place of the file.
+* Listing a read-denied directory succeeds and shows it empty: it is an empty read-only tmpfs.
+  Opening anything below it fails with `ENOENT` unless a deeper allow entry mounts that path
+  back.
+* Writing a write-denied file under a readable directory fails with `EROFS`; reading it works.
+* Creating, renaming or removing an entry in a write-denied directory fails with `EROFS`.
+* A missing deny path behaves the same at its placeholder: a file placeholder as a read-denied
+  file, a directory placeholder as a read- and write-denied directory.
+* If bubblewrap itself fails to set up the sandbox, the command is reported as exiting with
+  code 1.
+
+Through `fs.*` all of these answer `permission_denied`, because the node checks the policy first
+(api.md, `fs.stat`).
 
 ## Raw access
 

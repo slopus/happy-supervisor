@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use happy_supervisor::client::{self, RunExit};
 use happy_supervisor::state::StateDir;
-use happy_supervisor::{Error, ErrorKind, enroll, helper, node_info, sandbox};
+use happy_supervisor::{Error, ErrorKind, enroll, helper, node_info, sandbox, serve};
 
 /// The argument that makes this binary the sandbox helper.
 const HELPER_ARG: &str = "__sandbox";
@@ -37,6 +37,18 @@ enum Command {
     },
     /// Connect to the control plane and serve it until revoked or interrupted.
     Run {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Listen for a control plane instead of dialing one (docs/serve.md). Prints
+    /// `listening <addr>` once connections are accepted.
+    Serve {
+        /// `IP:PORT` (port 0 picks one) or `unix:PATH`.
+        #[arg(long)]
+        listen: String,
+        /// A file holding the token clients must present, or `-` for one line of stdin.
+        #[arg(long)]
+        token_file: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -98,6 +110,22 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
             }
             RunExit::Interrupted => Ok(ExitCode::SUCCESS),
         },
+        Command::Serve {
+            listen,
+            token_file,
+            state_dir,
+        } => {
+            let listen = listen.parse()?;
+            let token = serve::read_token(&token_file)?;
+            let state = StateDir::open(state_dir)?;
+            let listening = |addr: String| {
+                use std::io::Write as _;
+                println!("listening {addr}");
+                let _ = std::io::stdout().flush();
+            };
+            serve::serve_until(state, listen, token, listening, client::shutdown_signal()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Info { state_dir } => {
             let state = StateDir::open(state_dir)?;
             let info = tokio::task::spawn_blocking(move || {

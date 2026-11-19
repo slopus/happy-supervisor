@@ -83,7 +83,13 @@ pub struct Socket<S = HttpStream> {
     extensions: Option<String>,
     /// Which direction [`Socket::next`] polls first this time.
     read_first: bool,
+    /// The code of the close frame the peer sent.
+    peer_close: Option<u16>,
 }
+
+/// The close code a listening node closes a connection with when a newer one takes over
+/// (serve.md). A client that gets it does not redial.
+pub const CLOSE_REPLACED: u16 = 4001;
 
 /// What [`Socket::next`] waited for.
 pub enum Event {
@@ -105,7 +111,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Socket<S> {
             writable: false,
             extensions,
             read_first: false,
+            peer_close: None,
         }
+    }
+
+    /// The code of the close frame that ended the connection, if the peer sent one.
+    pub fn peer_close_code(&self) -> Option<u16> {
+        self.peer_close
     }
 
     /// The agreed `Sec-WebSocket-Extensions`, `None` when the connection is uncompressed.
@@ -180,10 +192,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Socket<S> {
             Poll::Ready(Ok(frame)) => Poll::Ready(Ok(match frame.opcode() {
                 OpCode::Binary => Event::Binary(frame.into_payload()),
                 OpCode::Text => Event::Text,
-                OpCode::Close => return Poll::Ready(Err(WebSocketError::ConnectionClosed)),
+                OpCode::Close => {
+                    self.peer_close = frame.close_code().map(u16::from);
+                    return Poll::Ready(Err(WebSocketError::ConnectionClosed));
+                }
                 _ => Event::Control,
             })),
         }
+    }
+
+    /// Sends a close frame with `code` and `reason`, waiting at most a second.
+    pub async fn close_with(mut self, code: u16, reason: &str) {
+        let close = async {
+            let mut ws = std::pin::Pin::new(&mut self.ws);
+            poll_fn(|cx| ws.as_mut().poll_ready(cx)).await?;
+            ws.as_mut().start_send(yawc::Frame::close(
+                yawc::close::CloseCode::from(code),
+                reason.as_bytes(),
+            ))?;
+            poll_fn(|cx| ws.as_mut().poll_flush(cx)).await
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(1), close).await;
     }
 
     /// Sends a close frame, waiting at most a second.
@@ -203,43 +232,15 @@ pub enum Dialed {
     Refused(StatusCode),
 }
 
-/// Opens the link WebSocket to `endpoint` (`wss://`, or `ws://` for tests), with the node token
-/// as a bearer credential. `Err` describes a failure worth retrying.
-pub async fn dial(endpoint: &Url, node_token: &str) -> Result<Dialed, String> {
-    let host = endpoint
-        .host_str()
-        .ok_or_else(|| format!("{endpoint} has no host"))?
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string();
-    let port = endpoint
-        .port_or_known_default()
-        .ok_or_else(|| format!("{endpoint} has no port"))?;
-    let tcp = TcpStream::connect((host.as_str(), port))
-        .await
-        .map_err(|err| format!("connecting: {err}"))?;
-    let _ = tcp.set_nodelay(true);
-    let io: Box<dyn Io> = match endpoint.scheme() {
-        "wss" => {
-            let name = rustls::pki_types::ServerName::try_from(host.clone())
-                .map_err(|err| format!("bad host {host}: {err}"))?;
-            let tls = tokio_rustls::TlsConnector::from(tls_config()?)
-                .connect(name, tcp)
-                .await
-                .map_err(|err| format!("TLS: {err}"))?;
-            Box::new(tls)
-        }
-        _ => Box::new(tcp),
-    };
-
+/// Opens the link WebSocket to `endpoint` with `token` as a bearer credential: `wss://`, or
+/// `ws://` for tests and local listeners, or `unix:PATH` for a local listener's socket (serve.md).
+/// `Err` describes a failure worth retrying.
+pub async fn dial(endpoint: &Url, token: &str) -> Result<Dialed, String> {
+    let (io, host_header, target) = connect(endpoint).await?;
     let key = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::now_v7().as_bytes());
-    let host_header = match endpoint.port() {
-        Some(port) => format!("{}:{port}", endpoint.host_str().unwrap_or_default()),
-        None => endpoint.host_str().unwrap_or_default().to_string(),
-    };
-    let bearer = HeaderValue::from_str(&format!("Bearer {node_token}"))
-        .map_err(|_| "the node token is not a valid header value".to_string())?;
-    let request = Request::get(&endpoint[url::Position::BeforePath..])
+    let bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| "the token is not a valid header value".to_string())?;
+    let request = Request::get(target)
         .header(header::HOST, host_header)
         .header(header::UPGRADE, "websocket")
         .header(header::CONNECTION, "Upgrade")
@@ -281,7 +282,7 @@ pub async fn dial(endpoint: &Url, node_token: &str) -> Result<Dialed, String> {
         .and_then(|v| v.to_str().ok());
     if protocol != Some(SUBPROTOCOL) {
         return Err(format!(
-            "the control plane selected subprotocol {protocol:?}, not {SUBPROTOCOL}"
+            "the server selected subprotocol {protocol:?}, not {SUBPROTOCOL}"
         ));
     }
     let extensions = headers
@@ -291,7 +292,7 @@ pub async fn dial(endpoint: &Url, node_token: &str) -> Result<Dialed, String> {
         .to_string();
     if extensions.split(';').next().map(str::trim) != Some("permessage-deflate") {
         return Err(format!(
-            "the control plane did not accept permessage-deflate (Sec-WebSocket-Extensions: {extensions:?})"
+            "the server did not accept permessage-deflate (Sec-WebSocket-Extensions: {extensions:?})"
         ));
     }
     let upgraded = hyper::upgrade::on(&mut response)
@@ -305,6 +306,51 @@ pub async fn dial(endpoint: &Url, node_token: &str) -> Result<Dialed, String> {
     )
     .map_err(|err| format!("WebSocket: {err}"))?;
     Ok(Dialed::Open(Box::new(Socket::new(ws, Some(extensions)))))
+}
+
+/// The stream to `endpoint`, its `Host` header and the request target.
+async fn connect(endpoint: &Url) -> Result<(Box<dyn Io>, String, String), String> {
+    #[cfg(unix)]
+    if endpoint.scheme() == "unix" {
+        let unix = tokio::net::UnixStream::connect(endpoint.path())
+            .await
+            .map_err(|err| format!("connecting to {}: {err}", endpoint.path()))?;
+        return Ok((Box::new(unix), "localhost".to_string(), "/".to_string()));
+    }
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| format!("{endpoint} has no host"))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = endpoint
+        .port_or_known_default()
+        .ok_or_else(|| format!("{endpoint} has no port"))?;
+    let tcp = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|err| format!("connecting: {err}"))?;
+    let _ = tcp.set_nodelay(true);
+    let io: Box<dyn Io> = match endpoint.scheme() {
+        "wss" => {
+            let name = rustls::pki_types::ServerName::try_from(host.clone())
+                .map_err(|err| format!("bad host {host}: {err}"))?;
+            let tls = tokio_rustls::TlsConnector::from(tls_config()?)
+                .connect(name, tcp)
+                .await
+                .map_err(|err| format!("TLS: {err}"))?;
+            Box::new(tls)
+        }
+        _ => Box::new(tcp),
+    };
+    let host_header = match endpoint.port() {
+        Some(port) => format!("{}:{port}", endpoint.host_str().unwrap_or_default()),
+        None => endpoint.host_str().unwrap_or_default().to_string(),
+    };
+    Ok((
+        io,
+        host_header,
+        endpoint[url::Position::BeforePath..].to_string(),
+    ))
 }
 
 /// `Sec-WebSocket-Accept` for `key` (RFC 6455, 4.2.2).

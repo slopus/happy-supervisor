@@ -11,6 +11,12 @@ use crate::error::{Error, ErrorKind, Result};
 const INSTALLATION_ID: &str = "installation-id";
 const CREDENTIALS: &str = "credentials.json";
 
+/// A running node's hold on its state directory. Released on drop, or when the process ends.
+#[derive(Debug)]
+pub struct StateLock {
+    _file: std::fs::File,
+}
+
 #[derive(Clone, Debug)]
 pub struct StateDir {
     root: PathBuf,
@@ -39,6 +45,25 @@ impl StateDir {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Takes the directory for one running node (`run` or `serve`) until the [`StateLock`] is
+    /// dropped. A second one is refused.
+    pub fn lock(&self) -> Result<StateLock> {
+        let path = self.root.join("lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(StateLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("another happy-supervisor is using {}", self.root.display()),
+            )),
+            Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
+        }
     }
 
     /// `private/`: identity, credentials and the proxy CA key. Every job's `hidden` path.
@@ -246,6 +271,23 @@ fn io_error(path: &Path, err: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_node_at_a_time_holds_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::open(Some(tmp.path().to_path_buf())).unwrap();
+        let held = state.lock().unwrap();
+        let err = state.lock().unwrap_err();
+        assert_eq!(
+            err,
+            Error::new(
+                ErrorKind::AlreadyExists,
+                format!("another happy-supervisor is using {}", tmp.path().display())
+            )
+        );
+        drop(held);
+        assert!(state.lock().is_ok());
+    }
 
     fn credentials(token: &str) -> Credentials {
         Credentials {

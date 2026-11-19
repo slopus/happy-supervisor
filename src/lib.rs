@@ -2,6 +2,7 @@
 //! watch for changes on this machine. The contract is in `docs/`.
 
 pub mod client;
+pub mod controller;
 pub mod dispatch;
 pub mod enroll;
 pub mod error;
@@ -15,6 +16,7 @@ mod process;
 pub mod protocol;
 pub mod proxy;
 pub mod sandbox;
+pub mod serve;
 pub mod state;
 pub mod streams;
 #[cfg(feature = "testing")]
@@ -28,6 +30,7 @@ pub mod ws;
 #[cfg(any(test, feature = "testing"))]
 pub mod testkit;
 
+pub use controller::Controller;
 pub use error::{Error, ErrorKind, Result};
 
 /// The crate version, reported as `supervisorVersion` and in `hello`.

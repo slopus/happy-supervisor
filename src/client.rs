@@ -78,6 +78,46 @@ pub async fn run_until(
         node_id: credentials.node_id,
         installation_id,
     };
+    let _lock = {
+        let state = state.clone();
+        blocking(move || state.lock()).await?
+    };
+    drive(state, identity, Source::Dial, stop).await
+}
+
+/// Serves the control planes that connect to a listener (serve.md): each socket from `sockets`
+/// takes over from the one before it. The installation ID is the node ID. Returns when `stop`
+/// resolves or `sockets` closes. The caller holds the state directory's lock.
+pub async fn serve_until(
+    state: StateDir,
+    sockets: mpsc::UnboundedReceiver<Box<Socket>>,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> Result<RunExit> {
+    let installation_id = {
+        let state = state.clone();
+        blocking(move || state.installation_id()).await?
+    };
+    let identity = NodeIdentity {
+        node_id: installation_id.clone(),
+        installation_id,
+    };
+    drive(state, identity, Source::Listen(sockets, None), stop).await
+}
+
+/// Where connections come from.
+enum Source {
+    /// Dial the stored endpoint, redialing with backoff.
+    Dial,
+    /// Accepted connections, and one that arrived while another was served.
+    Listen(mpsc::UnboundedReceiver<Box<Socket>>, Option<Box<Socket>>),
+}
+
+async fn drive(
+    state: StateDir,
+    identity: NodeIdentity,
+    source: Source,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> Result<RunExit> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     #[allow(unused_mut)]
     let (mut session, outbox) = Session::new(Role::Node(identity), clock.clone());
@@ -100,6 +140,7 @@ pub async fn run_until(
     let handlers = tokio::spawn(serve(node.clone(), outbox, from_driver));
     let mut driver = Driver {
         state,
+        source,
         session,
         node: node.clone(),
         clock,
@@ -114,7 +155,8 @@ pub async fn run_until(
     exit
 }
 
-async fn shutdown_signal() {
+/// Resolves on Ctrl-C or SIGTERM.
+pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -194,6 +236,7 @@ async fn serve(node: Arc<Node>, outbox: Outbox, mut messages: mpsc::UnboundedRec
 
 struct Driver {
     state: StateDir,
+    source: Source,
     session: Session,
     node: Arc<Node>,
     clock: Arc<dyn Clock>,
@@ -223,7 +266,15 @@ impl Driver {
     async fn run(&mut self) -> Result<RunExit> {
         let mut backoff = BACKOFF_MIN;
         loop {
-            match self.connection().await? {
+            let ended = match self.source {
+                Source::Dial => self.connection().await?,
+                Source::Listen(..) => match self.accepted().await {
+                    // A client that says `revoked` revokes nothing here: wait for the next.
+                    Ended::Revoked | Ended::Retry { .. } => continue,
+                    Ended::Stopped => return Ok(RunExit::Interrupted),
+                },
+            };
+            match ended {
                 Ended::Revoked => return Ok(RunExit::Revoked),
                 Ended::Stopped => return Ok(RunExit::Interrupted),
                 Ended::Retry { up } => {
@@ -280,17 +331,40 @@ impl Driver {
             socket.extensions().unwrap_or("uncompressed")
         );
 
+        Ok(self.connected(*socket).await)
+    }
+
+    /// Waits for the next accepted connection and serves it.
+    async fn accepted(&mut self) -> Ended {
+        let Source::Listen(sockets, waiting) = &mut self.source else {
+            return Ended::Stopped;
+        };
+        let socket = match waiting.take() {
+            Some(socket) => socket,
+            None => tokio::select! {
+                socket = sockets.recv() => match socket {
+                    Some(socket) => socket,
+                    None => return Ended::Stopped,
+                },
+                _ = self.stop.wait_for(|stopped| *stopped) => return Ended::Stopped,
+            },
+        };
+        tracing::info!("a control plane connected");
+        self.connected(*socket).await
+    }
+
+    async fn connected(&mut self, socket: Socket) -> Ended {
         let opened = Instant::now();
         self.session.connected();
-        let ended = self.serve_connection(*socket).await;
+        let ended = self.serve_connection(socket).await;
         self.session.disconnected();
-        Ok(match ended {
+        match ended {
             Served::Revoked => Ended::Revoked,
             Served::Stopped => Ended::Stopped,
             Served::Closed => Ended::Retry {
                 up: opened.elapsed(),
             },
-        })
+        }
     }
 
     /// Moves frames until the connection ends. One frame is written at a time, and the socket
@@ -348,8 +422,15 @@ impl Driver {
                     None => std::future::pending().await,
                 }
             };
+            let takeover = async {
+                match &mut self.source {
+                    Source::Listen(sockets, _) => sockets.recv().await,
+                    Source::Dial => std::future::pending().await,
+                }
+            };
             let wake = tokio::select! {
                 event = socket.next() => Wake::Socket(event),
+                Some(next) = takeover => Wake::Takeover(next),
                 _ = self.session.changed() => Wake::Changed,
                 _ = sleep_until(deadline) => Wake::Tick,
                 _ = ping.tick() => Wake::Ping,
@@ -369,6 +450,16 @@ impl Driver {
                 }
                 Wake::Socket(Err(err)) => {
                     tracing::warn!("the connection to the control plane ended: {err}");
+                    return Served::Closed;
+                }
+                Wake::Takeover(next) => {
+                    tracing::info!("a new connection takes over from the current one");
+                    if let Source::Listen(_, waiting) = &mut self.source {
+                        *waiting = Some(next);
+                    }
+                    socket
+                        .close_with(crate::ws::CLOSE_REPLACED, "replaced by a newer connection")
+                        .await;
                     return Served::Closed;
                 }
                 Wake::Changed => {}
@@ -472,6 +563,8 @@ enum Served {
 /// What woke the connection loop.
 enum Wake {
     Socket(std::result::Result<Event, yawc::WebSocketError>),
+    /// A listener accepted another connection, which replaces this one.
+    Takeover(Box<Socket>),
     Changed,
     Tick,
     Ping,

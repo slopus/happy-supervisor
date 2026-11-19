@@ -19,11 +19,12 @@ protocol rule in `client` or `testing`.
 
 | Module | Owner |
 |---|---|
-| `protocol`, `wire`, `ws`, `error`, `policy`, `helper`, `link`, `dispatch`, `testkit`, `lib.rs`, `sandbox/mod.rs`, `sandbox/windows.rs`, `Cargo.toml`, `Cargo.lock`, CI | scaffold |
+| `protocol`, `wire`, `ws`, `error`, `policy`, `helper`, `link`, `dispatch`, `serve`, `controller`, `testkit`, `lib.rs`, `sandbox/mod.rs`, `Cargo.toml`, `Cargo.lock`, CI | scaffold |
 | `state`, `enroll`, `client`, `testing`, `main.rs` | transport track |
 | `exec`, `process/*` | exec track |
-| `sandbox/linux.rs` | Linux sandbox track |
+| `sandbox/linux.rs`, `sandbox/placeholders.rs` | Linux sandbox track |
 | `sandbox/macos.rs` | macOS sandbox track |
+| `sandbox/windows.rs` | Windows sandbox track |
 | `fs` (bodies of `perform` and `handle`), `watch` | files track |
 | `proxy/*`, `streams`, `tunnel` | proxy track |
 | `node_info/*` | node-info track |
@@ -40,7 +41,8 @@ seam gets a real implementation in the same change, not a stub.
 * No `todo!()`, `unimplemented!()` or `dbg!()` (clippy denies them). Every `unsafe` block gets a
   `// SAFETY:` comment.
 * Tests call the real code and assert literal values.
-* The supervisor never creates a file or directory to apply a policy (policy.md).
+* A placeholder for a missing deny path is the only thing the supervisor creates to apply a
+  policy, and it removes it afterwards (policy.md, Paths that do not exist).
 
 ## Building and testing
 

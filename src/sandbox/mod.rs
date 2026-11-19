@@ -62,6 +62,10 @@ pub struct Plan<'a> {
     pub net: Option<NetPlan>,
     /// The supervisor binary that runs as the helper (`<exe> __sandbox`).
     pub exe: &'a Path,
+    /// `cgroup.procs` of the exec's limits cgroup, which the helper joins just before it execs
+    /// the command (`memoryBytes` and `processes`, process/cgroups.rs).
+    #[cfg(target_os = "linux")]
+    pub cgroup: Option<std::os::fd::BorrowedFd<'a>>,
 }
 
 /// A prepared operation. Keep it until the operation has ended: dropping it removes the

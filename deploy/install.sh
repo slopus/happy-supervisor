@@ -318,6 +318,8 @@ ExecStart="$BIN" run --state-dir "$STATE"${workload:+ $workload}
 Restart=on-failure
 # Exit code 3: the control plane revoked the credential. Join again instead.
 RestartPreventExitStatus=3
+# The service's cgroup is the supervisor's, for limits.memoryBytes and processes (docs/install.md).
+Delegate=yes
 
 [Install]
 WantedBy=$wanted

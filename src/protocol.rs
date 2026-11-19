@@ -928,9 +928,15 @@ pub enum ExecState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ExitStatus {
-    Exited { code: i32 },
-    Signaled { signal: i32 },
+    Exited {
+        code: i32,
+    },
+    Signaled {
+        signal: i32,
+    },
     TimedOut,
+    /// Linux: the tree went over `limits.memoryBytes`, and the kernel killed all of it.
+    MemoryLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2622,7 +2628,8 @@ mod tests {
             { "execId": "a", "state": "running", "logBytes": 1200 },
             { "execId": "b", "state": "exited", "exit": { "kind": "exited", "code": 0 }, "logBytes": 0 },
             { "execId": "c", "state": "exited", "exit": { "kind": "signaled", "signal": 9 }, "logBytes": 1 },
-            { "execId": "d", "state": "exited", "exit": { "kind": "timedOut" }, "logBytes": 2 }
+            { "execId": "d", "state": "exited", "exit": { "kind": "timedOut" }, "logBytes": 2 },
+            { "execId": "e", "state": "exited", "exit": { "kind": "memoryLimit" }, "logBytes": 3 }
         ]}));
         let exits: Vec<ExecState> = list.execs.into_iter().map(|s| s.state).collect();
         assert_eq!(
@@ -2637,6 +2644,9 @@ mod tests {
                 },
                 ExecState::Exited {
                     exit: ExitStatus::TimedOut
+                },
+                ExecState::Exited {
+                    exit: ExitStatus::MemoryLimit
                 },
             ]
         );

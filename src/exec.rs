@@ -158,6 +158,15 @@ impl Io {
     }
 }
 
+/// What bounds a command: its `limits`, and on Linux the cgroup that enforces `memoryBytes` and
+/// `processes`. A sandboxed command joins the cgroup from inside the sandbox
+/// (`sandbox::Plan::cgroup`), so bubblewrap and the helper do not count.
+#[derive(Clone, Copy)]
+struct Bounds<'a> {
+    limits: &'a Limits,
+    cgroup: Option<&'a process::Cgroup>,
+}
+
 /// A spawned child before it is registered.
 struct Spawned {
     child: Child,
@@ -522,6 +531,11 @@ impl Inner {
         let program = resolve_program(argv.program(), &env)?;
         let workload = self.workload.as_deref();
         let log = open_log(&log, confinement, workload)?;
+        let cgroup = process::Cgroup::create(&limits)?;
+        let bounds = Bounds {
+            limits: &limits,
+            cgroup: cgroup.as_ref(),
+        };
         let (
             Spawned {
                 mut child,
@@ -532,7 +546,7 @@ impl Inner {
             tunnel,
         ) = match confinement {
             Confinement::Raw => (
-                spawn_raw(&program, &argv, &cwd, &env, io, workload, &limits)?,
+                spawn_raw(&program, &argv, &cwd, &env, io, workload, bounds)?,
                 None,
                 Some(TunnelRoute::Loopback),
             ),
@@ -553,7 +567,7 @@ impl Inner {
                     limits,
                 };
                 let (spawned, (placeholders, netns)) =
-                    spawn_sandboxed(policy, net, op, io, workload, &limits)?;
+                    spawn_sandboxed(policy, net, op, io, workload, bounds)?;
                 let tunnel = policy.network().local_bind().then(|| match netns {
                     Some(netns) => TunnelRoute::Netns(Arc::new(netns)),
                     None => TunnelRoute::Loopback,
@@ -605,6 +619,7 @@ impl Inner {
             exec_id: exec_id.clone(),
             output: output.clone(),
             done: done_rx,
+            cgroup,
         };
         if let Err(err) = std::thread::Builder::new()
             .name("exec-wait".to_string())
@@ -739,6 +754,8 @@ struct Waiter {
     exec_id: ExecId,
     output: Arc<Mutex<Output>>,
     done: Receiver<()>,
+    /// The command's cgroup, for `memoryBytes` and `processes` on Linux. Removed after the exit.
+    cgroup: Option<process::Cgroup>,
 }
 
 impl Waiter {
@@ -763,8 +780,13 @@ impl Waiter {
         if let Some(timer) = running.timer.take() {
             timer.abort();
         }
+        let out_of_memory = self
+            .cgroup
+            .as_ref()
+            .is_some_and(process::Cgroup::out_of_memory);
         let exit = match (running.timed_out, status) {
             (true, _) => ExitStatus::TimedOut,
+            (false, _) if out_of_memory => ExitStatus::MemoryLimit,
             (false, Ok(status)) => process::exit_status(status),
             (false, Err(err)) => {
                 tracing::warn!("reaping {} failed: {err}", self.exec_id);
@@ -922,7 +944,7 @@ fn spawn_raw(
     env: &BTreeMap<String, String>,
     io: Io,
     workload: Option<&Workload>,
-    limits: &Limits,
+    bounds: Bounds<'_>,
 ) -> Result<Spawned> {
     if !cwd.as_path().is_dir() {
         return Err(Error::not_found(format!(
@@ -951,7 +973,11 @@ fn spawn_raw(
     #[cfg(unix)]
     process::default_interrupt(&mut command);
     #[cfg(unix)]
-    process::limit(&mut command, limits);
+    process::limit(&mut command, bounds.limits);
+    // Before `run_as`: the workload user may not write to the supervisor's cgroups.
+    if let Some(cgroup) = bounds.cgroup {
+        cgroup.join(&mut command);
+    }
     #[cfg(unix)]
     let pty = io.terminal().map(process::pty::Pty::open).transpose()?;
     #[cfg(unix)]
@@ -968,7 +994,7 @@ fn spawn_raw(
         Error::new(Error::from(err).kind, message)
     })?;
     drop(command);
-    let spawned = adopt(child, limits)?;
+    let spawned = adopt(child, bounds.limits)?;
     #[cfg(unix)]
     return Ok(Spawned {
         terminal: pty.map(|pty| pty.master),
@@ -1009,7 +1035,7 @@ fn spawn_sandboxed(
     op: crate::helper::JobOp,
     io: Io,
     workload: Option<&Workload>,
-    limits: &Limits,
+    bounds: Bounds<'_>,
 ) -> Result<(Spawned, Held)> {
     let job = crate::helper::Job {
         policy: policy.clone(),
@@ -1020,10 +1046,12 @@ fn spawn_sandboxed(
         policy,
         net,
         exe: &exe,
+        #[cfg(target_os = "linux")]
+        cgroup: bounds.cgroup.map(process::Cgroup::procs),
     };
     let prepared = crate::sandbox::prepare(&plan, &job)?;
     let frame = crate::helper::encode_job(&job);
-    let spawned = spawn_helper(prepared.command, &frame, io, workload, limits)?;
+    let spawned = spawn_helper(prepared.command, &frame, io, workload, bounds.limits)?;
     Ok((spawned, (prepared.placeholders, prepared.netns)))
 }
 

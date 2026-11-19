@@ -57,6 +57,8 @@ pub mod testkit;
 #[cfg(feature = "node")]
 pub use controller::Controller;
 pub use error::{Error, ErrorKind, Result};
+#[cfg(feature = "node")]
+pub use process::init_limits;
 
 /// The version reported as `supervisorVersion` and in `hello`: the release version a release
 /// build sets in `HAPPY_SUPERVISOR_VERSION` (deploy/README.md), else the crate version.

@@ -4,7 +4,8 @@
 //! [`prepare`] makes the placeholders the policy needs and returns
 //! `bwrap <namespaces> <mounts> -- <exe> __sandbox [helper args]`. Inside, the helper calls
 //! [`enter`]: in an isolated exec it first starts the proxy bridge and the `tcp.open` control
-//! server and forks, the parent staying to serve them; then it restores `SIGTERM`, denies TCP
+//! server and forks, the parent staying to serve them; then it joins the command's limits cgroup
+//! (`Plan::cgroup`), so bubblewrap and the bridge stay outside it, restores `SIGTERM`, denies TCP
 //! binding with Landlock where the policy asks, installs the seccomp filters, and returns so the
 //! helper execs the command or performs the file operation.
 //!
@@ -23,7 +24,7 @@ mod seccomp;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,8 @@ struct HelperArgs {
     bridge: Option<(RawFd, RawFd)>,
     /// The helper's end of the `tcp.open` control socket.
     control: Option<RawFd>,
+    /// `cgroup.procs` of the command's limits cgroup, written to just before the exec.
+    cgroup: Option<RawFd>,
 }
 
 impl HelperArgs {
@@ -66,6 +69,9 @@ impl HelperArgs {
         }
         if let Some(fd) = self.control {
             args.extend(["--control".into(), fd.to_string().into()]);
+        }
+        if let Some(fd) = self.cgroup {
+            args.extend(["--cgroup".into(), fd.to_string().into()]);
         }
         args
     }
@@ -84,6 +90,7 @@ impl HelperArgs {
                 "--http" => http = Some(fd),
                 "--socks" => socks = Some(fd),
                 "--control" => parsed.control = Some(fd),
+                "--cgroup" => parsed.cgroup = Some(fd),
                 _ => return Err(bad("an unknown flag")),
             }
         }
@@ -178,10 +185,15 @@ fn open_path(path: &Path) -> Result<OwnedFd> {
         .custom_flags(libc::O_PATH)
         .open(path)
         .map_err(unavailable)?;
+    high(file.as_fd()).map_err(unavailable)
+}
+
+/// A copy of `fd` numbered at least [`FIRST_FREE_FD`], for the helper to inherit.
+fn high(fd: BorrowedFd) -> std::io::Result<OwnedFd> {
     // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor or -1, and nothing else owns it.
-    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, FIRST_FREE_FD) };
+    let fd = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, FIRST_FREE_FD) };
     if fd < 0 {
-        return Err(unavailable(std::io::Error::last_os_error()));
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: as above.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -220,6 +232,13 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
         );
         args.bridge = Some((http.as_raw_fd(), socks.as_raw_fd()));
         sockets.extend([http, socks]);
+    }
+    if let (Some(cgroup), true) = (plan.cgroup, is_exec) {
+        let cgroup = high(cgroup).map_err(|err| {
+            Error::sandbox_unavailable(format!("cannot pass the limits cgroup on: {err}"))
+        })?;
+        args.cgroup = Some(cgroup.as_raw_fd());
+        sockets.push(cgroup);
     }
     let (netns, control) = if is_exec && isolated && local_bind {
         let (netns, control) = netns::pair()?;
@@ -312,7 +331,12 @@ pub fn enter(policy: &ResolvedPolicy) -> Result<()> {
     if let Some(control) = &control {
         set_cloexec(control.as_raw_fd())?;
     }
-    for fd in args.bridge.iter().flat_map(|(http, socks)| [*http, *socks]) {
+    for fd in args
+        .bridge
+        .iter()
+        .flat_map(|(http, socks)| [*http, *socks])
+        .chain(args.cgroup)
+    {
         set_cloexec(fd)?;
     }
     if args.bridge.is_some() || control.is_some() {
@@ -328,6 +352,11 @@ pub fn enter(policy: &ResolvedPolicy) -> Result<()> {
             0 => drop((bridge, control)),
             child => supervise(child, bridge, control),
         }
+    }
+    if let Some(fd) = args.cgroup {
+        crate::process::cgroups::join(fd).map_err(|err| {
+            Error::sandbox_unavailable(format!("cannot join the limits cgroup: {err}"))
+        })?;
     }
     // SAFETY: restoring the default action has no memory effects.
     unsafe { libc::signal(libc::SIGTERM, libc::SIG_DFL) };
@@ -530,6 +559,7 @@ fn run_true(bwrap: &Bwrap) -> Result<()> {
         policy: &policy,
         net: None,
         exe: &exe,
+        cgroup: None,
     };
     let Prepared { mut command, .. } = prepare(&plan, &job)?;
     let (mut status_reader, status_writer) = std::io::pipe()?;
@@ -616,9 +646,22 @@ mod tests {
         let both = HelperArgs {
             bridge: Some((10, 12)),
             control: Some(11),
+            cgroup: Some(13),
         };
         let args = both.to_args();
-        assert_eq!(args, ["--http", "10", "--socks", "12", "--control", "11"]);
+        assert_eq!(
+            args,
+            [
+                "--http",
+                "10",
+                "--socks",
+                "12",
+                "--control",
+                "11",
+                "--cgroup",
+                "13"
+            ]
+        );
         assert_eq!(HelperArgs::parse(args).unwrap(), both);
         assert_eq!(HelperArgs::parse([]).unwrap(), HelperArgs::default());
         assert_eq!(

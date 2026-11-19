@@ -34,13 +34,18 @@ pub(crate) fn default_interrupt(command: &mut Command) {
     }
 }
 
-/// The `exec.start` limits Unix enforces: `cpuSeconds` only, as `RLIMIT_CPU`, which every process
-/// the command starts inherits and counts for itself. The tree-wide memory and process limits
-/// need cgroups (Linux) or are not available (macOS).
+/// The `exec.start` limits Unix enforces. `cpuSeconds` is `RLIMIT_CPU`, which every process the
+/// command starts inherits and counts for itself. On Linux, `memoryBytes` and `processes` are a
+/// cgroup of the command's own ([`super::cgroups`]), when the supervisor's cgroup was delegated to
+/// it. macOS has neither: `RLIMIT_NPROC` counts every process of the user, not of the tree.
 pub(crate) fn limit_support() -> LimitSupport {
+    #[cfg(target_os = "linux")]
+    let (memory_bytes, processes) = super::cgroups::support();
+    #[cfg(not(target_os = "linux"))]
+    let (memory_bytes, processes) = (false, false);
     LimitSupport {
-        memory_bytes: false,
-        processes: false,
+        memory_bytes,
+        processes,
         cpu_seconds: true,
     }
 }

@@ -76,12 +76,21 @@ that is not root runs its work as itself, which is already a separate user.
    Restart=on-failure
    # Exit code 3: the control plane revoked the credential. Join again instead.
    RestartPreventExitStatus=3
+   # The service's cgroup is the supervisor's, for exec.start limits.memoryBytes and processes.
+   Delegate=yes
 
    [Install]
    WantedBy=multi-user.target
    ```
 
    Then `sudo systemctl daemon-reload && sudo systemctl enable --now happy-supervisor`.
+
+   `Delegate=yes` gives the supervisor the service's cgroup (cgroup v2). It moves itself into a
+   `supervisor` child and runs each command with `memoryBytes` or `processes` in a child of its
+   own, `exec-<pid>-<n>`, with `memory.max` and `pids.max`. Without delegation, or when another
+   process shares its cgroup, NodeInfo `limits` reports both `false` and `exec.start` refuses
+   them; the log says why at startup. A user service needs the user manager to delegate the
+   `memory` and `pids` controllers, as systemd's `user@.service` does by default.
 
    Do not add `RestrictNamespaces=`, `PrivateUsers=` or `ProtectSystem=`/`ProtectHome=`: the
    sandbox needs user namespaces and mounts of its own, and the commands the control plane runs

@@ -174,7 +174,14 @@ normally it kills every running group.
 
 `exec.start` `limits` are applied where the tree is made: `setrlimit(RLIMIT_CPU)` in the same
 `pre_exec` on Unix (`process::limit`), and the Job Object's limits on Windows
-(`process::job_limits`). A sandboxed Windows command runs in the runner's job, not the broker's,
+(`process::job_limits`). On Linux, `memoryBytes` and `processes` are a cgroup v2 per command
+(`process::cgroups`): at startup the supervisor checks that its own cgroup is delegated to it
+alone, moves itself into a `supervisor` leaf and enables `memory` and `pids` for children. A
+command's cgroup gets `memory.max` (no swap, `memory.oom.group`) and `pids.max`. A raw command
+joins it in `pre_exec`, before it becomes the workload user. A sandboxed one joins through an
+inherited `cgroup.procs` descriptor (`--cgroup`), from the helper just before its exec. After the
+exit, `memory.events` tells a kill for `memoryBytes` (`memoryLimit`) from any other, and the
+cgroup is removed, or retried later while something the command left behind is still in it. A sandboxed Windows command runs in the runner's job, not the broker's,
 so its limits travel in the helper job (`JobOp::Exec`) and the broker sets them on the runner's
 job, with one more process for the runner. `process::limit_support` is what
 NodeInfo reports, and `exec` refuses any limit it lacks before starting anything.

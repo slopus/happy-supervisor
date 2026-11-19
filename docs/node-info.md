@@ -184,8 +184,8 @@ Which `exec.start` `limits` (api.md) this node enforces. A limit marked `false` 
 
 | Field | Type | Meaning |
 |---|---|---|
-| `memoryBytes` | bool | Windows: a Job Object memory limit. Linux and macOS: `false`, because no rlimit bounds a process tree's memory (`RLIMIT_AS` counts address space, not memory). |
-| `processes` | bool | Windows: a Job Object active-process limit. Linux and macOS: `false`, because `RLIMIT_NPROC` counts every process of the user, not of the tree. |
+| `memoryBytes` | bool | Windows: a Job Object memory limit. Linux: `memory.max` of a cgroup v2 per command, `true` when the supervisor's cgroup was delegated to it and has the `memory` controller (install.md, `Delegate=yes`). macOS: `false`, because no rlimit bounds a process tree's memory (`RLIMIT_AS` counts address space, not memory). |
+| `processes` | bool | Windows: a Job Object active-process limit. Linux: `pids.max` of the same cgroup, `true` with a delegated cgroup that has the `pids` controller. macOS: `false`, because `RLIMIT_NPROC` counts every process of the user, not of the tree. |
 | `cpuSeconds` | bool | `true` everywhere: `RLIMIT_CPU` on Unix, a Job Object per-process time limit on Windows. |
 
 ### `defaultEnv`

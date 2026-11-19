@@ -158,6 +158,8 @@ async fn sandboxed(
         policy: &job.policy,
         net: None,
         exe: &exe,
+        #[cfg(target_os = "linux")]
+        cgroup: None,
     };
     let mut prepared = crate::sandbox::prepare(&plan, &job)?;
     crate::identity::run_as(&mut prepared.command, workload.as_deref(), None)?;

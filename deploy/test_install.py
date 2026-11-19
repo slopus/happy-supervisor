@@ -135,6 +135,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn(f'ExecStart="{self.bin}" run --state-dir "{self.state}" --workload-user happy-workload\n',
                       unit)
         self.assertIn('WantedBy=multi-user.target', unit)
+        self.assertIn('\nDelegate=yes\n', unit)
         self.assertEqual([e for e in events if e[0] == 'systemctl'],
                          [['systemctl', 'daemon-reload'], ['systemctl', 'enable', 'happy-supervisor'],
                           ['systemctl', 'restart', 'happy-supervisor']])
@@ -180,6 +181,7 @@ class InstallTests(unittest.TestCase):
         unit = (home / '.config/systemd/user/happy-supervisor.service').read_text()
         self.assertIn(f'ExecStart="{home}/.local/bin/happy-supervisor" run --state-dir "{state}"\n', unit)
         self.assertIn('WantedBy=default.target', unit)
+        self.assertIn('\nDelegate=yes\n', unit)
         self.assertIn(['systemctl', '--user', 'restart', 'happy-supervisor'], events)
         self.assertIn(['loginctl', 'enable-linger', 'me'], events)
 

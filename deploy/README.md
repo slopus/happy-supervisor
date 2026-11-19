@@ -124,3 +124,7 @@ Infra sets up, once:
   `happy-supervisor install-sandbox` as an administrator, on every Windows node; it deletes the
   version 1 accounts first. A Linux supervisor running as root refuses to start without
   `--workload-user`.
+* **Unreleased.** Linux enforces `limits.memoryBytes` and `limits.processes` when the service's
+  cgroup is delegated to the supervisor, and the installer's unit now says `Delegate=yes`. On an
+  existing Linux node, run `install.sh` again, or add `Delegate=yes` to the unit's `[Service]`
+  and restart it. A command killed for `memoryBytes` exits with `{ "kind": "memoryLimit" }`.

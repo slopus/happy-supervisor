@@ -117,13 +117,15 @@ fn main() -> ExitCode {
 }
 
 /// Opens the state directory and checks, before anything else runs, that the supervisor may
-/// run its work as the user it would (identity.rs).
+/// run its work as the user it would (identity.rs). Then, before it starts any process, takes
+/// over a cgroup delegated to it for the limits (process/cgroups.rs).
 fn open_state(
     dir: Option<PathBuf>,
     workload_user: Option<String>,
 ) -> happy_supervisor::Result<StateDir> {
     let state = StateDir::open(dir)?.with_workload_user(workload_user);
     Identity::resolve(state.workload_user()?.as_deref())?;
+    happy_supervisor::init_limits();
     Ok(state)
 }
 

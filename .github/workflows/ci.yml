@@ -59,6 +59,16 @@ jobs:
           bin=$(cargo test --all-features --test workload --no-run --message-format=json \
             | jq -r 'select(.target.name == "workload" and .executable != null) | .executable')
           sudo "$bin" --nocapture
+      # limits.memoryBytes and processes need a cgroup delegated to the supervisor: each node runs
+      # in a user scope with Delegate=yes, as an installed user service would (docs/install.md).
+      - name: limits, in a delegated cgroup
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+          HAPPY_TEST_DELEGATED=1 cargo test --all-features --test limits -- --nocapture
       # Timing tests, alone so nothing else competes for the CPU, and in release as shipped.
       - run: cargo test --release --all-features --test e2e -- --ignored --nocapture
         if: runner.os != 'Windows'

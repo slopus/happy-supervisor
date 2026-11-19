@@ -1,4 +1,9 @@
 //! `exec.start` `limits` (api.md), raw and sandboxed, through a `serve` node.
+//!
+//! On Linux, `memoryBytes` and `processes` need a cgroup delegated to the node. With
+//! `HAPPY_TEST_DELEGATED` set, as CI sets it, each node runs in a systemd user scope with
+//! `Delegate=yes`, like the installed service (docs/install.md), and those tests must pass.
+//! Without it they check that the node refuses both.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -23,7 +28,16 @@ impl Node {
     async fn start() -> Node {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("token"), format!("{TOKEN}\n")).unwrap();
-        let mut child = Command::new(BIN)
+        let mut command = if delegated() {
+            let mut command = Command::new("systemd-run");
+            command
+                .args(["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"])
+                .arg(BIN);
+            command
+        } else {
+            Command::new(BIN)
+        };
+        let mut child = command
             .args(["serve", "--listen", "127.0.0.1:0", "--token-file"])
             .arg(dir.path().join("token"))
             .arg("--state-dir")
@@ -80,6 +94,12 @@ impl Node {
     }
 }
 
+/// Whether the node runs in a cgroup delegated to it, so Linux enforces `memoryBytes` and
+/// `processes`.
+fn delegated() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("HAPPY_TEST_DELEGATED").is_some()
+}
+
 fn cwd() -> &'static str {
     if cfg!(windows) { r"C:\" } else { "/" }
 }
@@ -120,14 +140,14 @@ fn spin() -> Vec<&'static str> {
 async fn node_info_says_which_limits_are_enforced() {
     let node = Node::start().await;
     let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
-    let windows = cfg!(windows);
+    let tree = cfg!(windows) || delegated();
     assert_eq!(
         (
             info.limits.memory_bytes,
             info.limits.processes,
             info.limits.cpu_seconds
         ),
-        (windows, windows, true)
+        (tree, tree, true)
     );
 }
 
@@ -157,6 +177,9 @@ async fn cpu_seconds_ends_a_process_that_spins() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_limit_this_node_cannot_enforce_is_refused() {
+    if delegated() {
+        return;
+    }
     let node = Node::start().await;
     let params = |limits: Json| {
         happy_supervisor::wire::to_value(&json!({ "execId": "x", "argv": ["/bin/true"],
@@ -177,14 +200,65 @@ async fn a_limit_this_node_cannot_enforce_is_refused() {
     );
 }
 
-#[cfg(windows)]
+/// Linux kills the whole tree over `memoryBytes`, and says so in the exit. Windows makes the
+/// allocation fail instead.
 #[tokio::test]
-async fn processes_caps_the_tree() {
+async fn memory_bytes_kills_the_tree_over_it() {
+    if !delegated() {
+        return;
+    }
     let node = Node::start().await;
-    let nested = ["cmd", "/c", "cmd", "/c", "echo", "nested"];
+    // Writes 256 MiB, so the memory is used and not only reserved.
+    let allocate = [
+        "python3",
+        "-c",
+        "x = b'a' * (256 << 20); print('allocated')",
+    ];
     for (label, access) in [("raw", raw()), ("sandboxed", sandboxed())] {
         let (exit, output, _) = node
-            .run(label, &nested, &access, json!({ "processes": 2 }))
+            .run(
+                label,
+                &allocate,
+                &access,
+                json!({ "memoryBytes": 512u64 << 20 }),
+            )
+            .await;
+        assert_eq!(
+            (exit, output.as_str()),
+            (ExitStatus::Exited { code: 0 }, "allocated\n"),
+            "{label}"
+        );
+        let (exit, output, _) = node
+            .run(
+                &format!("{label}-64m"),
+                &allocate,
+                &access,
+                json!({ "memoryBytes": 64u64 << 20 }),
+            )
+            .await;
+        assert_eq!(
+            (exit, output.as_str()),
+            (ExitStatus::MemoryLimit, ""),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn processes_caps_the_tree() {
+    if cfg!(unix) && !delegated() {
+        return;
+    }
+    let node = Node::start().await;
+    // Two processes: the shell and the one it starts.
+    let nested: &[&str] = if cfg!(windows) {
+        &["cmd", "/c", "cmd", "/c", "echo", "nested"]
+    } else {
+        &["/bin/sh", "-c", "/bin/echo nested & wait"]
+    };
+    for (label, access) in [("raw", raw()), ("sandboxed", sandboxed())] {
+        let (exit, output, _) = node
+            .run(label, nested, &access, json!({ "processes": 2 }))
             .await;
         assert_eq!(
             (exit, output.trim()),
@@ -194,12 +268,21 @@ async fn processes_caps_the_tree() {
         let (exit, output, _) = node
             .run(
                 &format!("{label}-1"),
-                &nested,
+                nested,
                 &access,
                 json!({ "processes": 1 }),
             )
             .await;
-        assert_ne!(exit, ExitStatus::Exited { code: 0 }, "{label}: {output}");
-        assert!(!output.contains("nested"), "{label}: {output}");
+        if cfg!(windows) {
+            assert_ne!(exit, ExitStatus::Exited { code: 0 }, "{label}: {output}");
+            assert!(!output.contains("nested"), "{label}: {output}");
+        } else {
+            // The shell cannot fork: dash says so and exits with 2.
+            assert_eq!(
+                (exit, output.as_str()),
+                (ExitStatus::Exited { code: 2 }, "/bin/sh: 0: Cannot fork\n"),
+                "{label}"
+            );
+        }
     }
 }

@@ -642,19 +642,22 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
 * `limits` is optional: `{ "memoryBytes", "processes", "cpuSeconds" }`, each optional and at
   least 1. A limit this node cannot enforce is `sandbox_unavailable` and starts nothing, so a
   limit is never silently dropped. NodeInfo `limits` says which ones it enforces.
-  * `memoryBytes`: the memory the whole process tree may commit together. An allocation beyond
-    it fails.
+  * `memoryBytes`: the memory the whole process tree may use together. On Windows an allocation
+    beyond it fails. On Linux the kernel kills the whole tree, and the exit is `memoryLimit`;
+    swap does not extend it.
   * `processes`: how many processes the tree may have at once, the first one included. Starting
-    one more fails.
+    one more fails (`fork` returns `EAGAIN` on Linux).
   * `cpuSeconds`: the CPU time **each** process of the tree may use; it is not summed over the
     tree. A process over it is ended. On Unix it gets `SIGXCPU` (24), then `SIGKILL` a second
     later if it handles that. On Windows only user-mode time counts, and the Job Object ends the
     process with exit code -1073741756 (`0xC0000044`, `STATUS_QUOTA_EXCEEDED`). Use `timeout`
     for wall-clock time.
 
-  Raw and sandboxed commands both take limits. A sandboxed command's tree includes the sandbox's
-  own processes: bubblewrap and the helper on Linux, and on Windows the runner, which counts
-  toward `memoryBytes` but not `processes`.
+  Raw and sandboxed commands both take limits. On Linux, `memoryBytes` and `processes` are a
+  cgroup of the command's own, which only a supervisor with a delegated cgroup has (install.md);
+  a sandboxed command joins it inside the sandbox, so bubblewrap and the helper do not count. On
+  Windows a sandboxed command's tree includes the runner, which counts toward `memoryBytes` but
+  not `processes`.
 
 Result:
 
@@ -723,6 +726,8 @@ full (see Event delivery).
 * `{ "kind": "exited", "code": 0 }`. The process exited with that code.
 * `{ "kind": "signaled", "signal": 9 }`. Unix only. A signal ended it.
 * `{ "kind": "timedOut" }`. The timeout's `kill` action killed the tree.
+* `{ "kind": "memoryLimit" }`. Linux only. The tree went over `limits.memoryBytes`, and the
+  kernel killed all of it.
 
 A backgrounded process that later exits reports `exited` or `signaled` as usual.
 

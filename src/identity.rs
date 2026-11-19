@@ -212,6 +212,59 @@ impl Workload {
         self.uid
     }
 
+    /// Creates or truncates the file log at `path` as this user, in the helper
+    /// ([`crate::helper::OPEN_LOG_ARG`]), which hands back the log and its directory, so the OS
+    /// checks it as this user and the supervisor never resolves the path itself.
+    pub(crate) fn create_log(
+        &self,
+        path: &crate::protocol::AbsPath,
+    ) -> Result<(crate::exec::log::Place, std::fs::File)> {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        use std::process::Stdio;
+
+        let (ours, theirs) = std::os::unix::net::UnixDatagram::pair()?;
+        let mut command = std::process::Command::new(crate::helper::exe()?);
+        command
+            .args([crate::helper::HELPER_ARG, crate::helper::OPEN_LOG_ARG])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+            .stderr(Stdio::piped());
+        self.apply(&mut command, None)?;
+        let mut child = command.spawn()?;
+        drop(command);
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        // A helper that dies early closes its stdin; its exit then says why.
+        let _ = stdin.write_all(&crate::helper::encode_frame(path));
+        drop(stdin);
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "the log helper exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        let (frame, fds) = crate::helper::recv_fds(ours.as_fd(), 64 << 10, 2)?;
+        let reply: std::result::Result<(), Error> = crate::helper::read_frame(&mut &frame[..])?;
+        reply?;
+        let [dir, file]: [std::os::fd::OwnedFd; 2] = fds
+            .try_into()
+            .map_err(|_| Error::new(ErrorKind::Io, "the log helper sent no descriptors"))?;
+        let name = path
+            .as_path()
+            .file_name()
+            .unwrap_or_default()
+            .to_os_string();
+        Ok((
+            crate::exec::log::Place::from_parts(dir, name),
+            std::fs::File::from(file),
+        ))
+    }
+
     /// Makes `command`'s child this user before it execs: its supplementary groups, gid and uid,
     /// then `cwd` (or `/`), so the OS checks the working directory as this user. Do not also
     /// set `current_dir`, which the child would enter as the supervisor.

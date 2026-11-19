@@ -808,8 +808,9 @@ output is the least useful.
   to 64 MiB and may be at most 1 GiB. The parent directory must exist. The node never creates
   directories for a log. The file is created, or truncated if it exists. Under a sandbox, `path`
   must be writable by the policy, and the node checks that against the policy before starting.
-  The node writes the log itself, not the sandboxed process. A node with a workload user does
-  not support file logs yet and replies `invalid_params`. When the middle is dropped, the
+  The node writes the log itself, not the sandboxed process. A node with a workload user has
+  that user create or truncate the file, so it needs that user's permission and belongs to it,
+  and then writes it through the descriptor it got. When the middle is dropped, the
   node rewrites the file as the head, one line `[happy-supervisor: N bytes omitted]` (`N` is
   every byte dropped so far), then the tail, by writing `<name>.happy-supervisor-tmp` beside it
   and renaming it over. The line follows the head's last byte directly, even mid-line.

@@ -40,6 +40,13 @@ pub const HELPER_ARG: &str = "__sandbox";
 /// framed like a job, and it replies like a file job.
 pub const UNCONFINED_FS_ARG: &str = "fs";
 
+/// After [`HELPER_ARG`]: create or truncate one file log as this process's user. Its stdin
+/// holds the log's path, framed like a job. Its stdout is a Unix datagram socket, on which it
+/// sends one frame of `Result<(), Error>`, with the descriptors of the log's directory and of
+/// the log when it is `Ok` ([`send_fds`]). Logs of a workload user's commands open this way
+/// (identity.rs).
+pub const OPEN_LOG_ARG: &str = "open-log";
+
 /// The helper's fd for the exec status pipe.
 pub const STATUS_FD: i32 = 3;
 
@@ -242,6 +249,7 @@ fn unix_main() -> ! {
     match std::env::args_os().nth(2) {
         Some(arg) if arg == UNCONFINED_FS_ARG => unconfined_fs(),
         Some(arg) if arg == crate::watch::HELPER_WATCH_ARG => crate::watch::helper_main(),
+        Some(arg) if arg == OPEN_LOG_ARG => open_log(),
         _ => {}
     }
     let Job { policy, op } = match read_stdin_job() {
@@ -357,6 +365,84 @@ pub fn encode_fs_reply(result: Result<FsResponse>) -> Vec<u8> {
         Ok(response) => FsReply::Ok(response),
         Err(err) => FsReply::Err(err),
     })
+}
+
+/// [`OPEN_LOG_ARG`]: the parent made this process the workload user.
+#[cfg(unix)]
+fn open_log() -> ! {
+    use std::os::fd::{AsFd as _, OwnedFd};
+
+    let opened = read_frame::<AbsPath>(&mut std::io::stdin().lock())
+        .and_then(|path| crate::exec::log::Place::create(path.as_path()));
+    let (reply, fds): (Result<()>, Vec<OwnedFd>) = match opened {
+        Ok((place, file)) => (Ok(()), vec![place.into_parts().0, file.into()]),
+        Err(err) => (Err(err), Vec::new()),
+    };
+    let stdout = std::io::stdout();
+    let sent = send_fds(stdout.as_fd(), &encode_frame(&reply), &fds);
+    std::process::exit(if sent.is_ok() { 0 } else { 1 })
+}
+
+/// Sends `data` as one message on the Unix socket `socket`, with `fds` attached.
+#[cfg(unix)]
+pub(crate) fn send_fds(
+    socket: std::os::fd::BorrowedFd<'_>,
+    data: &[u8],
+    fds: &[std::os::fd::OwnedFd],
+) -> std::io::Result<()> {
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+    use std::os::fd::{AsRawFd as _, RawFd};
+
+    let raw: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+    let rights = [ControlMessage::ScmRights(&raw)];
+    let cmsgs = if raw.is_empty() { &[][..] } else { &rights[..] };
+    sendmsg::<()>(
+        socket.as_raw_fd(),
+        &[std::io::IoSlice::new(data)],
+        cmsgs,
+        MsgFlags::empty(),
+        None,
+    )?;
+    Ok(())
+}
+
+/// Receives one message of at most `max` bytes, and at most `max_fds` descriptors, from the
+/// Unix datagram socket `socket`.
+#[cfg(unix)]
+pub(crate) fn recv_fds(
+    socket: std::os::fd::BorrowedFd<'_>,
+    max: usize,
+    max_fds: usize,
+) -> std::io::Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+
+    let mut data = vec![0u8; max];
+    let mut space = vec![0u8; nix::sys::socket::cmsg_space::<RawFd>() * max_fds.max(1)];
+    let mut iov = [std::io::IoSliceMut::new(&mut data)];
+    let message = recvmsg::<()>(
+        socket.as_raw_fd(),
+        &mut iov,
+        Some(&mut space),
+        MsgFlags::empty(),
+    )?;
+    let mut fds = Vec::new();
+    for cmsg in message.cmsgs()? {
+        if let ControlMessageOwned::ScmRights(received) = cmsg {
+            for fd in received {
+                // SAFETY: the kernel just gave this process the descriptor, and nothing else
+                // owns it.
+                fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+    for fd in &fds {
+        // SAFETY: fcntl on an open descriptor has no memory effects.
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let len = message.bytes;
+    data.truncate(len);
+    Ok((data, fds))
 }
 
 #[cfg(unix)]

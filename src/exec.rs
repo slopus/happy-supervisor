@@ -5,7 +5,7 @@
 //! waiter reports the exit once both readers are done. The [`Table`] maps IDs to [`Phase`]s.
 //! Locks are always taken table first, then a process's output.
 
-mod log;
+pub(crate) mod log;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -521,14 +521,7 @@ impl Inner {
         }
         let program = resolve_program(argv.program(), &env)?;
         let workload = self.workload.as_deref();
-        if let (Some(workload), LogSpec::File { .. }) = (workload, &log) {
-            return Err(Error::invalid_params(format!(
-                "this node runs its commands as {:?}, and file logs, which the supervisor \
-                 writes, are not supported with a workload user yet: use a memory log",
-                workload.name()
-            )));
-        }
-        let log = open_log(&log, confinement)?;
+        let log = open_log(&log, confinement, workload)?;
         let (
             Spawned {
                 mut child,
@@ -887,18 +880,23 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
-/// Creates the process's log. A file log under a sandbox must be writable by its policy.
-fn open_log(spec: &LogSpec, confinement: &Confinement) -> Result<Log> {
+/// Creates the process's log. A file log under a sandbox must be writable by its policy. With a
+/// workload user, that user creates it.
+fn open_log(spec: &LogSpec, confinement: &Confinement, workload: Option<&Workload>) -> Result<Log> {
     match spec {
         LogSpec::Memory { .. } => Ok(Log::Memory(MemoryLog::new(spec.limit_bytes()))),
         LogSpec::File { path, .. } => {
             if let Confinement::Sandboxed(policy) = confinement {
                 check_log_writable(policy, path.as_path())?;
             }
-            Ok(Log::File(FileLog::create(
-                path.as_path(),
-                spec.limit_bytes(),
-            )?))
+            let (place, file) = match workload {
+                None => log::Place::create(path.as_path())?,
+                #[cfg(unix)]
+                Some(workload) => workload.create_log(path)?,
+                #[cfg(windows)]
+                Some(workload) => match *workload {},
+            };
+            Ok(Log::File(FileLog::new(place, file, spec.limit_bytes())))
         }
     }
 }

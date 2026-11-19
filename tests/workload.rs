@@ -306,6 +306,45 @@ async fn commands_and_file_operations_run_as_the_workload_user() {
     assert_eq!(err.kind, ErrorKind::PermissionDenied, "{}", err.message);
     assert!(!private.join("planted").exists());
 
+    // The workload user creates a file log, and a rewrite keeps it its own.
+    let start_logged = |exec_id: &str, path: &Path| {
+        happy_supervisor::wire::to_value(&json!({ "execId": exec_id,
+            "argv": ["/bin/sh", "-c", "printf 0123456789abcdefghijklmnopqrstuvwxyz"], "cwd": "/",
+            "env": {}, "access": raw(),
+            "log": { "kind": "file", "path": path.to_str().unwrap(), "limitBytes": 16 } }))
+    };
+    let err = node
+        .ctl
+        .call(
+            "exec.start",
+            start_logged("log-denied", &private.join("x.log")),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::PermissionDenied, "{}", err.message);
+    assert!(!private.join("x.log").exists());
+    let log = node.shared().join("out.log");
+    let mut events = node.ctl.events();
+    node.ctl
+        .call("exec.start", start_logged("logged", &log))
+        .await
+        .unwrap();
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await.unwrap() {
+            Some(Event::ExecExit(exit)) if exit.exec_id.as_str() == "logged" => break,
+            Some(_) => {}
+            None => panic!("the events ended"),
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "0123[happy-supervisor: 24 bytes omitted]\nstuvwxyz"
+    );
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().uid(),
+        uid.parse::<i64>().unwrap() as u32
+    );
+
     // Watches run as the workload user too: it cannot watch what it cannot read.
     let watch = |watch_id: &str, path: &Path| {
         happy_supervisor::wire::to_value(&json!({ "watchId": watch_id,

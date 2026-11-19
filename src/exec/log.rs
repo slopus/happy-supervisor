@@ -4,12 +4,13 @@
 //! [`Window`] is the offset arithmetic alone. The sinks, [`MemoryLog`] and [`FileLog`], store
 //! the bytes it says to keep, and [`Log`] is either of them or a discarded memory log.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write as _;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::protocol::ByteRange;
 
 /// Which logical bytes of a log are retained. Offsets count everything the process wrote.
@@ -170,11 +171,136 @@ impl MemoryLog {
     }
 }
 
+/// Where a file log lives: its directory and its name there. On Unix the directory is held
+/// open and the log is named only relative to it, so a rewrite never follows a path that changed
+/// after the log was created, whoever controls the directory (a workload user, policy.md).
+#[derive(Debug)]
+pub struct Place {
+    #[cfg(unix)]
+    dir: std::os::fd::OwnedFd,
+    #[cfg(windows)]
+    dir: std::path::PathBuf,
+    name: OsString,
+}
+
+impl Place {
+    /// Opens `path`'s directory, which must exist, and creates or truncates the log in it, as
+    /// this process's user.
+    pub fn create(path: &Path) -> Result<(Place, File)> {
+        let (parent, name) = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => (parent, name.to_os_string()),
+            _ => {
+                return Err(Error::invalid_params(format!(
+                    "{} names no file",
+                    path.display()
+                )));
+            }
+        };
+        #[cfg(unix)]
+        let place = {
+            use nix::fcntl::OFlag;
+            // O_PATH needs only search permission on the directory.
+            #[cfg(target_os = "linux")]
+            let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+            #[cfg(not(target_os = "linux"))]
+            let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+            let dir = nix::fcntl::open(parent, flags, nix::sys::stat::Mode::empty())
+                .map_err(std::io::Error::from)?;
+            Place { dir, name }
+        };
+        #[cfg(windows)]
+        let place = Place {
+            dir: parent.to_path_buf(),
+            name,
+        };
+        let file = place.open(&place.name, false)?;
+        Ok((place, file))
+    }
+
+    /// Opens `name` in the directory for reading and writing, truncated. `fresh` makes it
+    /// anew, never through what is there, replacing a file or symlink of that name.
+    fn open(&self, name: &OsString, fresh: bool) -> Result<File> {
+        #[cfg(unix)]
+        {
+            use nix::fcntl::OFlag;
+            use nix::sys::stat::Mode;
+            let mut flags = OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_CLOEXEC;
+            if fresh {
+                match nix::unistd::unlinkat(
+                    &self.dir,
+                    name.as_os_str(),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                ) {
+                    Ok(()) | Err(nix::errno::Errno::ENOENT) => {}
+                    Err(err) => return Err(std::io::Error::from(err).into()),
+                }
+                flags |= OFlag::O_EXCL | OFlag::O_NOFOLLOW;
+            }
+            let mode = Mode::from_bits_truncate(0o666);
+            let fd = nix::fcntl::openat(&self.dir, name.as_os_str(), flags, mode)
+                .map_err(std::io::Error::from)?;
+            Ok(File::from(fd))
+        }
+        #[cfg(windows)]
+        {
+            let _ = fresh;
+            Ok(File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(self.dir.join(name))?)
+        }
+    }
+
+    /// Renames `temp` over the log.
+    fn replace_with(&self, temp: &OsString) -> Result<()> {
+        #[cfg(unix)]
+        nix::fcntl::renameat(
+            &self.dir,
+            temp.as_os_str(),
+            &self.dir,
+            self.name.as_os_str(),
+        )
+        .map_err(std::io::Error::from)?;
+        #[cfg(windows)]
+        std::fs::rename(self.dir.join(temp), self.dir.join(&self.name))?;
+        Ok(())
+    }
+
+    /// Hands `place` and its log, opened elsewhere, to a [`FileLog`] (a workload user's,
+    /// identity.rs).
+    #[cfg(unix)]
+    pub fn from_parts(dir: std::os::fd::OwnedFd, name: OsString) -> Place {
+        Place { dir, name }
+    }
+
+    #[cfg(unix)]
+    pub fn into_parts(self) -> (std::os::fd::OwnedFd, OsString) {
+        (self.dir, self.name)
+    }
+}
+
+/// Gives `temp` the owner and mode of `log`, which it replaces: a supervisor running as root
+/// rewrites a workload user's log.
+#[cfg(unix)]
+fn same_owner(temp: &File, log: &File) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let (want, have) = (log.metadata()?, temp.metadata()?);
+    if (want.uid(), want.gid()) != (have.uid(), have.gid()) {
+        std::os::unix::fs::fchown(temp, Some(want.uid()), Some(want.gid()))?;
+    }
+    if want.mode() != have.mode() {
+        temp.set_permissions(std::fs::Permissions::from_mode(want.mode() & 0o7777))?;
+    }
+    Ok(())
+}
+
 /// A log written to a file as plain text: the head, then, once the middle was dropped, the line
 /// `[happy-supervisor: N bytes omitted]`, then the tail.
 #[derive(Debug)]
 pub struct FileLog {
-    path: PathBuf,
+    place: Place,
     file: File,
     window: Window,
     /// The file offset of the logical byte `window.tail_start()`.
@@ -183,20 +309,21 @@ pub struct FileLog {
 
 impl FileLog {
     /// Creates or truncates `path`. Its parent must exist.
+    #[cfg(test)]
     pub fn create(path: &Path, limit: u64) -> Result<FileLog> {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        let (place, file) = Place::create(path)?;
+        Ok(FileLog::new(place, file, limit))
+    }
+
+    /// A log in `file`, just created or truncated at `place`.
+    pub fn new(place: Place, file: File, limit: u64) -> FileLog {
         let window = Window::new(limit);
-        Ok(FileLog {
-            path: path.to_path_buf(),
+        FileLog {
+            place,
             file,
             tail_at: window.tail_start(),
             window,
-        })
+        }
     }
 
     pub fn append(&mut self, chunk: &[u8]) -> Result<()> {
@@ -213,17 +340,12 @@ impl FileLog {
     fn compact(&mut self, before: &Window, append: &Append, chunk: &[u8]) -> Result<()> {
         let start = before.total();
         let slice = |r: &Range<u64>| &chunk[(r.start - start) as usize..(r.end - start) as usize];
-        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
-        name.push(".happy-supervisor-tmp");
-        let temp_path = self.path.with_file_name(name);
-        let mut temp = std::io::BufWriter::new(
-            File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp_path)?,
-        );
+        let mut temp_name = self.place.name.clone();
+        temp_name.push(".happy-supervisor-tmp");
+        let temp = self.place.open(&temp_name, true)?;
+        #[cfg(unix)]
+        same_owner(&temp, &self.file)?;
+        let mut temp = std::io::BufWriter::new(temp);
 
         let old_head = before.total().min(before.head_end());
         self.copy_to(&mut temp, 0..old_head)?;
@@ -241,7 +363,7 @@ impl FileLog {
         temp.write_all(slice(&append.tail))?;
         let temp = temp.into_inner().map_err(|err| err.into_error())?;
 
-        std::fs::rename(&temp_path, &self.path)?;
+        self.place.replace_with(&temp_name)?;
         self.file = temp;
         self.tail_at = self.window.head_end() + marker.len() as u64;
         Ok(())

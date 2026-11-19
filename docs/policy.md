@@ -250,6 +250,8 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
   runs as the user, so unprivileged user namespaces must be allowed for it. An isolated
   command's sandbox reaches its proxy sockets through descriptors the node passes it, not by
   path, so no other process of the user can reach them.
-* Not supported yet, and refused rather than run as root: `log.kind: "file"`, which the
-  supervisor would write (`invalid_params`), and a workload user on Windows, where the node does
-  not start with one.
+* A `log.kind: "file"` log is created or truncated by a helper running as that user, which
+  hands the supervisor the open log and its directory. The supervisor writes through those and
+  makes its rewrites relative to that directory, never by path, and gives each rewritten file
+  the owner and mode of the one it replaces.
+* Not supported yet: a workload user on Windows, where the node does not start with one.

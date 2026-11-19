@@ -94,7 +94,7 @@ seccompiler = { version = "0.5", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
-nix = { version = "0.30", features = ["signal", "process", "fs", "user"], optional = true }
+nix = { version = "0.30", features = ["signal", "process", "fs", "user", "socket", "uio"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = [

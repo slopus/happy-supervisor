@@ -21,6 +21,9 @@ pub(crate) fn internal(ip: IpAddr, own: &[IpAddr]) -> bool {
     }
 }
 
+/// Azure's host endpoint (DHCP, DNS, the guest agent), reachable from every VM.
+const AZURE_WIRESERVER: Ipv4Addr = Ipv4Addr::new(168, 63, 129, 16);
+
 fn internal_v4(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
     a == 0
@@ -30,6 +33,7 @@ fn internal_v4(ip: Ipv4Addr) -> bool {
         || (a == 100 && (64..128).contains(&b))
         || ip.is_multicast()
         || ip.is_broadcast()
+        || ip == AZURE_WIRESERVER
 }
 
 fn internal_v6(ip: Ipv6Addr) -> bool {
@@ -94,6 +98,8 @@ mod tests {
             ("172.32.0.1", false),
             ("192.168.1.1", true),
             ("169.254.169.254", true),
+            ("168.63.129.16", true),
+            ("168.63.129.17", false),
             ("100.64.0.1", true),
             ("100.127.255.255", true),
             ("100.128.0.1", false),

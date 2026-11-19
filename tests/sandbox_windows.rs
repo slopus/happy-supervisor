@@ -30,8 +30,9 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 enum Outcome {
     /// Exit 0, with this stdout (CRLF as LF).
     Ok(String),
-    /// Refused with `Access is denied` (ERROR_ACCESS_DENIED) or WSAEACCES, or a
-    /// permission-denied status from the helper.
+    /// Refused: `Access is denied` (ERROR_ACCESS_DENIED), WSAEACCES, `dir` finding nothing in a
+    /// directory it may not list (every one listed here has entries), or a permission-denied
+    /// status from the helper. `move` exits 0 even when refused.
     Denied,
     /// Another non-zero exit.
     Exit(i32),
@@ -58,6 +59,8 @@ struct Grants {
     write_deny: Vec<PathBuf>,
     net: Net,
     local_bind: bool,
+    /// Written, and named by TEMP and TMP.
+    temp: Option<PathBuf>,
 }
 
 fn grants(read: &[&Path], write: &[&Path]) -> Grants {
@@ -71,6 +74,7 @@ fn grants(read: &[&Path], write: &[&Path]) -> Grants {
         write_deny: Vec::new(),
         net: Net::Host,
         local_bind: false,
+        temp: None,
     }
 }
 
@@ -92,6 +96,14 @@ impl Grants {
 
     fn local_bind(mut self) -> Grants {
         self.local_bind = true;
+        self
+    }
+
+    /// PowerShell runs in ConstrainedLanguage mode when it cannot write its temp directory.
+    fn temp(mut self, path: &Path) -> Grants {
+        self.read.push(path.to_path_buf());
+        self.write.push(path.to_path_buf());
+        self.temp = Some(path.to_path_buf());
         self
     }
 
@@ -161,20 +173,24 @@ fn powershell(script: &str) -> Vec<String> {
     ]
 }
 
-const TCP_LISTEN: &str =
-    "$l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $l.Start(); 'bound'";
+const TCP_LISTEN: &str = "$ErrorActionPreference = 'Stop'; $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $l.Start(); 'bound'";
 
 /// Runs `argv` through `sandbox::prepare` and the broker, the way `exec.start` does: the status
 /// pipe's write end is duplicated into the broker and named in the stdin preamble.
 fn run(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> (Outcome, String) {
     helper::set_exe(PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor")));
     let root = system_root();
-    let env = BTreeMap::from([
+    let mut env = BTreeMap::from([
         ("SystemRoot".to_string(), root.clone()),
         ("windir".to_string(), root.clone()),
         ("SystemDrive".to_string(), root[..2].to_string()),
         ("PATH".to_string(), format!(r"{root}\System32;{root}")),
     ]);
+    if let Some(temp) = &grants.temp {
+        for name in ["TEMP", "TMP"] {
+            env.insert(name.to_string(), temp.to_str().unwrap().to_string());
+        }
+    }
     let job = Job {
         policy: ResolvedPolicy::resolve(&grants.policy(), state).unwrap(),
         op: JobOp::Exec {
@@ -226,14 +242,18 @@ fn run(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> 
     drop(placeholders);
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let denied = ["Access is denied", "forbidden by its access permissions"]
-        .iter()
-        .any(|text| stderr.contains(text) || stdout.contains(text));
+    let denied = [
+        "Access is denied",
+        "forbidden by its access permissions",
+        "File Not Found",
+    ]
+    .iter()
+    .any(|text| stderr.contains(text) || stdout.contains(text));
     let outcome = match helper::parse_exec_status(&status) {
         Err(err) if err.kind == ErrorKind::PermissionDenied => Denied,
         Err(err) => return (Outcome::Exit(-1), err.to_string()),
-        Ok(()) if output.status.success() => Outcome::Ok(stdout.clone()),
         Ok(()) if denied => Denied,
+        Ok(()) if output.status.success() => Outcome::Ok(stdout.clone()),
         Ok(()) => Outcome::Exit(output.status.code().unwrap_or(-1)),
     };
     (outcome, format!("stdout: {stdout}\nstderr: {stderr}"))
@@ -254,7 +274,7 @@ impl Tree {
             "out/locked",
             "outside/inner",
             "state",
-            "bin",
+            "tmp",
         ] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
         }
@@ -268,7 +288,8 @@ impl Tree {
     }
 
     fn path(&self, rel: &str) -> PathBuf {
-        self.root.join(rel)
+        rel.split('/')
+            .fold(self.root.clone(), |path, part| path.join(part))
     }
 
     fn show(&self, rel: &str) -> String {
@@ -372,19 +393,19 @@ fn policy_combinations_and_their_outcomes() {
         (
             "write: a granted directory",
             grants(&[], &[&t("out")]),
-            cmd(format!("echo new> {0}\\a && type {0}\\a", p("out"))),
+            cmd(format!("echo new>{0}\\a&& type {0}\\a", p("out"))),
             ok("new\n"),
         ),
         (
             "write: a read grant does not write",
             grants(&[&t("out")], &[]),
-            cmd(format!("echo new> {}\\b", p("out"))),
+            cmd(format!("echo new>{}\\b", p("out"))),
             Denied,
         ),
         (
             "write: a deny inside a granted directory",
             grants(&[], &[&t("out")]).write_deny(&t("out/locked")),
-            cmd(format!("echo new> {}\\c", p("out/locked"))),
+            cmd(format!("echo new>{}\\c", p("out/locked"))),
             Denied,
         ),
         (
@@ -414,7 +435,7 @@ fn policy_combinations_and_their_outcomes() {
         (
             "state: unwritable",
             grants(&[], &[&tree.root]),
-            cmd(format!("echo x> {}\\new", p("state"))),
+            cmd(format!("echo x>{}\\new", p("state"))),
             Denied,
         ),
         (
@@ -473,19 +494,19 @@ fn policy_combinations_and_their_outcomes() {
         ),
         (
             "listen: without localBind",
-            none(),
+            none().temp(&t("tmp")),
             powershell(TCP_LISTEN),
             Denied,
         ),
         (
             "listen: with localBind",
-            none().local_bind(),
+            none().local_bind().temp(&t("tmp")),
             powershell(TCP_LISTEN),
             ok("bound\n"),
         ),
         (
             "listen: isolated with localBind",
-            none().isolated().local_bind(),
+            none().isolated().local_bind().temp(&t("tmp")),
             powershell(TCP_LISTEN),
             ok("bound\n"),
         ),
@@ -507,6 +528,10 @@ fn policy_combinations_and_their_outcomes() {
     assert_eq!(
         std::fs::read_to_string(t("data/file.txt")).unwrap(),
         "data\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t("state/credentials.json")).unwrap(),
+        "{}\n"
     );
     assert_eq!(
         std::fs::read_dir(t("out/locked")).unwrap().count(),

@@ -108,6 +108,8 @@ struct Shared {
     offered: Mutex<Option<String>>,
     accepted: Mutex<Option<String>>,
     stray_replies: AtomicUsize,
+    /// Nanoseconds spent in `Session::receive`.
+    receiving_ns: AtomicU64,
     sockets: mpsc::UnboundedSender<Box<Socket>>,
 }
 
@@ -148,6 +150,7 @@ impl ControlPlane {
             offered: Mutex::default(),
             accepted: Mutex::default(),
             stray_replies: AtomicUsize::new(0),
+            receiving_ns: AtomicU64::new(0),
             sockets: sockets_tx,
         });
         let app = Router::new()
@@ -324,6 +327,13 @@ impl ControlPlane {
     /// answered after its session was lost.
     pub fn stray_replies(&self) -> usize {
         self.shared.stray_replies.load(Ordering::SeqCst)
+    }
+
+    /// The time this control plane spent handing received frames to its session: reassembling
+    /// and decoding messages, a 16 MiB one taking milliseconds. A reply that arrives meanwhile
+    /// waits, on this side.
+    pub fn receiving(&self) -> Duration {
+        Duration::from_nanos(self.shared.receiving_ns.load(Ordering::SeqCst))
     }
 
     fn send(&self, control: Control) {
@@ -667,7 +677,10 @@ impl Actor {
                 received.0 += 1;
                 received.1 += payload.len() as u64;
                 drop(received);
+                let started = std::time::Instant::now();
                 self.session.receive(&payload);
+                let took = started.elapsed().as_nanos() as u64;
+                self.shared.receiving_ns.fetch_add(took, Ordering::SeqCst);
             }
             Ok(Event::Text) => self.session.reject("a text frame"),
             _ => {}

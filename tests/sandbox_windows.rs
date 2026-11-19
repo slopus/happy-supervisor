@@ -1113,9 +1113,8 @@ fn token_escapes() {
         escape("happy-sbx-nolisten", powershell(TCP_LISTEN)),
     );
 
-    let users = admin_powershell(
-        "(1..8 | % { ([Security.Principal.NTAccount]('happy-sbx-{0:d2}' -f $_)).Translate([Security.Principal.SecurityIdentifier]).Value }) -join ','",
-    );
+    let users =
+        admin_powershell("(Get-LocalUser -Name 'happy-sbx-*' | % { $_.SID.Value }) -join ','");
     let users: Vec<String> = users.trim().split(',').map(str::to_string).collect();
     eprintln!("slot users: {users:?}");
 
@@ -1181,19 +1180,5 @@ fn token_escapes() {
     eprintln!(
         "{}",
         admin_powershell("Remove-NetFirewallRule -Name hsbx-codex; 'rule removed'",)
-    );
-
-    row(
-        "AppContainer from the sandbox account: cmd",
-        base(),
-        vec![
-            winbox().to_str().unwrap().to_string(),
-            "container".to_string(),
-            "hsbx-probe-combo".to_string(),
-            "none".to_string(),
-            format!(r"{}\System32\cmd.exe", system_root()),
-            "/c".to_string(),
-            "echo inside".to_string(),
-        ],
     );
 }

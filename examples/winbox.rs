@@ -66,7 +66,7 @@ mod win {
     };
     use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, CreateProcessW, CreateProcessWithLogonW,
+        CreateProcessAsUserW, CreateProcessW, CreateProcessWithLogonW, DETACHED_PROCESS,
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
         GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LOGON_WITH_PROFILE,
         LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
@@ -409,7 +409,7 @@ mod win {
                 null(),
                 null(),
                 1,
-                0,
+                DETACHED_PROCESS,
                 null(),
                 null(),
                 &startup,

@@ -211,8 +211,8 @@ struct PathRule {
     write: bool,
 }
 
-/// The policy's entries as Seatbelt rules, shallowest first; equal depths keep the policy's
-/// order, so the deny of a tied path stays after its allow.
+/// The policy's layers as Seatbelt rules, shallowest first. A layer already settles an allow
+/// and a deny of the same path (deny wins), and paths of equal depth never overlap.
 ///
 /// A write-denied entry that does not exist is enforced by its path alone. If a directory above
 /// it is missing too, a command could build that directory elsewhere and rename it into place,
@@ -223,7 +223,7 @@ fn path_rules(policy: &ResolvedPolicy) -> Vec<PathRule> {
         .layers()
         .into_iter()
         .map(|layer| PathRule {
-            path: real_path(&layer.path),
+            path: layer.path,
             read: Some(layer.read),
             write: layer.write,
         })
@@ -246,21 +246,6 @@ fn path_rules(policy: &ResolvedPolicy) -> Vec<PathRule> {
     }));
     rules.sort_by_key(|rule| rule.path.components().count());
     rules
-}
-
-/// `path` with its deepest existing ancestor canonicalized, so `/tmp/x` is `/private/tmp/x`
-/// whether or not `x` exists.
-fn real_path(path: &Path) -> PathBuf {
-    let mut rest = Vec::new();
-    for ancestor in path.ancestors() {
-        if let Ok(real) = std::fs::canonicalize(ancestor) {
-            return rest.iter().rev().fold(real, |acc, name| acc.join(name));
-        }
-        if let Some(name) = ancestor.file_name() {
-            rest.push(name);
-        }
-    }
-    path.to_path_buf()
 }
 
 /// The shallowest component of `path` that does not exist (`path` itself when only it is
@@ -701,16 +686,6 @@ mod tests {
                 (root.join("new"), None, false),
                 (root.join("new/hooks"), Some(true), false),
             ]
-        );
-    }
-
-    #[test]
-    fn tmp_entries_use_the_real_path() {
-        assert_eq!(
-            real_path(Path::new("/tmp/does-not-exist/x")),
-            std::fs::canonicalize("/tmp")
-                .unwrap()
-                .join("does-not-exist/x")
         );
     }
 

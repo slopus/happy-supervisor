@@ -73,9 +73,8 @@ Push a change to `VERSION` to `main`. `.github/workflows/release.yml` then:
 6. once the publish trigger serves the signed `SHA256SUMS`, checks it is this run's list under the
    release key and creates GitHub Release `v<version>` with the same files.
 
-The publish trigger signs and publishes it with no approval; a project owner later moves `latest`
-with the promote trigger:
-publishing a version never changes what a new install gets.
+The publish trigger signs and publishes it with no approval. A project owner later moves `latest`
+with the promote trigger: publishing a version never changes what a new install gets.
 
 ### Google Cloud
 
@@ -96,9 +95,8 @@ Held in happy-terraform:
   `MINISIGN_PUBLIC_KEY=RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr` and
   `MINISIGN_SECRET_KEY_B64` from the secret.
 * Trigger `happy-supervisor-promote`, started by publishing the version to its topic (project
-  owners only), no approval: checks the
-  served release against the release key, then copies its installers from
-  `releases/<version>/` to the root and points `releases/latest` at it.
+  owners only), no approval: checks the served release against the release key, then copies its
+  installers from `releases/<version>/` to the root and points `releases/latest` at it.
 
 ## Hosting
 

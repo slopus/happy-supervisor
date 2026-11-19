@@ -1622,8 +1622,8 @@ pub enum GpuVendor {
 }
 
 /// NodeInfo's `sandbox`. On the wire it is the flat object of node-info.md. In Rust the
-/// availability and the Landlock ABI are sum types, so "available with a reason" or "seatbelt
-/// with a Landlock ABI" cannot be built.
+/// availability and the bubblewrap version are sum types, so "available with a reason" or
+/// "seatbelt with a bubblewrap version" cannot be built.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "SandboxInfoWire", try_from = "SandboxInfoWire")]
 pub struct SandboxInfo {
@@ -1636,10 +1636,6 @@ pub struct SandboxInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mechanism {
-    /// The v1 Linux backend, until bubblewrap replaces it.
-    Landlock {
-        abi: Option<u32>,
-    },
     /// `version` is what `bwrap --version` printed.
     Bubblewrap {
         version: Option<String>,
@@ -1673,8 +1669,6 @@ struct SandboxInfoWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    landlock_abi: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     baseline_read: Vec<String>,
     #[serde(default)]
@@ -1684,7 +1678,6 @@ struct SandboxInfoWire {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum MechanismName {
-    Landlock,
     Bubblewrap,
     Seatbelt,
     Windows,
@@ -1693,12 +1686,11 @@ enum MechanismName {
 
 impl From<SandboxInfo> for SandboxInfoWire {
     fn from(info: SandboxInfo) -> SandboxInfoWire {
-        let (mechanism, landlock_abi, version) = match info.mechanism {
-            Mechanism::Landlock { abi } => (MechanismName::Landlock, abi, None),
-            Mechanism::Bubblewrap { version } => (MechanismName::Bubblewrap, None, version),
-            Mechanism::Seatbelt => (MechanismName::Seatbelt, None, None),
-            Mechanism::Windows => (MechanismName::Windows, None, None),
-            Mechanism::None => (MechanismName::None, None, None),
+        let (mechanism, version) = match info.mechanism {
+            Mechanism::Bubblewrap { version } => (MechanismName::Bubblewrap, version),
+            Mechanism::Seatbelt => (MechanismName::Seatbelt, None),
+            Mechanism::Windows => (MechanismName::Windows, None),
+            Mechanism::None => (MechanismName::None, None),
         };
         let (available, reason) = match info.status {
             SandboxStatus::Available => (true, None),
@@ -1708,7 +1700,6 @@ impl From<SandboxInfo> for SandboxInfoWire {
             mechanism,
             available,
             reason,
-            landlock_abi,
             version,
             baseline_read: info.baseline_read,
             gaps: info.gaps,
@@ -1720,18 +1711,12 @@ impl TryFrom<SandboxInfoWire> for SandboxInfo {
     type Error = Error;
 
     fn try_from(wire: SandboxInfoWire) -> Result<SandboxInfo, Error> {
-        let mechanism = match (wire.mechanism, wire.landlock_abi, wire.version) {
-            (MechanismName::Landlock, abi, None) => Mechanism::Landlock { abi },
-            (MechanismName::Bubblewrap, None, version) => Mechanism::Bubblewrap { version },
-            (MechanismName::Seatbelt, None, None) => Mechanism::Seatbelt,
-            (MechanismName::Windows, None, None) => Mechanism::Windows,
-            (MechanismName::None, None, None) => Mechanism::None,
-            (_, Some(_), _) => {
-                return Err(Error::invalid_params(
-                    "landlockAbi is set for a non-landlock mechanism",
-                ));
-            }
-            (_, None, Some(_)) => {
+        let mechanism = match (wire.mechanism, wire.version) {
+            (MechanismName::Bubblewrap, version) => Mechanism::Bubblewrap { version },
+            (MechanismName::Seatbelt, None) => Mechanism::Seatbelt,
+            (MechanismName::Windows, None) => Mechanism::Windows,
+            (MechanismName::None, None) => Mechanism::None,
+            (_, Some(_)) => {
                 return Err(Error::invalid_params(
                     "version is set for a mechanism other than bubblewrap",
                 ));
@@ -1847,15 +1832,14 @@ mod tests {
             { "name": "NVIDIA L4", "vendor": "nvidia", "memoryBytes": 24152899584u64, "driverVersion": "580.82.07" }
           ],
           "sandbox": {
-            "mechanism": "landlock",
+            "mechanism": "bubblewrap",
+            "version": "0.11.0",
             "available": true,
             "reason": null,
-            "landlockAbi": 6,
             "baselineRead": ["/usr", "/bin", "/lib", "/lib64", "/etc"],
             "gaps": [
-              "with localBind false and unixSockets true, UDP ports can still be bound, and a TCP socket can listen on an ephemeral port without bind",
-              "with localBind true and unixSockets false, abstract-namespace Unix sockets can still be bound",
-              "ioctl on an opened device and connecting to a Unix socket are not restricted"
+              "a command killed by a signal is reported as exiting with 128 plus the signal number",
+              "32-bit x86 and x32 programs cannot run in the sandbox"
             ]
           },
           "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
@@ -2020,7 +2004,12 @@ mod tests {
     #[test]
     fn node_ready_and_node_info() {
         let info: NodeInfo = round_trip(node_info_json());
-        assert_eq!(info.sandbox.mechanism, Mechanism::Landlock { abi: Some(6) });
+        assert_eq!(
+            info.sandbox.mechanism,
+            Mechanism::Bubblewrap {
+                version: Some("0.11.0".to_string())
+            }
+        );
         assert_eq!(info.sandbox.require_available(), Ok(()));
         assert_eq!(info.os.arch, Arch::X86_64);
         assert_eq!(info.gpus[0].vendor, GpuVendor::Nvidia);
@@ -2070,14 +2059,14 @@ mod tests {
     #[test]
     fn sandbox_info_shapes() {
         let mac: SandboxInfo = round_trip(
-            json!({ "mechanism": "seatbelt", "available": false, "reason": "sandbox-exec is missing", "landlockAbi": null, "baselineRead": [], "gaps": [] }),
+            json!({ "mechanism": "seatbelt", "available": false, "reason": "sandbox-exec is missing", "baselineRead": [], "gaps": [] }),
         );
         assert_eq!(
             mac.require_available(),
             Err(Error::sandbox_unavailable("sandbox-exec is missing"))
         );
         let windows: SandboxInfo = round_trip(
-            json!({ "mechanism": "none", "available": false, "reason": "Windows has no sandbox backend", "landlockAbi": null, "baselineRead": [], "gaps": [] }),
+            json!({ "mechanism": "none", "available": false, "reason": "Windows has no sandbox backend", "baselineRead": [], "gaps": [] }),
         );
         assert_eq!(windows.mechanism, Mechanism::None);
         let bwrap: SandboxInfo = round_trip(
@@ -2094,10 +2083,9 @@ mod tests {
         );
         assert_eq!(restricted.mechanism, Mechanism::Windows);
         assert!(rejects::<SandboxInfo>(json!({ "mechanism": "seatbelt", "version": "1", "available": true, "reason": null, "baselineRead": [] })).contains("version is set for a mechanism other than bubblewrap"));
-        assert!(rejects::<SandboxInfo>(json!({ "mechanism": "seatbelt", "available": true, "reason": null, "landlockAbi": 3, "baselineRead": [] })).contains("landlockAbi is set for a non-landlock mechanism"));
-        assert!(rejects::<SandboxInfo>(json!({ "mechanism": "landlock", "available": true, "reason": "x", "landlockAbi": 3, "baselineRead": [] })).contains("an available sandbox has a reason"));
-        assert!(rejects::<SandboxInfo>(json!({ "mechanism": "landlock", "available": false, "reason": null, "landlockAbi": null, "baselineRead": [] })).contains("an unavailable sandbox has no reason"));
-        assert!(rejects::<SandboxInfo>(json!({ "mechanism": "none", "available": true, "reason": null, "landlockAbi": null, "baselineRead": [] })).contains("mechanism none cannot be available"));
+        assert!(rejects::<SandboxInfo>(json!({ "mechanism": "bubblewrap", "available": true, "reason": "x", "baselineRead": [] })).contains("an available sandbox has a reason"));
+        assert!(rejects::<SandboxInfo>(json!({ "mechanism": "bubblewrap", "available": false, "reason": null, "baselineRead": [] })).contains("an unavailable sandbox has no reason"));
+        assert!(rejects::<SandboxInfo>(json!({ "mechanism": "none", "available": true, "reason": null, "baselineRead": [] })).contains("mechanism none cannot be available"));
     }
 
     #[test]

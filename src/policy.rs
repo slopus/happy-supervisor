@@ -444,59 +444,6 @@ impl ResolvedPolicy {
         self.read.entries.insert(canonical, true);
         self.layers = self.compute_layers();
     }
-
-    /// The policy as the v1 backends (Landlock, the v1 Seatbelt profile) enforce it: allowed
-    /// paths only. Until the v2 backends land, they run a policy only when it has that shape:
-    /// both defaults deny, nothing denied below an allowed path except the state directory, and
-    /// host networking.
-    pub fn grants(&self) -> Result<Vec<Grant>> {
-        let unsupported =
-            |why: &str| Err(Error::sandbox_unavailable(format!("this backend {why}")));
-        if self.read.default == Default::Allow || self.write.default == Default::Allow {
-            return unsupported("cannot enforce an allow default");
-        }
-        if matches!(self.network, Network::Isolated { .. }) {
-            return unsupported("cannot isolate the network");
-        }
-        let mut grants: BTreeMap<PathBuf, (GrantKind, Rights)> = BTreeMap::new();
-        for layer in &self.layers {
-            if layer.path == self.state_dir {
-                continue;
-            }
-            let parent = layer.path.parent();
-            let parent_read = parent.is_some_and(|p| self.can_read(p));
-            let parent_write = parent.is_some_and(|p| self.can_write(p));
-            if (parent_read && !layer.read) || (parent_write && !layer.write) {
-                return unsupported("cannot deny a path below an allowed one");
-            }
-            if !layer.read {
-                continue;
-            }
-            let Ok(canonical) = std::fs::canonicalize(&layer.path) else {
-                continue;
-            };
-            let kind = if canonical.is_dir() {
-                GrantKind::Directory
-            } else {
-                GrantKind::File
-            };
-            let rights = if layer.write {
-                Rights::ReadWrite
-            } else {
-                Rights::Read
-            };
-            add_grant(&mut grants, canonical, kind, rights);
-        }
-        for (path, rights) in V1_DEVICES {
-            if Path::new(path).exists() {
-                add_grant(&mut grants, PathBuf::from(path), GrantKind::File, rights);
-            }
-        }
-        Ok(grants
-            .into_iter()
-            .map(|(path, (kind, rights))| Grant { path, kind, rights })
-            .collect())
-    }
 }
 
 /// The canonical form of `path`, or of its deepest existing ancestor followed by the rest: how
@@ -532,47 +479,6 @@ pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
         Some(rest) if cfg!(windows) => Ok(PathBuf::from(rest)),
         _ => Ok(canonical),
     }
-}
-
-/// The device nodes the v1 backends grant every sandbox.
-const V1_DEVICES: [(&str, Rights); 4] = [
-    ("/dev/null", Rights::ReadWrite),
-    ("/dev/zero", Rights::Read),
-    ("/dev/random", Rights::Read),
-    ("/dev/urandom", Rights::Read),
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Rights {
-    Read,
-    /// Write implies read.
-    ReadWrite,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GrantKind {
-    /// Covers the directory and everything below it.
-    Directory,
-    /// Covers that file only.
-    File,
-}
-
-/// One canonical, existing path a v1 backend lets an operation use.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Grant {
-    pub path: PathBuf,
-    pub kind: GrantKind,
-    pub rights: Rights,
-}
-
-fn add_grant(
-    grants: &mut BTreeMap<PathBuf, (GrantKind, Rights)>,
-    path: PathBuf,
-    kind: GrantKind,
-    rights: Rights,
-) {
-    let entry = grants.entry(path).or_insert((kind, rights));
-    entry.1 = entry.1.max(rights);
 }
 
 /// A rule set from path strings, for tests.
@@ -988,45 +894,6 @@ mod tests {
         assert!(!resolved.can_read(&private.join("proxy-ca.key")));
         let paths: Vec<PathBuf> = resolved.layers().into_iter().map(|l| l.path).collect();
         assert_eq!(paths, [private, bundle]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn v1_backends_get_grants_only_for_allow_lists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        std::fs::create_dir(root.join("repo")).unwrap();
-        let repo = root.join("repo");
-        let (root_s, repo_s) = (root.to_str().unwrap(), repo.to_str().unwrap());
-        let state = root.join("state");
-        let list = allow_list([root_s], [repo_s], false, false);
-        let grants = ResolvedPolicy::resolve(&list, &state)
-            .unwrap()
-            .grants()
-            .unwrap();
-        let ours: Vec<(PathBuf, GrantKind, Rights)> = grants
-            .into_iter()
-            .filter(|g| !g.path.starts_with("/dev"))
-            .map(|g| (g.path, g.kind, g.rights))
-            .collect();
-        assert_eq!(
-            ours,
-            [
-                (root.clone(), GrantKind::Directory, Rights::Read),
-                (repo.clone(), GrantKind::Directory, Rights::ReadWrite),
-            ]
-        );
-        let nested = policy(
-            rules(Default::Deny, &[root_s], &[repo_s]),
-            rules(Default::Deny, &[], &[]),
-        );
-        let refused = ResolvedPolicy::resolve(&nested, &state).unwrap().grants();
-        assert_eq!(
-            refused,
-            Err(Error::sandbox_unavailable(
-                "this backend cannot deny a path below an allowed one"
-            ))
-        );
     }
 
     #[test]

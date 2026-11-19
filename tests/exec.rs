@@ -203,7 +203,7 @@ fn info() -> NodeInfo {
         "cpu": { "model": null, "physicalCores": null, "logicalCores": 1 },
         "memory": { "totalBytes": 1, "swapTotalBytes": 0 },
         "disks": [], "gpus": [],
-        "sandbox": { "mechanism": "none", "available": false, "reason": "test", "landlockAbi": null, "baselineRead": [] },
+        "sandbox": { "mechanism": "none", "available": false, "reason": "test", "baselineRead": [] },
         "defaultEnv": {}, "collectedAtMs": 0
     }))
     .unwrap()

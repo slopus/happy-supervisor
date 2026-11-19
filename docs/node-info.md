@@ -34,15 +34,14 @@ the rest of the collection, and each is cut off at 3 seconds.
     { "name": "NVIDIA L4", "vendor": "nvidia", "memoryBytes": 24152899584, "driverVersion": "580.82.07" }
   ],
   "sandbox": {
-    "mechanism": "landlock",
+    "mechanism": "bubblewrap",
+    "version": "0.11.0",
     "available": true,
     "reason": null,
-    "landlockAbi": 6,
     "baselineRead": ["/usr", "/bin", "/lib", "/lib64", "/etc"],
     "gaps": [
-      "with localBind false and unixSockets true, UDP ports can still be bound, and a TCP socket can listen on an ephemeral port without bind",
-      "with localBind true and unixSockets false, abstract-namespace Unix sockets can still be bound",
-      "ioctl on an opened device and connecting to a Unix socket are not restricted"
+      "a command killed by a signal is reported as exiting with 128 plus the signal number",
+      "32-bit x86 and x32 programs cannot run in the sandbox"
     ]
   },
   "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
@@ -150,13 +149,12 @@ What this node can enforce for `{ "mode": "sandboxed" }` commands (policy.md).
 
 | Field | Type | Meaning |
 |---|---|---|
-| `mechanism` | `"bubblewrap"` \| `"seatbelt"` \| `"windows"` \| `"landlock"` \| `"none"` | The backend: bubblewrap and seccomp on Linux, Seatbelt on macOS, a restricted token with ACLs and a firewall on Windows (policy.md). `landlock` is the v1 Linux backend, reported until bubblewrap replaces it. |
+| `mechanism` | `"bubblewrap"` \| `"seatbelt"` \| `"windows"` \| `"none"` | The backend: bubblewrap and seccomp on Linux, Seatbelt on macOS, a restricted token with ACLs and a firewall on Windows (policy.md). |
 | `version` | string \| null | Bubblewrap only: what `bwrap --version` printed. |
 | `available` | bool | Whether sandboxed commands can run. Decided by actually running a sandboxed `true` at startup, not by checking for features. |
 | `reason` | string \| null | Why it is unavailable, in one sentence (for example "bwrap is not on PATH", or "unprivileged user namespaces are disabled"). |
-| `landlockAbi` | integer \| null | Linux only. The Landlock ABI version the kernel supports. It determines the gaps listed in policy.md. |
 | `baselineRead` | array of paths | Existing system paths that ordinary programs need to read on this machine. The supervisor never adds these to a policy itself. |
-| `gaps` | array of strings | What this node's sandbox does not enforce, one sentence each, so the control plane can see it without knowing kernels. The Linux list depends on `landlockAbi` (policy.md, Gaps the node reports). Empty when `available` is false. |
+| `gaps` | array of strings | What this node's sandbox does not enforce, one sentence each, so the control plane can see it without knowing kernels. The Linux list depends on the kernel. Empty when `available` is false. |
 
 `baselineRead` by platform, keeping only paths that exist:
 

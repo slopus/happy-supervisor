@@ -919,7 +919,8 @@ directory. The OS caps both per user (`fs.inotify.max_user_instances`, by defaul
 `fs.inotify.max_user_watches`). A start that hits a cap replies `io`.
 
 With a workload user, each watch is a helper process running as that user (policy.md, Workload
-user), which can watch only what that user can read, and the caps count against that user. If
+user), which can watch only what that user can read, and the caps count against that user. On
+Unix a watch never reports a name in a directory its user cannot list. If
 the helper exits, the node sends `overflow` and the watch ends.
 
 ### `watch.stop`

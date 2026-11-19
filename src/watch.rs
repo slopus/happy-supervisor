@@ -237,6 +237,12 @@ fn start_os(
     mut report: impl FnMut(Vec<Seen>) + Send + 'static,
 ) -> Result<RecommendedWatcher> {
     let identity = identity(&root).ok_or_else(|| Error::not_found(path.as_str()))?;
+    if unreadable(&root) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{}: permission denied", path.as_str()),
+        ));
+    }
     let observer = Observer {
         root: root.clone(),
         identity,
@@ -399,6 +405,19 @@ fn watch_error(err: notify::Error) -> Error {
     }
 }
 
+/// Whether this process's user is refused reading `path`, which for a directory means listing
+/// it. A path that is gone is not refused. inotify watches only what its user can read, but
+/// FSEvents reports changes anywhere, so the OS half checks itself.
+#[cfg(unix)]
+fn unreadable(path: &Path) -> bool {
+    nix::unistd::access(path, nix::unistd::AccessFlags::R_OK) == Err(nix::errno::Errno::EACCES)
+}
+
+#[cfg(not(unix))]
+fn unreadable(_path: &Path) -> bool {
+    false
+}
+
 /// The identity of the file at `path`, so a root that was removed and made again is noticed.
 #[cfg(unix)]
 fn identity(path: &Path) -> Option<(u64, u64)> {
@@ -516,6 +535,10 @@ impl Observer {
         let mut root_touched = false;
         for (kind, path) in changes(&event) {
             root_touched |= self.root.starts_with(&path);
+            // A name in a directory the watching user cannot list is not its to see.
+            if path != self.root && path.parent().is_some_and(unreadable) {
+                continue;
+            }
             let new_dir = kind == ChangeKind::Created && self.recursive && path != self.root;
             seen.push(Seen::Changed {
                 kind,
@@ -997,6 +1020,29 @@ mod tests {
             events(&mut f.session),
             [json!({ "watchId": "w-1", "changes": [
                 { "kind": "created", "path": "/shown/repo/visible" },
+            ] })]
+        );
+    }
+
+    #[test]
+    fn a_change_in_a_directory_the_watcher_cannot_list_is_not_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let mut f = fixture(|_| None);
+        let t0 = Instant::now();
+        let closed = f.root.join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o300)).unwrap();
+        f.observe(created(&closed.join("secret")), t0);
+        f.observe(created(&f.root.join("open")), t0);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        f.state.flush();
+        assert_eq!(
+            events(&mut f.session),
+            [json!({ "watchId": "w-1", "changes": [
+                { "kind": "created", "path": "/shown/repo/open" },
             ] })]
         );
     }

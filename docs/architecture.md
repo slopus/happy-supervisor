@@ -172,6 +172,16 @@ Every command, raw or sandboxed, is its own process group (Unix, `setsid` in the
 `KILL_ON_JOB_CLOSE` (Windows). Kill and timeout signal the whole group. When the supervisor exits
 normally it kills every running group.
 
+The supervisor waits for every child it starts. Processes whose parent exits are reparented to
+PID 1, which the host's init is, but a container's entry point may be the supervisor itself.
+bubblewrap's own init, PID 1 of the sandbox, outlives the bubblewrap the supervisor waits for by a
+moment, so every sandboxed command leaves one such orphan. When `run` or `serve` starts as PID 1,
+`init::reap_as_pid1` forks before the runtime starts: the parent stays PID 1, reaps every orphan,
+passes `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2` on, and exits with the
+supervisor's code. The supervisor cannot reap them itself, because a child of one of its threads
+that exited is reparented to its main thread too, beside the orphans. With a delegated cgroup,
+the supervisor moves that init into its `supervisor` leaf with itself.
+
 `exec.start` `limits` are applied where the tree is made: `setrlimit(RLIMIT_CPU)` in the same
 `pre_exec` on Unix (`process::limit`), and the Job Object's limits on Windows
 (`process::job_limits`). On Linux, `memoryBytes` and `processes` are a cgroup v2 per command

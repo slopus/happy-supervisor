@@ -94,6 +94,11 @@ fn main() -> ExitCode {
         return happy_supervisor::connect::main(std::env::args().skip(2));
     }
     let cli = Cli::parse();
+    // Before the runtime starts any thread: forking is safe only while there is one.
+    #[cfg(unix)]
+    if matches!(cli.command, Command::Run { .. } | Command::Serve { .. }) {
+        happy_supervisor::init::reap_as_pid1();
+    }
     #[cfg(windows)]
     if let Command::InstallSandbox(args) = cli.command {
         return sandbox::windows::install_main(args);

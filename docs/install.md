@@ -101,6 +101,21 @@ that is not root runs its work as itself, which is already a separate user.
 The state directory's private part, credentials included, stays `0700` root, so neither raw nor
 sandboxed work can read it (policy.md, Fixed rules).
 
+## Containers
+
+The supervisor may be a container's entry point, as `happy-supervisor run` or `serve`. bubblewrap
+needs what it needs on a host: user namespaces, and a seccomp profile and AppArmor policy that let
+it create them and mount (for example Docker's `--security-opt seccomp=unconfined
+--security-opt apparmor=unconfined`).
+
+A process whose parent exits is reparented to PID 1, which must reap it, and every sandboxed
+command leaves one: bubblewrap's own init outlives the bubblewrap the supervisor waits for by a
+moment. When the supervisor starts as PID 1, it forks and keeps a small init in front of itself
+that reaps them, passes `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2` on, and
+exits with the supervisor's code (128 plus the signal when a signal ended it). So `docker run
+--init` is not needed, and does no harm: the supervisor is then not PID 1 and leaves the reaping
+to Docker's init.
+
 ## macOS
 
 Run the supervisor as the user whose files its commands should see, for example from a

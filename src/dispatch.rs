@@ -247,8 +247,8 @@ impl Node {
 }
 
 /// With a workload user, the sandbox's bridge connects to the proxy sockets as that user. They
-/// stay in `private/`, which only the supervisor's user can reach; bubblewrap binds them into
-/// that one sandbox by descriptor (policy.md, Workload user).
+/// stay in `private/`, which only the supervisor's user can reach; that one sandbox's helper
+/// connects to them through descriptors the node passes it (policy.md, Workload user).
 fn open_sockets_to_sandbox(proxy: &CommandProxy) -> Result<()> {
     #[cfg(unix)]
     for endpoint in [&proxy.http, &proxy.socks] {

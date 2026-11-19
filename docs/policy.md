@@ -243,9 +243,9 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
   that user and without a policy. A `tty` command's terminal belongs to that user.
 * The supervisor itself stays root. Its private state directory stays `0700`, and the state
   directory becomes `0711` so the user can reach `public/ca-bundle.pem`. On Linux, bubblewrap
-  runs as the user, so unprivileged user namespaces must be allowed for it, and an isolated
-  command's proxy sockets are bound into its sandbox by descriptor, so no other process of the
-  user can reach them.
+  runs as the user, so unprivileged user namespaces must be allowed for it. An isolated
+  command's sandbox reaches its proxy sockets through descriptors the node passes it, not by
+  path, so no other process of the user can reach them.
 * Not supported yet, and refused rather than run as root: watches (`sandbox_unavailable`),
   `log.kind: "file"`, which the supervisor would write (`invalid_params`), and a workload user
   on Windows, where the node does not start with one.

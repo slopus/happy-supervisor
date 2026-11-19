@@ -74,7 +74,7 @@ that does not resolve is not a policy decision: the client gets HTTP `502` or SO
 
 | Platform | The proxy listens on | The command reaches it at |
 |---|---|---|
-| Linux, isolated | `http.sock` and `socks.sock` in `private/net/<n>/` of the state directory, bind-mounted into the sandbox | `127.0.0.1:3128` (HTTP) and `127.0.0.1:1080` (SOCKS5) in the sandbox's own network namespace, where the sandbox helper bridges each to its socket |
+| Linux, isolated | `http.sock` and `socks.sock` in `private/net/<n>/` of the state directory, passed to the sandbox helper as descriptors, not mounted | `127.0.0.1:3128` (HTTP) and `127.0.0.1:1080` (SOCKS5) in the sandbox's own network namespace, where the sandbox helper bridges each to its socket |
 | Windows, isolated | `127.0.0.1` at the first two free ports of the range `install-sandbox` recorded, the only loopback ports the sandbox's firewall filters let it reach | the same addresses |
 | Otherwise | `127.0.0.1:<ephemeral>` each | the same addresses |
 

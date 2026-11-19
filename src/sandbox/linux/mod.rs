@@ -45,8 +45,10 @@ const MIN_BWRAP: (u32, u32) = (0, 8);
 /// What `prepare` tells the helper on its command line, beside the job on stdin.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HelperArgs {
-    /// The HTTP and SOCKS5 proxy sockets to bridge `127.0.0.1:3128` and `:1080` to.
-    bridge: Option<(PathBuf, PathBuf)>,
+    /// `O_PATH` descriptors of the HTTP and SOCKS5 proxy sockets to bridge `127.0.0.1:3128` and
+    /// `:1080` to. The helper connects through `/proc/self/fd`, so the sockets need no mount and
+    /// no path the sandbox's user can reach.
+    bridge: Option<(RawFd, RawFd)>,
     /// The helper's end of the `tcp.open` control socket.
     control: Option<RawFd>,
 }
@@ -54,8 +56,13 @@ struct HelperArgs {
 impl HelperArgs {
     fn to_args(&self) -> Vec<OsString> {
         let mut args = Vec::new();
-        if let Some((http, socks)) = &self.bridge {
-            args.extend(["--http".into(), http.into(), "--socks".into(), socks.into()]);
+        if let Some((http, socks)) = self.bridge {
+            args.extend([
+                "--http".into(),
+                http.to_string().into(),
+                "--socks".into(),
+                socks.to_string().into(),
+            ]);
         }
         if let Some(fd) = self.control {
             args.extend(["--control".into(), fd.to_string().into()]);
@@ -70,13 +77,13 @@ impl HelperArgs {
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let value = args.next().ok_or_else(|| bad("a flag without a value"))?;
-            match flag.to_str() {
-                Some("--http") => http = Some(PathBuf::from(value)),
-                Some("--socks") => socks = Some(PathBuf::from(value)),
-                Some("--control") => {
-                    let fd = value.to_str().and_then(|v| v.parse().ok());
-                    parsed.control = Some(fd.ok_or_else(|| bad("--control is not an fd"))?);
-                }
+            let fd = value.to_str().and_then(|v| v.parse::<RawFd>().ok());
+            let flag = flag.to_str().unwrap_or_default();
+            let fd = fd.ok_or_else(|| bad(&format!("{flag} is not an fd")))?;
+            match flag {
+                "--http" => http = Some(fd),
+                "--socks" => socks = Some(fd),
+                "--control" => parsed.control = Some(fd),
                 _ => return Err(bad("an unknown flag")),
             }
         }
@@ -159,9 +166,9 @@ fn network(policy: &ResolvedPolicy) -> (bool, bool, bool) {
     }
 }
 
-/// An `O_PATH` descriptor of `path`, for `--ro-bind-fd`. Numbered above the descriptors the
-/// child sets up itself (stdio and the status pipe, [`helper::STATUS_FD`]), which would
-/// otherwise replace it.
+/// An `O_PATH` descriptor of the proxy socket at `path`, for the helper to connect through
+/// (`HelperArgs::bridge`). Numbered above the descriptors the child sets up itself (stdio and the
+/// status pipe, [`helper::STATUS_FD`]), which would otherwise replace it.
 fn open_path(path: &Path) -> Result<OwnedFd> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let unavailable =
@@ -205,19 +212,15 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
     let is_exec = matches!(job.op, JobOp::Exec { .. });
     let (isolated, local_bind, _) = network(policy);
     let mut args = HelperArgs::default();
-    let extra = [plan.exe.to_path_buf()];
     let mut sockets = Vec::new();
     if let (Some(net), true) = (&plan.net, is_exec && isolated) {
-        let (http, socks) = (unix_socket(&net.http)?, unix_socket(&net.socks)?);
-        for path in [&http, &socks] {
-            sockets.push((open_path(path)?, path.clone()));
-        }
-        args.bridge = Some((http, socks));
+        let (http, socks) = (
+            open_path(&unix_socket(&net.http)?)?,
+            open_path(&unix_socket(&net.socks)?)?,
+        );
+        args.bridge = Some((http.as_raw_fd(), socks.as_raw_fd()));
+        sockets.extend([http, socks]);
     }
-    let by_fd: Vec<(RawFd, PathBuf)> = sockets
-        .iter()
-        .map(|(fd, path)| (fd.as_raw_fd(), path.clone()))
-        .collect();
     let (netns, control) = if is_exec && isolated && local_bind {
         let (netns, control) = netns::pair()?;
         args.control = Some(control.as_raw_fd());
@@ -225,7 +228,7 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
     } else {
         (None, None)
     };
-    let mounts = mounts::Mounts::new(policy, placeholders.held(), &extra, &by_fd)?;
+    let mounts = mounts::Mounts::new(policy, placeholders.held(), &[plan.exe.to_path_buf()])?;
 
     let mut command = Command::new(&bwrap.path);
     command.args(["--unshare-user"]);
@@ -258,7 +261,7 @@ pub fn prepare(plan: &Plan, job: &Job) -> Result<Prepared> {
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            let inherited = control.iter().chain(sockets.iter().map(|(fd, _)| fd));
+            let inherited = control.iter().chain(&sockets);
             for fd in inherited {
                 let fd = fd.as_raw_fd();
                 let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -308,6 +311,9 @@ pub fn enter(policy: &ResolvedPolicy) -> Result<()> {
     let control = args.control.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
     if let Some(control) = &control {
         set_cloexec(control.as_raw_fd())?;
+    }
+    for fd in args.bridge.iter().flat_map(|(http, socks)| [*http, *socks]) {
+        set_cloexec(fd)?;
     }
     if args.bridge.is_some() || control.is_some() {
         let bridge = match args.bridge {
@@ -607,28 +613,24 @@ mod tests {
     #[test]
     fn helper_args_round_trip() {
         let both = HelperArgs {
-            bridge: Some(("/s/http.sock".into(), "/s/socks.sock".into())),
+            bridge: Some((10, 12)),
             control: Some(11),
         };
         let args = both.to_args();
-        assert_eq!(
-            args,
-            [
-                "--http",
-                "/s/http.sock",
-                "--socks",
-                "/s/socks.sock",
-                "--control",
-                "11"
-            ]
-        );
+        assert_eq!(args, ["--http", "10", "--socks", "12", "--control", "11"]);
         assert_eq!(HelperArgs::parse(args).unwrap(), both);
         assert_eq!(HelperArgs::parse([]).unwrap(), HelperArgs::default());
+        assert_eq!(
+            HelperArgs::parse(["--http".into(), "10".into()])
+                .unwrap_err()
+                .message,
+            "bad helper arguments: --http and --socks go together"
+        );
         assert_eq!(
             HelperArgs::parse(["--http".into(), "/a".into()])
                 .unwrap_err()
                 .message,
-            "bad helper arguments: --http and --socks go together"
+            "bad helper arguments: --http is not an fd"
         );
     }
 

@@ -1,9 +1,11 @@
 //! The isolated sandbox's way out (proxy.md, Where it listens): inside the network namespace the
 //! helper listens on `127.0.0.1:3128` and `127.0.0.1:1080` and splices each connection to the
-//! node's HTTP and SOCKS5 proxy sockets, which are bind-mounted into the sandbox.
+//! node's HTTP and SOCKS5 proxy sockets. It reaches those through `/proc/self/fd`, by the
+//! `O_PATH` descriptors the node passed it, so they are not mounted in the sandbox.
 
 use std::io;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -16,8 +18,11 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn bind(http: PathBuf, socks: PathBuf) -> io::Result<Bridge> {
+    pub fn bind(http: RawFd, socks: RawFd) -> io::Result<Bridge> {
         let listen = |port| TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        let (http, socks) = [http, socks]
+            .map(|fd| PathBuf::from(format!("/proc/self/fd/{fd}")))
+            .into();
         Ok(Bridge {
             routes: vec![(listen(HTTP_PORT)?, http), (listen(SOCKS_PORT)?, socks)],
         })

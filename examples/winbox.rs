@@ -93,6 +93,14 @@ mod win {
         fn FreeSid(sid: PSID) -> *mut c_void;
     }
 
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetErrorMode(mode: u32) -> u32;
+    }
+
+    const SEM_FAILCRITICALERRORS: u32 = 0x1;
+    const SEM_NOGPFAULTERRORBOX: u32 = 0x2;
+
     const ALREADY_EXISTS: i32 = 0x800700b7_u32 as i32;
     const SE_GROUP_ENABLED: u32 = 0x4;
     const WRITE_RESTRICTED: u32 = 0x8;
@@ -302,6 +310,9 @@ mod win {
 
     /// Starts `argv` under this process's token with `disable` made deny-only.
     pub fn escape(disable: &str, argv: &[String]) -> io::Result<u32> {
+        // A child that cannot load fails with a code instead of waiting on an error box.
+        // SAFETY: takes and returns flags.
+        unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
         let own = own_token()?;
         let sids: Vec<Sid> = match disable {
             "none" => Vec::new(),

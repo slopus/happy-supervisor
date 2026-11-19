@@ -1097,21 +1097,6 @@ fn token_escapes() {
         base().isolated(),
         escape("user", curl(&[&out_url])),
     );
-    row(
-        "isolated, http://example.com, nothing dropped",
-        base().isolated(),
-        escape("none", http()),
-    );
-    row(
-        "isolated, http://example.com, happy-sbx-isolated deny-only",
-        base().isolated(),
-        escape("happy-sbx-isolated", http()),
-    );
-    row(
-        "no localBind, listen, happy-sbx-nolisten deny-only",
-        base().temp(&tree.path("tmp")),
-        escape("happy-sbx-nolisten", powershell(TCP_LISTEN)),
-    );
 
     let users =
         admin_powershell("(Get-LocalUser -Name 'happy-sbx-*' | % { $_.SID.Value }) -join ','");

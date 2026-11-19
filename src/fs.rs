@@ -77,21 +77,37 @@ pub async fn handle(request: FsRequest, confinement: Confinement) -> Result<FsRe
 }
 
 async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsResponse> {
-    // Landlock governs opening, not metadata, so the helper could stat any path.
-    if let FsRequest::Stat(params) = &request {
-        let path = params.path.as_path().to_path_buf();
-        let policy = policy.clone();
-        let readable = tokio::task::spawn_blocking(move || {
-            policy.can_read(&crate::policy::resolve_path(&path))
-        })
-        .await
-        .map_err(|err| Error::new(ErrorKind::Io, format!("policy check failed: {err}")))?;
-        if !readable {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                format!("{}: not readable by the policy", params.path.as_str()),
-            ));
+    // The sandbox shows a path the policy hides as missing (bubblewrap) or lets metadata through
+    // (Seatbelt), so the policy decides first and every platform answers permission_denied.
+    let (path, writes) = match &request {
+        FsRequest::Stat(params) | FsRequest::List(params) => (&params.path, false),
+        FsRequest::Read(params) => (&params.path, false),
+        FsRequest::Write(params) => (&params.path, true),
+        FsRequest::Mkdir(params) => (&params.path, true),
+        FsRequest::Remove(params) => (&params.path, true),
+    };
+    let (shown, target, check) = (
+        path.as_str().to_string(),
+        path.as_path().to_path_buf(),
+        policy.clone(),
+    );
+    let denied = tokio::task::spawn_blocking(move || {
+        let target = crate::policy::resolve_path(&target);
+        if !check.can_read(&target) {
+            Some("readable")
+        } else if writes && !check.can_write(&target) {
+            Some("writable")
+        } else {
+            None
         }
+    })
+    .await
+    .map_err(|err| Error::new(ErrorKind::Io, format!("policy check failed: {err}")))?;
+    if let Some(what) = denied {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{shown}: not {what} by the policy"),
+        ));
     }
 
     let job = Job {
@@ -282,7 +298,13 @@ fn overwrite(path: &Path, data: &[u8]) -> Result<()> {
     };
     let (temp_path, mut temp) = match create_temp_beside(&target) {
         Ok(temp) => temp,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && existing.is_some() => {
+        // bubblewrap denies writing with a read-only mount: EROFS.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) && existing.is_some() =>
+        {
             let mut file = existing.expect("checked above");
             file.set_len(0).map_err(at(path))?;
             return file.write_all(data).map_err(at(path));

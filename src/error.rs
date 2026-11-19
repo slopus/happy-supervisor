@@ -109,7 +109,10 @@ impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Error {
         let kind = match err.kind() {
             std::io::ErrorKind::NotFound => ErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+            // The Linux sandbox denies writes with read-only mounts.
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
+                ErrorKind::PermissionDenied
+            }
             std::io::ErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
             _ => ErrorKind::Io,
         };

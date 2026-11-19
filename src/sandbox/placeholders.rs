@@ -306,15 +306,23 @@ fn remove_if_ours(path: &Path, kind: PlaceholderKind, id: FileId) {
     }
 }
 
+/// Opens `path` itself, not what a symlink there points to, without reading or writing it. Not
+/// through `OpenOptions::custom_flags`, which drops `O_PATH` on musl (its `O_ACCMODE` holds it).
 #[cfg(target_os = "linux")]
-const PIN_FLAGS: i32 = libc::O_PATH | libc::O_NOFOLLOW;
+fn pin(path: &Path) -> io::Result<std::fs::File> {
+    use nix::fcntl::OFlag;
+    let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let fd = nix::fcntl::open(path, flags, nix::sys::stat::Mode::empty())?;
+    Ok(fd.into())
+}
+
 // Placeholders are readable to their owner, so a plain read-only open works where O_PATH is
 // missing.
 #[cfg(all(unix, not(target_os = "linux")))]
 const PIN_FLAGS: i32 = libc::O_NOFOLLOW;
 
 /// Opens `path` itself, not what a symlink there points to, without reading or writing it.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn pin(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()

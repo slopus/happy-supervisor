@@ -177,14 +177,18 @@ fn network(policy: &ResolvedPolicy) -> (bool, bool, bool) {
 /// (`HelperArgs::bridge`). Numbered above the descriptors the child sets up itself (stdio and the
 /// status pipe, [`helper::STATUS_FD`]), which would otherwise replace it.
 fn open_path(path: &Path) -> Result<OwnedFd> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let unavailable =
-        |err| Error::sandbox_unavailable(format!("cannot open {}: {err}", path.display()));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH)
-        .open(path)
-        .map_err(unavailable)?;
+    use nix::fcntl::OFlag;
+    let unavailable = |err: std::io::Error| {
+        Error::sandbox_unavailable(format!("cannot open {}: {err}", path.display()))
+    };
+    // Not `OpenOptions::custom_flags`: std drops the bits of `O_ACCMODE` from custom flags, and
+    // musl's `O_ACCMODE` holds `O_PATH`, so a musl build would open the socket itself (ENXIO).
+    let file = nix::fcntl::open(
+        path,
+        OFlag::O_PATH | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|errno| unavailable(errno.into()))?;
     high(file.as_fd()).map_err(unavailable)
 }
 
@@ -676,6 +680,19 @@ mod tests {
                 .message,
             "bad helper arguments: --http is not an fd"
         );
+    }
+
+    /// A proxy socket opens as a path, never as the socket itself (ENXIO), in a musl build too.
+    #[test]
+    fn a_proxy_socket_opens_as_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("http.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let fd = open_path(&path).unwrap();
+        assert!(fd.as_raw_fd() >= FIRST_FREE_FD);
+        // SAFETY: F_GETFL only reads the flags of a descriptor this test owns.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags & libc::O_PATH, 0, "{flags:o}");
     }
 
     #[test]

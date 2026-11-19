@@ -136,3 +136,6 @@ triggers and `release.yml` do.
 * **0.2.1.** The code of 0.2.0-linux.5, for all five platforms (Linux x86_64 and aarch64, macOS
   aarch64 and x86_64, Windows x86_64), under a version without a platform suffix. Versions from
   here on name one build for every platform.
+* **0.2.2.** On the Linux release builds (static musl), isolated commands work again: the proxy
+  sockets are opened with `O_PATH`, which musl dropped, so every isolated exec failed with
+  "cannot open …/http.sock: No such device or address".

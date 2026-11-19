@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,6 +43,9 @@ pub struct CommandProxyConfig {
 pub enum ListenOn {
     /// `127.0.0.1:<ephemeral>`, one port each.
     Loopback,
+    /// `127.0.0.1` at the first free ports of this range, HTTP first. On Windows the sandbox's
+    /// firewall filters permit only the range the install recorded.
+    LoopbackRange(RangeInclusive<u16>),
     /// `http.sock` and `socks.sock` in this existing directory. Unix only.
     UnixDir(PathBuf),
 }
@@ -310,12 +314,30 @@ enum Listener {
 }
 
 impl Listener {
-    async fn bind(listen: &ListenOn, name: &str) -> io::Result<(Listener, Endpoint)> {
+    /// `after` is the port the other listener of the pair took in a range.
+    async fn bind(
+        listen: &ListenOn,
+        name: &str,
+        after: Option<u16>,
+    ) -> io::Result<(Listener, Endpoint)> {
         match listen {
             ListenOn::Loopback => {
                 let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
                 let address = tcp.local_addr()?;
                 Ok((Listener::Tcp(tcp), Endpoint::Tcp(address)))
+            }
+            ListenOn::LoopbackRange(range) => {
+                let first = after.map_or(*range.start(), |port| port.saturating_add(1));
+                for port in first..=*range.end() {
+                    if let Ok(tcp) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+                        let address = tcp.local_addr()?;
+                        return Ok((Listener::Tcp(tcp), Endpoint::Tcp(address)));
+                    }
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("no free proxy port in {}-{}", range.start(), range.end()),
+                ))
             }
             #[cfg(unix)]
             ListenOn::UnixDir(dir) => {
@@ -380,7 +402,7 @@ pub async fn start(cfg: CommandProxyConfig, node: &ProxyManager) -> io::Result<C
         listen,
     } = cfg;
     let password = match (&credential, &listen) {
-        (Some(_), ListenOn::Loopback) => {
+        (Some(_), ListenOn::Loopback | ListenOn::LoopbackRange(_)) => {
             let mut secret = [0u8; 32];
             super::random_bytes(&mut secret).map_err(io::Error::other)?;
             let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
@@ -406,8 +428,12 @@ pub async fn start(cfg: CommandProxyConfig, node: &ProxyManager) -> io::Result<C
         limiter: Mutex::default(),
         tasks: Tasks::open(),
     });
-    let (http_listener, http) = Listener::bind(&listen, "http.sock").await?;
-    let (socks_listener, socks) = match Listener::bind(&listen, "socks.sock").await {
+    let (http_listener, http) = Listener::bind(&listen, "http.sock", None).await?;
+    let http_port = match &http {
+        Endpoint::Tcp(address) => Some(address.port()),
+        Endpoint::Unix(_) => None,
+    };
+    let (socks_listener, socks) = match Listener::bind(&listen, "socks.sock", http_port).await {
         Ok(bound) => bound,
         Err(err) => {
             remove_socket(&http);

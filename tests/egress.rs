@@ -887,3 +887,39 @@ async fn unix_socket_listeners_serve_both_proxies_and_vanish_on_drop() {
     assert!(!http.exists() && !socks.exists());
     assert_eq!(h.events(), []);
 }
+
+#[tokio::test]
+async fn a_port_range_listener_takes_the_first_free_ports_and_fails_when_none_are_left() {
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = taken.local_addr().unwrap().port();
+    let range = first..=first + 2;
+    let h = Harness::start(
+        Some((rules(Default::Deny, &[], &[]), None)),
+        &[],
+        ListenOn::LoopbackRange(range.clone()),
+    )
+    .await;
+    assert_eq!((h.http().port(), h.socks().port()), (first + 1, first + 2));
+
+    let dir = tempfile::tempdir().unwrap();
+    let (private, public) = (dir.path().join("private"), dir.path().join("public"));
+    std::fs::create_dir(&private).unwrap();
+    std::fs::create_dir(&public).unwrap();
+    let ca = NodeCa::load_or_create(&private, &public).unwrap();
+    let (tx, _from_node) = mpsc::unbounded_channel();
+    let manager = ProxyManager::new(Channel(tx), ca, |_| {});
+    let config = CommandProxyConfig {
+        exec_id: ExecId::try_from("e_2").unwrap(),
+        egress: Some((rules(Default::Deny, &[], &[]), None)),
+        credential: None,
+        listen: ListenOn::LoopbackRange(range),
+    };
+    let err = egress::start(config, &manager).await.err().unwrap();
+    assert_eq!(
+        (err.kind(), err.to_string()),
+        (
+            io::ErrorKind::AddrInUse,
+            format!("no free proxy port in {first}-{}", first + 2)
+        )
+    );
+}

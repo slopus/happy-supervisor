@@ -69,12 +69,12 @@ nothing past the job is consumed. Then:
 * macOS: the parent spawned it as `/usr/bin/sandbox-exec -p <profile> <exe> __sandbox`, so it is
   already confined.
 * Windows: the helper is a broker, as the supervisor's account in the exec's Job Object. It
-  leases one of the sandbox's accounts, adds the ACEs the policy needs for that account's group,
-  and starts `<exe> __sandbox runner` as that account (CreateProcessWithLogonW). The runner
-  restricts its own token and starts the command, or performs the file operation impersonating
-  it. When the runner exits the broker revokes the ACEs. The status pipe's handle arrives in a
-  preamble on stdin (`HSS1`) instead of as fd 3. `install-sandbox` creates the accounts, groups
-  and firewall filters once.
+  leases an account from the pool for the policy's network mode and `localBind`, adds the ACEs
+  the policy needs for that account's group, and starts `<exe> __sandbox runner` as that
+  account (CreateProcessWithLogonW). The runner restricts its own token and starts the command,
+  or performs the file operation impersonating it. When the runner exits the broker revokes the
+  ACEs. The status pipe's handle arrives in a preamble on stdin (`HSS1`) instead of as fd 3.
+  `install-sandbox` creates the accounts, groups and firewall filters once.
 * Then `JobOp::Exec` execs the command (`execve`, so the PID stays the same and the rest of stdin
   belongs to the command). The parent passes the write end of a pipe as the helper's fd 3. If
   confinement or the exec fails, the helper writes the `Error` as CBOR there and exits 127. A

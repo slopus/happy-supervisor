@@ -149,7 +149,7 @@ How isolated networking works (proxy.md, "Egress proxy"):
 |---|---|---|
 | Linux | `bwrap` 0.8+ on `PATH` (or at a configured path), unprivileged user namespaces (or a setuid `bwrap`), kernel seccomp. On Ubuntu 24.04+, an AppArmor profile that allows `bwrap` user namespaces (below). | NodeInfo `sandbox.available`, `sandbox.reason` |
 | macOS | `/usr/bin/sandbox-exec`. | same |
-| Windows | Windows 10 1809+ / Server 2019+, the supervisor installed once with administrator rights to create the sandbox account and firewall filters. | same |
+| Windows | Windows 10 1809+ / Server 2019+, the supervisor installed once with administrator rights to create the sandbox accounts and firewall filters. | same |
 
 A node that cannot enforce a policy replies `sandbox_unavailable` and never runs the operation
 with less.
@@ -198,12 +198,15 @@ Through `fs.*` all of these answer `permission_denied`, because the node checks 
 
 ### Windows: escapes, gaps and errors
 
-**Isolated networking on Windows can be escaped.** The firewall filters that confine an isolated
-command are keyed on a sandbox group in its token. A command that creates a restricted token of
-its own in which that group is deny-only is no longer matched by the filters, and reaches the
-network directly. Until this is fixed (an AppContainer sandbox is being evaluated), treat
-isolated mode on Windows as a guard against accidents, not against a command that tries to get
-out.
+**Network rules on Windows follow the account, not the token's choices.** `install-sandbox`
+creates a pool of accounts for each combination of network mode and `localBind`, and each
+account belongs to the network groups its pool needs. A command runs as an account of its
+policy's pool. The firewall's blocks match a token that holds such a group in any state: a
+restricted token of the command's own can make the group deny-only, but cannot drop it, so the
+command cannot step out of a block. Its permits (the proxy ports, loopback) match only an
+enabled group, so a command can lose one but never gain one. A process elsewhere on the machine
+whose restricted token restricts to none of Everyone, RESTRICTED and WRITE RESTRICTED also fails
+the blocks' check and loses the network.
 
 Reads use the separate-account model: the command runs as one of the sandbox's own unprivileged
 accounts, and the policy adds and removes access with ACLs. So `read.default: "deny"` is not

@@ -14,13 +14,15 @@ happy-supervisor join --url https://control.example.com/api/nodes/join --token <
 happy-supervisor run [--state-dir <dir>]
 happy-supervisor serve --listen 127.0.0.1:7777 --token-file <file> [--state-dir <dir>]
 happy-supervisor info [--state-dir <dir>]
+happy-supervisor install-sandbox        # Windows, once, as an administrator
 ```
 
 `join` exchanges a single-use join token at the join endpoint for a long-lived node credential
 and the endpoint to connect to. `run` connects and serves the control plane until the
 credential is revoked (exit code 3). `serve` listens instead of dialing, for tests and local
 programs that drive the node with `happy_supervisor::Controller`. `info` prints this
-machine's NodeInfo as JSON.
+machine's NodeInfo as JSON. On Windows, `install-sandbox` creates the sandbox's accounts, groups
+and firewall filters; without it the sandbox reports unavailable.
 
 The contract:
 
@@ -32,6 +34,7 @@ The contract:
 * [docs/architecture.md](docs/architecture.md) covers the modules, the sandbox helper and the link session.
 
 The library exports the wire types (`happy_supervisor::protocol`), the sans-IO link session
-both sides can drive (`happy_supervisor::link`), the control-plane client for a `serve` node
-(`happy_supervisor::Controller`), and, with the `testing` feature, an in-process
-control plane for tests (`happy_supervisor::testing`).
+both sides can drive (`happy_supervisor::link`), the control plane's side of the link
+(`happy_supervisor::server`, alone with `default-features = false, features = ["control-plane"]`),
+the control-plane client for a `serve` node (`happy_supervisor::Controller`), and, with the
+`testing` feature, an in-process control plane for tests (`happy_supervisor::testing`).

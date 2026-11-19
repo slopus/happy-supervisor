@@ -177,6 +177,33 @@ What a command sees on Linux:
 Through `fs.*` all of these answer `permission_denied`, because the node checks the policy first
 (api.md, `fs.stat`).
 
+### Windows: escapes, gaps and errors
+
+**Isolated networking on Windows can be escaped.** The firewall filters that confine an isolated
+command are keyed on a sandbox group in its token. A command that creates a restricted token of
+its own in which that group is deny-only is no longer matched by the filters, and reaches the
+network directly. Until this is fixed (an AppContainer sandbox is being evaluated), treat
+isolated mode on Windows as a guard against accidents, not against a command that tries to get
+out.
+
+Reads use the separate-account model: the command runs as one of the sandbox's own unprivileged
+accounts, and the policy adds and removes access with ACLs. So `read.default: "deny"` is not
+exact on Windows: the command can still read what any local user can, such as the Windows and
+Program Files directories and other world-readable data. Under `read.default: "allow"` it
+cannot read the supervisor account's private files, such as its profile, unless `read.allow`
+lists them.
+
+Under `write.default: "deny"` the command's token is write-restricted, and Windows gives a
+restricted token no Schannel credentials. TLS through Schannel (curl.exe, PowerShell, .NET) fails
+with `SEC_E_NO_CREDENTIALS`; programs with their own TLS (OpenSSL, rustls, Go, Node, Python)
+work.
+
+The Windows probe lists these and its other gaps in `gaps`, among them: `unixSockets: false` is
+not enforced; `localBind: false` blocks TCP listen but not UDP bind; in isolated mode the command
+can reach every port in the proxy port range, and with `localBind` every loopback port; names
+still resolve through the DNS Client service; processes started through system services (WMI,
+Task Scheduler) leave the Job Object.
+
 ## Raw access
 
 `{ "mode": "raw" }` access carries no policy and runs with the supervisor's rights. Raw processes

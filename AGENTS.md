@@ -24,7 +24,7 @@ protocol rule in `client` or `testing`.
 | `exec`, `process/*` | exec track |
 | `sandbox/linux/*`, `sandbox/placeholders.rs`, `connect` | Linux sandbox track |
 | `sandbox/macos/*` | macOS sandbox track |
-| `sandbox/windows.rs` | Windows sandbox track |
+| `sandbox/windows/*` | Windows sandbox track |
 | `fs` (bodies of `perform` and `handle`), `watch` | files track |
 | `proxy/*`, `streams`, `tunnel` | proxy track |
 | `node_info/*` | node-info track |

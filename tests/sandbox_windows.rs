@@ -194,9 +194,25 @@ fn powershell(script: &str) -> Vec<String> {
 
 const TCP_LISTEN: &str = "$ErrorActionPreference = 'Stop'; $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $l.Start(); 'bound'";
 
-/// Runs `argv` through `sandbox::prepare` and the broker, the way `exec.start` does: the status
-/// pipe's write end is duplicated into the broker and named in the stdin preamble.
-fn run(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> (Outcome, String) {
+/// One test at a time, so each lease takes the first account and a test can tell which one
+/// a killed broker held.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A broker started on a job, until it exits.
+struct Started {
+    child: std::process::Child,
+    status: std::io::PipeReader,
+    _placeholders: sandbox::Placeholders,
+}
+
+/// Starts `argv` through `sandbox::prepare` and the broker, the way `exec.start` does: the
+/// status pipe's write end is duplicated into the broker and named in the stdin preamble.
+fn start(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> Started {
     helper::set_exe(PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor")));
     let root = system_root();
     let mut env = BTreeMap::from([
@@ -235,7 +251,7 @@ fn run(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> 
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let (mut status_reader, status_writer) = std::io::pipe().unwrap();
+    let (status_reader, status_writer) = std::io::pipe().unwrap();
     let mut theirs: HANDLE = std::ptr::null_mut();
     // SAFETY: both process handles are open; the call closes our pipe handle.
     let duplicated = unsafe {
@@ -255,10 +271,18 @@ fn run(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> 
     stdin.write_all(&(theirs as u64).to_le_bytes()).unwrap();
     stdin.write_all(&helper::encode_job(&job)).unwrap();
     drop(stdin);
+    Started {
+        child,
+        status: status_reader,
+        _placeholders: placeholders,
+    }
+}
+
+fn run(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> (Outcome, String) {
+    let mut started = start(grants, state, net, argv);
     let mut status = Vec::new();
-    status_reader.read_to_end(&mut status).unwrap();
-    let output = child.wait_with_output().unwrap();
-    drop(placeholders);
+    started.status.read_to_end(&mut status).unwrap();
+    let output = started.child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let denied = [
@@ -340,6 +364,7 @@ fn bind_in(ports: std::ops::RangeInclusive<u16>) -> TcpListener {
 
 #[test]
 fn the_probe_reports_an_installed_sandbox() {
+    let _serial = serial();
     helper::set_exe(PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor")));
     let info = sandbox::probe();
     assert_eq!(info.status, SandboxStatus::Available);
@@ -350,6 +375,7 @@ fn the_probe_reports_an_installed_sandbox() {
 
 #[test]
 fn policy_combinations_and_their_outcomes() {
+    let _serial = serial();
     let tree = Tree::new();
     let t = |rel: &str| tree.path(rel);
     let p = |rel: &str| tree.show(rel);
@@ -578,6 +604,7 @@ fn policy_combinations_and_their_outcomes() {
 /// when the ACE is added and again when it is revoked.
 #[test]
 fn a_grant_reaches_the_bottom_of_a_large_tree() {
+    let _serial = serial();
     let tree = Tree::new();
     let big = tree.path("big");
     for dir in 0..20 {
@@ -608,6 +635,95 @@ fn a_grant_reaches_the_bottom_of_a_large_tree() {
     );
 }
 
+#[test]
+fn concurrent_execs_each_lease_an_account() {
+    let _serial = serial();
+    let tree = Tree::new();
+    let state = tree.path("state");
+    let started: Vec<Started> = (0..4)
+        .map(|i| {
+            let out = tree.path(&format!("out/c{i}"));
+            std::fs::create_dir(&out).unwrap();
+            start(
+                &grants(&[], &[&out]),
+                &state,
+                None,
+                &cmd(format!(
+                    r"echo c{i}>{}\n&& ping -n 2 127.0.0.1 >NUL",
+                    out.display()
+                )),
+            )
+        })
+        .collect();
+    for (i, mut started) in started.into_iter().enumerate() {
+        let mut status = Vec::new();
+        started.status.read_to_end(&mut status).unwrap();
+        let output = started.child.wait_with_output().unwrap();
+        assert_eq!(
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            (Some(0), "".into()),
+            "exec {i}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.path(&format!("out/c{i}/n"))).unwrap(),
+            format!("c{i}\r\n")
+        );
+    }
+}
+
+fn icacls(path: &Path) -> String {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A broker killed while its command runs leaves its ACEs; the next lease of that account
+/// revokes them from the journal before adding its own.
+#[test]
+fn the_next_lease_revokes_what_a_killed_broker_left() {
+    let _serial = serial();
+    let tree = Tree::new();
+    let out = tree.path("out");
+    let mut started = start(
+        &grants(&[], &[&out]),
+        &tree.path("state"),
+        None,
+        &cmd(r"echo started& ping -n 60 127.0.0.1 >NUL".to_string()),
+    );
+    let mut line = [0u8; 9];
+    started
+        .child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut line)
+        .unwrap();
+    assert_eq!(&line, b"started\r\n");
+    assert!(icacls(&out).contains("happy-sbx-"), "{}", icacls(&out));
+    started.child.kill().unwrap();
+    started.child.wait().unwrap();
+    assert!(
+        icacls(&out).contains("happy-sbx-"),
+        "the broker revoked nothing"
+    );
+
+    let data = tree.path("data");
+    let (outcome, output) = run(
+        &grants(&[&data], &[]),
+        &tree.path("state"),
+        None,
+        &cmd(format!(r"echo x>{}\after", out.display())),
+    );
+    assert_eq!(outcome, Denied, "{output}");
+    assert!(!icacls(&out).contains("happy-sbx-"), "{}", icacls(&out));
+    assert!(!icacls(&data).contains("happy-sbx-"), "{}", icacls(&data));
+}
+
 fn confinement(tree: &Tree, read: &[&str], write: &[&str]) -> Confinement {
     let paths = |rels: &[&str]| rels.iter().map(|rel| tree.path(rel)).collect::<Vec<_>>();
     let mut grants = grants(&[], &[]);
@@ -621,54 +737,61 @@ fn abs(path: &Path) -> AbsPath {
     AbsPath::try_from(path.to_str().unwrap()).unwrap()
 }
 
-#[tokio::test]
-async fn file_operations_run_as_the_sandbox() {
-    helper::set_exe(PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor")));
-    let tree = Tree::new();
-    let read = |rel: &str| {
-        FsRequest::Read(FsReadParams {
-            path: abs(&tree.path(rel)),
-            offset: 0,
-            length: None,
-        })
-    };
-    let write = |rel: &str| {
-        FsRequest::Write(FsWriteParams {
-            path: abs(&tree.path(rel)),
-            data: Bytes::new(b"written".to_vec()),
-            mode: WriteMode::Overwrite,
-        })
-    };
+#[test]
+fn file_operations_run_as_the_sandbox() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        helper::set_exe(PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor")));
+        let tree = Tree::new();
+        let read = |rel: &str| {
+            FsRequest::Read(FsReadParams {
+                path: abs(&tree.path(rel)),
+                offset: 0,
+                length: None,
+            })
+        };
+        let write = |rel: &str| {
+            FsRequest::Write(FsWriteParams {
+                path: abs(&tree.path(rel)),
+                data: Bytes::new(b"written".to_vec()),
+                mode: WriteMode::Overwrite,
+            })
+        };
 
-    match fs::handle(read("data/file.txt"), confinement(&tree, &["data"], &[])).await {
-        Ok(FsResponse::Read(FsReadResult { data, .. })) => {
-            assert_eq!(data.into_vec(), b"data\n")
+        match fs::handle(read("data/file.txt"), confinement(&tree, &["data"], &[])).await {
+            Ok(FsResponse::Read(FsReadResult { data, .. })) => {
+                assert_eq!(data.into_vec(), b"data\n")
+            }
+            other => panic!("read answered {other:?}"),
         }
-        other => panic!("read answered {other:?}"),
-    }
-    let denied = |result: Result<FsResponse, happy_supervisor::Error>| {
-        result.map(|_| ()).map_err(|err| err.kind)
-    };
-    assert_eq!(
-        denied(
-            fs::handle(
-                read("outside/secret.txt"),
-                confinement(&tree, &["data"], &[])
-            )
-            .await
-        ),
-        Err(ErrorKind::PermissionDenied)
-    );
-    assert_eq!(
-        denied(fs::handle(write("out/new.txt"), confinement(&tree, &["out"], &[])).await),
-        Err(ErrorKind::PermissionDenied)
-    );
-    assert_eq!(
-        denied(fs::handle(write("out/new.txt"), confinement(&tree, &[], &["out"])).await),
-        Ok(())
-    );
-    assert_eq!(
-        std::fs::read_to_string(tree.path("out/new.txt")).unwrap(),
-        "written"
-    );
+        let denied = |result: Result<FsResponse, happy_supervisor::Error>| {
+            result.map(|_| ()).map_err(|err| err.kind)
+        };
+        assert_eq!(
+            denied(
+                fs::handle(
+                    read("outside/secret.txt"),
+                    confinement(&tree, &["data"], &[])
+                )
+                .await
+            ),
+            Err(ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            denied(fs::handle(write("out/new.txt"), confinement(&tree, &["out"], &[])).await),
+            Err(ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            denied(fs::handle(write("out/new.txt"), confinement(&tree, &[], &["out"])).await),
+            Ok(())
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.path("out/new.txt")).unwrap(),
+            "written"
+        );
+    });
 }

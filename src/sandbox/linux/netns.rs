@@ -72,6 +72,16 @@ pub fn pair() -> io::Result<(NetnsControl, OwnedFd)> {
     ))
 }
 
+/// Held by [`serve`] from a request to its reply, so the helper does not exit between them.
+static IN_FLIGHT: Mutex<()> = Mutex::new(());
+
+/// Waits for the request being answered, if any, and keeps the next one from starting. The
+/// helper calls it before it exits: a command that accepts a connection and exits at once would
+/// otherwise take the helper down before the connected socket reaches the node.
+pub fn finish_serving() {
+    std::mem::forget(IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner));
+}
+
 /// The helper's side: answers requests until the node closes its end.
 pub fn serve(socket: OwnedFd) {
     let mut request = [0u8; 2];
@@ -84,6 +94,7 @@ pub fn serve(socket: OwnedFd) {
         if len == 0 {
             return;
         }
+        let _answering = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
         let port = u16::from_be_bytes(request);
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let sent = match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {

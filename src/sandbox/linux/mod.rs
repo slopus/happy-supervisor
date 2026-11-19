@@ -343,6 +343,7 @@ fn supervise(child: libc::pid_t, bridge: Option<bridge::Bridge>, control: Option
             std::process::exit(helper::EXIT_EXEC_FAILED);
         }
     }
+    netns::finish_serving();
     if libc::WIFSIGNALED(status) {
         let signal = libc::WTERMSIG(status);
         // SAFETY: dying by the command's signal, so the sandbox reports what the command did.

@@ -716,7 +716,9 @@ fn tcp_open_reaches_a_listener_inside_the_namespace() {
             break port.trim().parse().unwrap();
         }
     };
-    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    // The namespace's port is free on the host, unless another process there took the same
+    // number; a host listener on it must not be the one tcp.open reaches.
+    let _host_listener = TcpListener::bind(("127.0.0.1", port));
     let netns = started
         .netns
         .as_ref()

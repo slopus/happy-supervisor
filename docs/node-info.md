@@ -170,8 +170,11 @@ Who the supervisor runs as, and who its work runs as (policy.md, Workload user).
 | Field | Type | Meaning |
 |---|---|---|
 | `supervisorUser` | string | The supervisor process's user name (its uid on Unix if it has none). |
-| `workloadUser` | string \| null | With `--workload-user`, the user every command and file operation runs as. `null` when they run as `supervisorUser`. |
-| `root` | bool | The supervisor runs as root (Unix) or with an elevated administrator token (Windows). With `workloadUser` null, its raw work does too. |
+| `workloadUser` | string \| null | With `--workload-user`, the user every command and file operation runs as. Never root: the node does not start with a root workload user. `null` when work runs as `supervisorUser`. |
+| `root` | bool | The supervisor runs as root (Unix) or with an elevated administrator token (Windows). With `workloadUser` null, its work does too. On Linux `root` with `workloadUser` null never happens: the supervisor refuses to start that way. |
+
+So work runs as root exactly when `workloadUser` is null and `root` is true, which only macOS and
+Windows allow.
 
 ### `defaultEnv`
 

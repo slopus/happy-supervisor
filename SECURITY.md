@@ -3,7 +3,8 @@
 These are the project's security requirements. Every change must keep them. Where a platform
 cannot meet one, the node says so (NodeInfo `sandbox`) and refuses the operation; it never runs
 it with less. The details live in [docs/policy.md](docs/policy.md),
-[docs/proxy.md](docs/proxy.md), [docs/tunnels.md](docs/tunnels.md) and [docs/api.md](docs/api.md).
+[docs/proxy.md](docs/proxy.md), [docs/tunnels.md](docs/tunnels.md) and [docs/api.md](docs/api.md),
+and how to install the node is in [docs/install.md](docs/install.md).
 
 ## Trust model
 
@@ -30,7 +31,8 @@ it with less. The details live in [docs/policy.md](docs/policy.md),
 8. Commands run as a process tree that the node can always kill completely: a process group on
    Unix, a Job Object on Windows. This applies to raw commands too.
 9. A supervisor with a workload user never runs work as itself. It refuses to start if that user
-   is missing or is root, and it refuses an operation it cannot yet run as that user.
+   is missing or is root, and it refuses an operation it cannot yet run as that user. On Linux, a
+   root supervisor requires a workload user.
 
 ## The policy
 

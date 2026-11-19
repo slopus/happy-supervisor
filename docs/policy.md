@@ -238,7 +238,8 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
 (node-info.md), so a control plane can refuse to share a node whose work would run as root.
 
 * The node refuses to start if the user does not exist, is root (uid 0), or the supervisor is
-  not root.
+  not root. On Linux it also refuses to start as root without a workload user, so work there
+  never runs as root (install.md). A Linux supervisor that is not root runs work as itself.
 * A command enters its `cwd` as that user. A raw file operation runs in the sandbox helper, as
   that user and without a policy. A `tty` command's terminal belongs to that user.
 * The supervisor itself stays root. Its private state directory stays `0700`, and the state

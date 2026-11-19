@@ -21,9 +21,12 @@ pub struct Identity {
 impl Identity {
     /// The supervisor's own user, and the workload user named, if any. The node refuses to
     /// start when that user does not exist, is root, or cannot be switched to because the
-    /// supervisor is not root.
+    /// supervisor is not root, and on Linux when the supervisor is root and names none.
     pub fn resolve(workload_user: Option<&str>) -> Result<Identity> {
         let (supervisor_user, root) = current();
+        if cfg!(target_os = "linux") && root && workload_user.is_none() {
+            return Err(Error::invalid_params(ROOT_NEEDS_WORKLOAD_USER));
+        }
         let workload = match workload_user {
             None => None,
             Some(name) => Some(Arc::new(Workload::resolve(name, &supervisor_user, root)?)),
@@ -65,6 +68,11 @@ impl Identity {
         }
     }
 }
+
+/// On Linux, work never runs as root (SECURITY.md).
+const ROOT_NEEDS_WORKLOAD_USER: &str = "on Linux a supervisor running as root needs \
+     --workload-user, the unprivileged user its commands and file operations run as: see \
+     docs/install.md (https://github.com/slopus/happy-supervisor/blob/main/docs/install.md)";
 
 /// Makes `command` run as `workload`, when there is one ([`Workload::apply`]).
 pub(crate) fn run_as(

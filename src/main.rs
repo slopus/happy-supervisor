@@ -35,13 +35,17 @@ enum Command {
         name: Option<String>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// As for `run`.
+        #[arg(long)]
+        workload_user: Option<String>,
     },
     /// Connect to the control plane and serve it until revoked or interrupted.
     Run {
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Run every command, file operation and watch as this user (Unix, supervisor running
-        /// as root). Overrides `private/workload-user` in the state directory.
+        /// as root). Overrides `private/workload-user` in the state directory. Required on Linux
+        /// when the supervisor runs as root.
         #[arg(long)]
         workload_user: Option<String>,
     },
@@ -68,6 +72,9 @@ enum Command {
     Info {
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// As for `run`.
+        #[arg(long)]
+        workload_user: Option<String>,
     },
 }
 
@@ -109,6 +116,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// Opens the state directory and checks, before anything else runs, that the supervisor may
+/// run its work as the user it would (identity.rs).
+fn open_state(
+    dir: Option<PathBuf>,
+    workload_user: Option<String>,
+) -> happy_supervisor::Result<StateDir> {
+    let state = StateDir::open(dir)?.with_workload_user(workload_user);
+    Identity::resolve(state.workload_user()?.as_deref())?;
+    Ok(state)
+}
+
 async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
     match command {
         Command::Join {
@@ -116,8 +134,9 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
             token,
             name,
             state_dir,
+            workload_user,
         } => {
-            let state = StateDir::open(state_dir)?;
+            let state = open_state(state_dir, workload_user)?;
             let credentials = enroll::join(&url, &token, name, &state).await?;
             println!(
                 "joined as {}, endpoint {}",
@@ -128,8 +147,7 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         Command::Run {
             state_dir,
             workload_user,
-        } => match client::run(StateDir::open(state_dir)?.with_workload_user(workload_user)).await?
-        {
+        } => match client::run(open_state(state_dir, workload_user)?).await? {
             RunExit::Revoked => {
                 eprintln!("happy-supervisor: the control plane revoked this node's credential");
                 Ok(ExitCode::from(3))
@@ -144,7 +162,7 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         } => {
             let listen = listen.parse()?;
             let token = serve::read_token(&token_file)?;
-            let state = StateDir::open(state_dir)?.with_workload_user(workload_user);
+            let state = open_state(state_dir, workload_user)?;
             let listening = |addr: String| {
                 use std::io::Write as _;
                 println!("listening {addr}");
@@ -155,8 +173,11 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         }
         #[cfg(windows)]
         Command::InstallSandbox(_) => unreachable!("handled before the runtime starts"),
-        Command::Info { state_dir } => {
-            let state = StateDir::open(state_dir)?;
+        Command::Info {
+            state_dir,
+            workload_user,
+        } => {
+            let state = open_state(state_dir, workload_user)?;
             let info = tokio::task::spawn_blocking(move || {
                 let installation_id = state.installation_id()?;
                 let name = state.credentials()?.map(|c| c.name);

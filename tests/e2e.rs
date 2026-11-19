@@ -604,8 +604,10 @@ async fn a_control_plane_that_declines_compression_is_refused() {
 }
 
 /// 100 tiny commands while 16 MiB reads keep the link busy, with lanes and through one lane.
-/// Prints both p99s. It measures time, so it runs alone: CI runs it in a step of its own.
-#[tokio::test]
+/// Prints both p99s. It measures time, so it runs alone: CI runs it in a step of its own, in
+/// release. The control plane gets its own threads so that decoding the reads does not delay the
+/// tiny commands on its side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "timing: run alone with --ignored"]
 async fn tiny_commands_stay_fast_beside_a_16_mib_read() {
     let dir = tempfile::tempdir().unwrap();

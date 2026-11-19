@@ -172,8 +172,20 @@ impl Node {
 
     /// An isolated Linux sandbox has its own loopback, so it reaches its proxies through Unix
     /// sockets the helper bridges. A socket's path must fit the 108 bytes of a socket address,
-    /// so their directory is a counter.
+    /// so their directory is a counter. An isolated Windows sandbox reaches only the loopback
+    /// ports its firewall filters permit, which `install-sandbox` fixed.
     fn proxy_listen(&self, isolated: bool) -> Result<ListenOn> {
+        #[cfg(windows)]
+        if isolated {
+            return crate::sandbox::windows::proxy_ports()
+                .map(ListenOn::LoopbackRange)
+                .ok_or_else(|| {
+                    Error::sandbox_unavailable(
+                        "the sandbox is not installed: run `happy-supervisor install-sandbox` \
+                         as an administrator",
+                    )
+                });
+        }
         if !(cfg!(target_os = "linux") && isolated) {
             return Ok(ListenOn::Loopback);
         }

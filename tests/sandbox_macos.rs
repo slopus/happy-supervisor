@@ -94,9 +94,7 @@ impl P {
         self.0.read.deny.extend(paths(list));
         self
     }
-    /// Also allows reading them: a path read rules deny, by default too, may not be writable.
     fn write_allow(mut self, list: &[&Path]) -> P {
-        self.0.read.allow.extend(paths(list));
         self.0.write.allow.extend(paths(list));
         self
     }
@@ -407,7 +405,7 @@ fn policy_combinations_and_their_outcomes() {
             ok("new\n"),
         ),
         (
-            "write: a write allow is readable",
+            "write: implies read",
             policy().write_allow(&[&t("out")]),
             sh(format!("cat {}", p("out/existing.txt"))),
             ok("existing\n"),

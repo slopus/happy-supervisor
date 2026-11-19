@@ -35,7 +35,7 @@ const SYSTEM_SYMLINKS: [&str; 3] = ["/etc", "/tmp", "/var"];
 
 /// What every profile allows whatever the policy says (policy.md, macOS).
 const GAPS: [&str; 2] = [
-    "the metadata (not the listing or contents) of every directory above a readable policy entry is readable",
+    "the metadata (not the listing or contents) of every directory above a grant is readable",
     "with isolated networking and localBind, a listener may bind any local address and accept connections from other hosts, and the command cannot connect to its own listeners",
 ];
 

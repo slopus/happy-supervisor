@@ -100,7 +100,7 @@ class InstallTests(unittest.TestCase):
         for directory in ['/bin', '/usr/bin']:
             for program in Path(directory).iterdir():
                 link = tools / program.name
-                if program.name not in hidden and not link.exists():
+                if program.name not in hidden and not os.path.lexists(link):
                     link.symlink_to(program)
         self.env = {'PATH': f'{self.stub}:{tools}', 'HOME': str(self.root / 'home'),
                     'MOCK_ROOT': str(self.root), 'TMPDIR': str(self.root),

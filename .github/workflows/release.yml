@@ -112,11 +112,11 @@ jobs:
           mkdir -p out
           bin=out/happy-supervisor-$NAME$EXE
           cp "target/$TARGET/release/happy-supervisor$EXE" "$bin"
-          grep -aqF "$HAPPY_SUPERVISOR_VERSION" "$bin" ||
-            { echo "$bin does not carry $HAPPY_SUPERVISOR_VERSION" >&2; exit 1; }
-          # The binary as shipped starts here and describes this machine.
+          # The binary as shipped starts here, reports the release version and describes this
+          # machine.
           "$bin" info --state-dir "$RUNNER_TEMP/state" > "$RUNNER_TEMP/info.json"
-          jq -e --arg arch "$ARCH" '.os.arch == $arch' "$RUNNER_TEMP/info.json"
+          jq -e --arg v "$HAPPY_SUPERVISOR_VERSION" --arg arch "$ARCH" \
+            '.supervisorVersion == $v and .os.arch == $arch' "$RUNNER_TEMP/info.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: build-${{ matrix.name }}

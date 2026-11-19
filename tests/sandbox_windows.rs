@@ -968,3 +968,188 @@ fn exec_start_runs_through_the_broker() {
         "got from stdin\r\n"
     );
 }
+
+fn winbox() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor"))
+        .parent()
+        .unwrap()
+        .join(r"examples\winbox.exe")
+}
+
+/// Runs PowerShell as the test's own account (an administrator in CI) and returns its stdout.
+fn admin_powershell(script: &str) -> String {
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// `winbox wfp-hold`: the rules stay until the returned child's stdin closes.
+fn hold_wfp(rules: &[String]) -> std::process::Child {
+    let mut child = std::process::Command::new(winbox())
+        .arg("wfp-hold")
+        .args(rules)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = [0u8; 5];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+    child
+}
+
+fn release(mut child: std::process::Child) {
+    drop(child.stdin.take());
+    child.wait().unwrap();
+}
+
+/// An experiment, not a requirement: what a sandboxed command reaches after it makes SIDs of
+/// its own token deny-only (`winbox escape`), against our group-keyed filters and against
+/// user-keyed blocks as Codex installs them (a WFP filter and a firewall rule).
+#[test]
+fn token_escapes() {
+    let _serial = serial();
+    let tree = Tree::new();
+    let state = tree.path("state");
+    let examples = winbox().parent().unwrap().to_path_buf();
+    let ports = sandbox::windows::proxy_ports().unwrap();
+    let in_range = bind_in(ports.clone());
+    let in_port = in_range.local_addr().unwrap().port();
+    serve(in_range);
+    let out_range = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let out_url = format!(
+        "http://127.0.0.1:{}/",
+        out_range.local_addr().unwrap().port()
+    );
+    serve(out_range);
+    let proxy = |port: u16| Endpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    let net_plan = NetPlan {
+        http: proxy(in_port),
+        socks: proxy(in_port),
+    };
+    let escape = |disable: &str, argv: Vec<String>| -> Vec<String> {
+        let mut out = vec![
+            winbox().to_str().unwrap().to_string(),
+            "escape".to_string(),
+            disable.to_string(),
+        ];
+        out.extend(argv);
+        out
+    };
+    let http = || curl(&["-o", "NUL", "-w", "%{http_code}", "http://example.com"]);
+    let base = || grants(&[&examples], &[]);
+    let row = |label: &str, grants: Grants, argv: Vec<String>| {
+        let net = matches!(grants.net, Net::Isolated).then(|| net_plan.clone());
+        let (outcome, output) = run(&grants, &state, net, &argv);
+        eprintln!(
+            "ROW {label}: {outcome:?}\n    {}",
+            output.replace('\n', "\n    ")
+        );
+    };
+
+    row(
+        "isolated, loopback outside the range, nothing dropped",
+        base().isolated(),
+        escape("none", curl(&[&out_url])),
+    );
+    row(
+        "isolated, loopback outside the range, happy-sbx-isolated deny-only",
+        base().isolated(),
+        escape("happy-sbx-isolated", curl(&[&out_url])),
+    );
+    row(
+        "isolated, loopback outside the range, user deny-only",
+        base().isolated(),
+        escape("user", curl(&[&out_url])),
+    );
+    row(
+        "isolated, http://example.com, nothing dropped",
+        base().isolated(),
+        escape("none", http()),
+    );
+    row(
+        "isolated, http://example.com, happy-sbx-isolated deny-only",
+        base().isolated(),
+        escape("happy-sbx-isolated", http()),
+    );
+    row(
+        "no localBind, listen, happy-sbx-nolisten deny-only",
+        base().temp(&tree.path("tmp")),
+        escape("happy-sbx-nolisten", powershell(TCP_LISTEN)),
+    );
+
+    let users = admin_powershell(
+        "(1..8 | % { ([Security.Principal.NTAccount]('happy-sbx-{0:d2}' -f $_)).Translate([Security.Principal.SecurityIdentifier]).Value }) -join ','",
+    );
+    let users: Vec<String> = users.trim().split(',').map(str::to_string).collect();
+    eprintln!("slot users: {users:?}");
+
+    let held = hold_wfp(
+        &users
+            .iter()
+            .map(|sid| format!("block-user:{sid}:80"))
+            .collect::<Vec<_>>(),
+    );
+    row(
+        "Codex-style WFP block on the user SID, port 80, nothing dropped",
+        base(),
+        escape("none", http()),
+    );
+    row(
+        "Codex-style WFP block on the user SID, port 80, user deny-only",
+        base(),
+        escape("user", http()),
+    );
+    release(held);
+
+    eprintln!(
+        "firewall before: {}",
+        admin_powershell("Get-NetFirewallProfile | % { \"$($_.Name)=$($_.Enabled)\" }").trim()
+    );
+    let sddl: String = users.iter().map(|sid| format!("(A;;CC;;;{sid})")).collect();
+    eprintln!(
+        "{}",
+        admin_powershell(&format!(
+            "Set-NetFirewallProfile -All -Enabled True; New-NetFirewallRule -Name hsbx-codex -DisplayName hsbx-codex -Direction Outbound -Action Block -Protocol TCP -RemotePort 80 -LocalUser 'D:{sddl}' | Out-Null; 'rule added'"
+        ))
+    );
+    row(
+        "Codex-style firewall rule on the user SID, port 80, nothing dropped",
+        base(),
+        escape("none", http()),
+    );
+    row(
+        "Codex-style firewall rule on the user SID, port 80, user deny-only",
+        base(),
+        escape("user", http()),
+    );
+    eprintln!(
+        "{}",
+        admin_powershell("Remove-NetFirewallRule -Name hsbx-codex; 'rule removed'",)
+    );
+
+    row(
+        "AppContainer from the sandbox account: cmd",
+        base(),
+        vec![
+            winbox().to_str().unwrap().to_string(),
+            "container".to_string(),
+            "hsbx-probe-combo".to_string(),
+            "none".to_string(),
+            format!(r"{}\System32\cmd.exe", system_root()),
+            "/c".to_string(),
+            "echo inside".to_string(),
+        ],
+    );
+}

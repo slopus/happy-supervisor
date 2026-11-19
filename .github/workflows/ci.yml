@@ -43,7 +43,7 @@ jobs:
       - run: cargo run --all-features -- install-sandbox
         if: runner.os == 'Windows'
       # The policy-to-outcome table with each row's time, in the log.
-      - run: cargo test --all-features --test sandbox_windows -- --nocapture
+      - run: cargo test --all-features --test sandbox_windows --test appcontainer_probe -- --nocapture --test-threads 1
         if: runner.os == 'Windows'
       - run: cargo test --all-features
       # The workload user (identity.rs) needs a supervisor running as root.

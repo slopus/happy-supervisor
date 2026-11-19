@@ -119,12 +119,21 @@ Infra sets up, once:
 
 ## Release notes
 
+One version names one build. Bump `VERSION` in the commit that releases, and give it a bullet
+here in that commit; `test_install.py` fails without one. Changes after a release go under an
+**Unreleased** bullet until the next bump. Never reuse a version: `publish.sh` refuses one that
+exists. Commits between releases do not bump `VERSION`, since a bump on `main` is what starts a
+release; a binary built from them reports `VERSION` only if built as a release, which only the
+triggers and `release.yml` do.
+
 * **0.2.0-linux.1.** The first release from this repository. On Windows the sandbox's install
   record is now version 2 (accounts pooled per network profile): run `install.ps1` again, or
   `happy-supervisor install-sandbox` as an administrator, on every Windows node; it deletes the
   version 1 accounts first. A Linux supervisor running as root refuses to start without
   `--workload-user`.
-* **Unreleased.** Linux enforces `limits.memoryBytes` and `limits.processes` when the service's
-  cgroup is delegated to the supervisor, and the installer's unit now says `Delegate=yes`. On an
-  existing Linux node, run `install.sh` again, or add `Delegate=yes` to the unit's `[Service]`
-  and restart it. A command killed for `memoryBytes` exits with `{ "kind": "memoryLimit" }`.
+* **0.2.0-linux.2.** Linux enforces `limits.memoryBytes` and `limits.processes` when the
+  service's cgroup is delegated to the supervisor, and the installer's unit now says
+  `Delegate=yes`. On an existing Linux node, run `install.sh` again, or add `Delegate=yes` to the
+  unit's `[Service]` and restart it. A command killed for `memoryBytes` exits with
+  `{ "kind": "memoryLimit" }`. `join` no longer takes `--token`: it reads `HAPPY_JOIN_TOKEN` or
+  `--token-file` (`-` for stdin), so the token never shows in `ps`.

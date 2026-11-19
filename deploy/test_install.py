@@ -230,5 +230,12 @@ class InstallTests(unittest.TestCase):
         self.assertIn(['userdel', '-r', 'happy-workload'], events)
 
 
+class ReleaseNotesTests(unittest.TestCase):
+    def test_the_release_notes_cover_this_version(self):
+        version = Path(__file__).with_name('VERSION').read_text().strip()
+        notes = Path(__file__).with_name('README.md').read_text()
+        self.assertTrue(f'\n* **{version}.** ' in notes, f'deploy/README.md has no notes for {version}')
+
+
 if __name__ == '__main__':
     unittest.main()

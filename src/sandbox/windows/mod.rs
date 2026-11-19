@@ -49,6 +49,8 @@ const GAPS: &[&str] = &[
     "unixSockets false is not enforced: AF_UNIX sockets can be created and connected in directories the policy lets the sandbox use",
     "localBind false blocks TCP listen; UDP sockets can still be bound",
     "in isolated mode the sandbox can connect to every loopback port in the proxy port range, which includes other commands' proxies",
+    "in isolated mode with localBind the sandbox can connect to every loopback port, including the host's own local services, since its own listeners cannot be told apart from them",
+    "in isolated mode names still resolve: the DNS Client service queries the network for the sandbox, so a lookup can carry data out",
     "a command that makes a sandbox network group deny-only in a restricted token of its own escapes the network filters",
     "processes started through system services (WMI, Task Scheduler) leave the Job Object",
     "the sandbox can read the supervisor binary, which it runs as",

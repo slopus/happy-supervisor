@@ -312,8 +312,9 @@ fn launch(
     drop(stdin_reader);
     // SAFETY: fresh handles from CreateProcessWithLogonW.
     let (process, thread) = unsafe { (owned(info.hProcess), owned(info.hThread)) };
+    let exec = matches!(job.op, JobOp::Exec { .. });
     let started = (|| -> io::Result<(OwnedHandle, u64)> {
-        let job = kill_on_close_job()?;
+        let job = kill_on_close_job(exec)?;
         // SAFETY: both handles are open.
         check(unsafe {
             AssignProcessToJobObject(
@@ -384,7 +385,9 @@ impl Runner {
     }
 }
 
-fn kill_on_close_job() -> io::Result<OwnedHandle> {
+/// The runner's job. For an exec it gets the limits of the exec's own job, which the broker is
+/// in and the runner cannot be (`exec.start` `limits`).
+fn kill_on_close_job(exec: bool) -> io::Result<OwnedHandle> {
     // SAFETY: null attributes and name: an anonymous job.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
@@ -392,8 +395,12 @@ fn kill_on_close_job() -> io::Result<OwnedHandle> {
     }
     // SAFETY: a fresh handle.
     let job = unsafe { owned(job) };
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let mut limits = if exec {
+        crate::process::own_job_limits()?
+    } else {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default()
+    };
+    limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     // SAFETY: `limits` is the structure the class names, of the size passed.
     check(unsafe {
         SetInformationJobObject(

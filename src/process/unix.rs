@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, Command};
 
-use crate::protocol::{ExitStatus, KillSignal};
+use crate::protocol::{ExitStatus, KillSignal, LimitSupport, Limits};
 
 /// Makes the child the leader of a new session and process group, before anything else runs
 /// in it (the sandbox helper included).
@@ -29,6 +29,40 @@ pub(crate) fn default_interrupt(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+}
+
+/// The `exec.start` limits Unix enforces: `cpuSeconds` only, as `RLIMIT_CPU`, which every process
+/// the command starts inherits and counts for itself. The tree-wide memory and process limits
+/// need cgroups (Linux) or are not available (macOS).
+pub(crate) fn limit_support() -> LimitSupport {
+    LimitSupport {
+        memory_bytes: false,
+        processes: false,
+        cpu_seconds: true,
+    }
+}
+
+/// Applies `limits` to the child before it execs: at `cpuSeconds` of CPU time a process gets
+/// `SIGXCPU`, and a second later `SIGKILL` if it survived that.
+pub(crate) fn limit(command: &mut Command, limits: &Limits) {
+    let Some(seconds) = limits.cpu_seconds else {
+        return;
+    };
+    let seconds = seconds.get() as libc::rlim_t;
+    let cpu = libc::rlimit {
+        rlim_cur: seconds,
+        rlim_max: seconds.saturating_add(1),
+    };
+    // SAFETY: the closure runs in the forked child and only calls setrlimit, which is
+    // async-signal-safe, on a value copied into it.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setrlimit(libc::RLIMIT_CPU, &cpu) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             Ok(())
         });
     }

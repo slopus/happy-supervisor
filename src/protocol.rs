@@ -6,6 +6,7 @@
 //! [`Policy`]'s.
 
 use std::collections::BTreeMap;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -672,6 +673,51 @@ pub struct ExecStartParams {
     /// A terminal of this size instead of pipes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tty: Option<TtySize>,
+    #[serde(default, skip_serializing_if = "Limits::is_none")]
+    pub limits: Limits,
+}
+
+/// `exec.start` `limits` (api.md). An absent field is no limit. A node that cannot enforce one
+/// it is given replies `sandbox_unavailable` (NodeInfo `limits`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Limits {
+    /// The memory the whole process tree may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<NonZeroU64>,
+    /// The processes the tree may hold at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<NonZeroU32>,
+    /// The CPU time each process of the tree may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_seconds: Option<NonZeroU64>,
+}
+
+impl Limits {
+    pub fn is_none(&self) -> bool {
+        *self == Limits::default()
+    }
+
+    /// The names of the limits set here that `support` does not enforce.
+    pub fn unsupported(&self, support: &LimitSupport) -> Vec<&'static str> {
+        [
+            (
+                "memoryBytes",
+                self.memory_bytes.is_some(),
+                support.memory_bytes,
+            ),
+            ("processes", self.processes.is_some(), support.processes),
+            (
+                "cpuSeconds",
+                self.cpu_seconds.is_some(),
+                support.cpu_seconds,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, set, supported)| *set && !supported)
+        .map(|(name, ..)| name)
+        .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1596,8 +1642,18 @@ pub struct NodeInfo {
     pub gpus: Vec<GpuInfo>,
     pub sandbox: SandboxInfo,
     pub identity: IdentityInfo,
+    pub limits: LimitSupport,
     pub default_env: BTreeMap<String, String>,
     pub collected_at_ms: u64,
+}
+
+/// NodeInfo's `limits`: which `exec.start` limits this node enforces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitSupport {
+    pub memory_bytes: bool,
+    pub processes: bool,
+    pub cpu_seconds: bool,
 }
 
 /// NodeInfo's `identity`: who the supervisor runs as, and who its work runs as.
@@ -1911,6 +1967,7 @@ mod tests {
             ]
           },
           "identity": { "supervisorUser": "root", "workloadUser": "happy-workload", "root": true },
+          "limits": { "memoryBytes": false, "processes": false, "cpuSeconds": true },
           "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
           "collectedAtMs": 1763496000000u64
         })
@@ -2088,6 +2145,14 @@ mod tests {
                 supervisor_user: "root".to_string(),
                 workload_user: Some("happy-workload".to_string()),
                 root: true
+            }
+        );
+        assert_eq!(
+            info.limits,
+            LimitSupport {
+                memory_bytes: false,
+                processes: false,
+                cpu_seconds: true
             }
         );
 
@@ -2519,6 +2584,38 @@ mod tests {
         assert_eq!(
             rejects::<ExecResizeParams>(json!({ "execId": "e", "rows": 0, "cols": 80 })),
             "a terminal of 0 rows and 80 columns: both must be at least 1"
+        );
+        let limited: ExecStartParams = round_trip(json!({ "execId": "l", "argv": ["/bin/sh"],
+            "cwd": "/", "env": {}, "stdin": false, "log": { "kind": "memory" },
+            "limits": { "memoryBytes": 536870912u64, "processes": 64, "cpuSeconds": 600 } }));
+        let support = |memory_bytes, processes| LimitSupport {
+            memory_bytes,
+            processes,
+            cpu_seconds: true,
+        };
+        assert_eq!(
+            limited.limits.unsupported(&support(true, true)),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            limited.limits.unsupported(&support(false, false)),
+            ["memoryBytes", "processes"]
+        );
+        let cpu_only: ExecStartParams = parse(json!({ "execId": "l", "argv": ["/bin/sh"],
+            "cwd": "/", "env": {}, "limits": { "cpuSeconds": 1 } }));
+        assert_eq!(
+            cpu_only.limits.unsupported(&support(false, false)),
+            [] as [&str; 0]
+        );
+        assert!(
+            rejects::<ExecStartParams>(json!({ "execId": "l", "argv": ["/bin/sh"],
+                "cwd": "/", "env": {}, "limits": { "processes": 0 } }))
+            .contains("expected a nonzero u32")
+        );
+        assert!(
+            rejects::<ExecStartParams>(json!({ "execId": "l", "argv": ["/bin/sh"],
+                "cwd": "/", "env": {}, "limits": { "threads": 4 } }))
+            .contains("unknown field `threads`")
         );
 
         let list: ExecListResult = round_trip(json!({ "execs": [

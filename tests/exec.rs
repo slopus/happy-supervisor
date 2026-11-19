@@ -205,6 +205,7 @@ fn info() -> NodeInfo {
         "disks": [], "gpus": [],
         "sandbox": { "mechanism": "none", "available": false, "reason": "test", "baselineRead": [] },
         "identity": { "supervisorUser": "me", "workloadUser": null, "root": false },
+        "limits": { "memoryBytes": false, "processes": false, "cpuSeconds": true },
             "defaultEnv": {}, "collectedAtMs": 0
     }))
     .unwrap()

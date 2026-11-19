@@ -9,6 +9,10 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub(crate) use unix::{Tree, default_interrupt, exit_status, isolate, wait_exit};
+pub(crate) use unix::{
+    Tree, default_interrupt, exit_status, isolate, limit, limit_support, wait_exit,
+};
 #[cfg(windows)]
-pub(crate) use windows::{Tree, exit_status, isolate, status_preamble, wait_exit};
+pub(crate) use windows::{
+    Tree, exit_status, isolate, limit_support, own_job_limits, status_preamble, wait_exit,
+};

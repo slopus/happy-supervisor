@@ -305,6 +305,9 @@ a4 0c 67 "build-1" 0d 66 "stdout" 09 50 <16 bytes> 0e 00
 | 163 | `supervisorUser` | key |
 | 164 | `workloadUser` | key |
 | 165 | `root` | key |
+| 166 | `limits` | key |
+| 167 | `processes` | key |
+| 168 | `cpuSeconds` | key |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -604,6 +607,7 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
   "timeout": { "ms": 600000, "action": { "kind": "background" } },
   "log": { "kind": "file", "path": "/home/me/repo/.logs/build-1.log", "limitBytes": 67108864 },
   "proxy": { "token": "pt_8f1c…", "hosts": ["api.github.com"] },
+  "limits": { "cpuSeconds": 3600 },
   "access": { "mode": "sandboxed", "policy": { … } }
 }
 ```
@@ -635,6 +639,22 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
 * `log` is optional and defaults to `{ "kind": "memory" }`. Every process's combined output
   (stdout and stderr, in arrival order) is recorded in its log from the start, whether or not
   it ever times out, so `exec.log` works for every process. See Output logs.
+* `limits` is optional: `{ "memoryBytes", "processes", "cpuSeconds" }`, each optional and at
+  least 1. A limit this node cannot enforce is `sandbox_unavailable` and starts nothing, so a
+  limit is never silently dropped. NodeInfo `limits` says which ones it enforces.
+  * `memoryBytes`: the memory the whole process tree may commit together. An allocation beyond
+    it fails.
+  * `processes`: how many processes the tree may have at once, the first one included. Starting
+    one more fails.
+  * `cpuSeconds`: the CPU time **each** process of the tree may use; it is not summed over the
+    tree. A process over it is ended. On Unix it gets `SIGXCPU` (24), then `SIGKILL` a second
+    later if it handles that. On Windows only user-mode time counts, and the Job Object ends the
+    process with exit code -1073741756 (`0xC0000044`, `STATUS_QUOTA_EXCEEDED`). Use `timeout`
+    for wall-clock time.
+
+  Raw and sandboxed commands both take limits. A sandboxed command's tree includes the sandbox's
+  own processes (bubblewrap and the helper on Linux), except that on Windows the broker is not
+  counted in `processes`.
 
 Result:
 

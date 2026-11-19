@@ -45,6 +45,7 @@ the rest of the collection, and each is cut off at 3 seconds.
     ]
   },
   "identity": { "supervisorUser": "root", "workloadUser": "happy-workload", "root": true },
+  "limits": { "memoryBytes": false, "processes": false, "cpuSeconds": true },
   "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
   "collectedAtMs": 1763496000000
 }
@@ -175,6 +176,17 @@ Who the supervisor runs as, and who its work runs as (policy.md, Workload user).
 
 So work runs as root exactly when `workloadUser` is null and `root` is true, which only macOS and
 Windows allow.
+
+### `limits`
+
+Which `exec.start` `limits` (api.md) this node enforces. A limit marked `false` is refused with
+`sandbox_unavailable`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `memoryBytes` | bool | Windows: a Job Object memory limit. Linux and macOS: `false`, because no rlimit bounds a process tree's memory (`RLIMIT_AS` counts address space, not memory). |
+| `processes` | bool | Windows: a Job Object active-process limit. Linux and macOS: `false`, because `RLIMIT_NPROC` counts every process of the user, not of the tree. |
+| `cpuSeconds` | bool | `true` everywhere: `RLIMIT_CPU` on Unix, a Job Object per-process time limit on Windows. |
 
 ### `defaultEnv`
 

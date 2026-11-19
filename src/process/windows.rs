@@ -10,16 +10,17 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_TIME,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, INFINITE, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
     WaitForSingleObject,
 };
 
-use crate::protocol::{ExitStatus, KillSignal};
+use crate::protocol::{ExitStatus, KillSignal, LimitSupport, Limits};
 
 /// The exit code of processes ended by `exec.kill` or a timeout.
 const KILLED_EXIT_CODE: u32 = 1;
@@ -38,9 +39,9 @@ pub(crate) struct Tree {
 }
 
 impl Tree {
-    /// Puts `child`, spawned suspended by [`isolate`], into a new Job Object, then resumes it.
-    /// On an error the child is still suspended, and the caller kills it.
-    pub(crate) fn adopt(child: &Child) -> io::Result<Tree> {
+    /// Puts `child`, spawned suspended by [`isolate`], into a new Job Object with `limits`, then
+    /// resumes it. On an error the child is still suspended, and the caller kills it.
+    pub(crate) fn adopt(child: &Child, limits: &Limits) -> io::Result<Tree> {
         // SAFETY: null attributes and name create an anonymous job with default security.
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
@@ -50,8 +51,7 @@ impl Tree {
         let tree = Tree {
             job: unsafe { OwnedHandle::from_raw_handle(job as RawHandle) },
         };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let limits = job_limits(limits);
         // SAFETY: `limits` is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION of the size passed.
         let set = unsafe {
             SetInformationJobObject(
@@ -92,6 +92,59 @@ impl Tree {
     fn handle(&self) -> HANDLE {
         self.job.as_raw_handle() as HANDLE
     }
+}
+
+/// The `exec.start` limits a Job Object enforces: all of them.
+pub(crate) fn limit_support() -> LimitSupport {
+    LimitSupport {
+        memory_bytes: true,
+        processes: true,
+        cpu_seconds: true,
+    }
+}
+
+/// `KILL_ON_JOB_CLOSE` and `limits`: the memory committed by the whole job, the processes in it
+/// at once, and each process's user-mode CPU time.
+pub(crate) fn job_limits(limits: &Limits) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if let Some(bytes) = limits.memory_bytes {
+        flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        info.JobMemoryLimit = usize::try_from(bytes.get()).unwrap_or(usize::MAX);
+    }
+    if let Some(processes) = limits.processes {
+        flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        info.BasicLimitInformation.ActiveProcessLimit = processes.get();
+    }
+    if let Some(seconds) = limits.cpu_seconds {
+        flags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
+        // In 100-nanosecond units.
+        info.BasicLimitInformation.PerProcessUserTimeLimit =
+            i64::try_from(seconds.get().saturating_mul(10_000_000)).unwrap_or(i64::MAX);
+    }
+    info.BasicLimitInformation.LimitFlags = flags;
+    info
+}
+
+/// The limits of the Job Object this process is in: the Windows sandbox's broker copies its exec's
+/// limits to the job of the runner, which it cannot start inside its own.
+pub(crate) fn own_job_limits() -> io::Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: a null job is the caller's; `info` is the structure the class names, of the size
+    // passed.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
 }
 
 /// Resumes the threads of process `pid`. A process created suspended has exactly one, its

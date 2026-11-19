@@ -24,9 +24,9 @@ use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::process::{self, Tree};
 use crate::protocol::{
     AbsPath, Argv, Bytes, ExecId, ExecLogParams, ExecLogResult, ExecResizeParams, ExecStartParams,
-    ExecStartResult, ExecState, ExecSummary, ExecWriteParams, ExitStatus, KillSignal, LogSpec,
-    MAX_EXEC_LOG_READ_BYTES, MAX_EXEC_WRITE_BYTES, MAX_OUTPUT_CHUNK_BYTES, MEMORY_LOG_BUDGET_BYTES,
-    RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction, TtySize,
+    ExecStartResult, ExecState, ExecSummary, ExecWriteParams, ExitStatus, KillSignal, Limits,
+    LogSpec, MAX_EXEC_LOG_READ_BYTES, MAX_EXEC_WRITE_BYTES, MAX_OUTPUT_CHUNK_BYTES,
+    MEMORY_LOG_BUDGET_BYTES, RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction, TtySize,
 };
 use crate::proxy::egress::CommandProxy;
 use crate::sandbox::{NetPlan, NetnsControl, Placeholders};
@@ -498,7 +498,16 @@ impl Inner {
             log,
             proxy: _,
             tty,
+            limits,
         } = params;
+        let unsupported = limits.unsupported(&process::limit_support());
+        if !unsupported.is_empty() {
+            let names: Vec<String> = unsupported.iter().map(|n| format!("limits.{n}")).collect();
+            return Err(Error::sandbox_unavailable(format!(
+                "this node cannot enforce {} (NodeInfo limits)",
+                names.join(" or ")
+            )));
+        }
         let io = match tty {
             Some(size) => Io::Tty(size),
             None => Io::Pipes { stdin },
@@ -530,7 +539,7 @@ impl Inner {
             tunnel,
         ) = match confinement {
             Confinement::Raw => (
-                spawn_raw(&program, &argv, &cwd, &env, io, workload)?,
+                spawn_raw(&program, &argv, &cwd, &env, io, workload, &limits)?,
                 None,
                 Some(TunnelRoute::Loopback),
             ),
@@ -544,9 +553,13 @@ impl Inner {
                 };
                 let mut resolved = vec![program.to_string_lossy().into_owned()];
                 resolved.extend(argv.args().iter().cloned());
-                let argv = Argv::try_from(resolved)?;
+                let op = crate::helper::JobOp::Exec {
+                    argv: Argv::try_from(resolved)?,
+                    cwd: cwd.clone(),
+                    env,
+                };
                 let (spawned, (placeholders, netns)) =
-                    spawn_sandboxed(policy, net, argv, &cwd, env, io, workload)?;
+                    spawn_sandboxed(policy, net, op, io, workload, &limits)?;
                 let tunnel = policy.network().local_bind().then(|| match netns {
                     Some(netns) => TunnelRoute::Netns(Arc::new(netns)),
                     None => TunnelRoute::Loopback,
@@ -910,6 +923,7 @@ fn spawn_raw(
     env: &BTreeMap<String, String>,
     io: Io,
     workload: Option<&Workload>,
+    limits: &Limits,
 ) -> Result<Spawned> {
     if !cwd.as_path().is_dir() {
         return Err(Error::not_found(format!(
@@ -938,6 +952,8 @@ fn spawn_raw(
     #[cfg(unix)]
     process::default_interrupt(&mut command);
     #[cfg(unix)]
+    process::limit(&mut command, limits);
+    #[cfg(unix)]
     let pty = io.terminal().map(process::pty::Pty::open).transpose()?;
     #[cfg(unix)]
     if let Some(pty) = &pty {
@@ -953,7 +969,7 @@ fn spawn_raw(
         Error::new(Error::from(err).kind, message)
     })?;
     drop(command);
-    let spawned = adopt(child)?;
+    let spawned = adopt(child, limits)?;
     #[cfg(unix)]
     return Ok(Spawned {
         terminal: pty.map(|pty| pty.master),
@@ -963,8 +979,16 @@ fn spawn_raw(
     Ok(spawned)
 }
 
-fn adopt(mut child: Child) -> Result<Spawned> {
-    match Tree::adopt(&child) {
+/// Unix applied `limits` before exec ([`process::limit`]); a Windows Job Object takes them here.
+fn adopt(mut child: Child, limits: &Limits) -> Result<Spawned> {
+    #[cfg(unix)]
+    let tree = {
+        let _ = limits;
+        Tree::adopt(&child)
+    };
+    #[cfg(windows)]
+    let tree = Tree::adopt(&child, limits);
+    match tree {
         Ok(tree) => Ok(Spawned {
             child,
             tree,
@@ -978,26 +1002,19 @@ fn adopt(mut child: Child) -> Result<Spawned> {
     }
 }
 
-/// Runs the sandbox helper with the job on its stdin, and waits on the status pipe until the
-/// helper has exec'd the command or reported why it could not.
+/// Runs the sandbox helper with the job, an exec `op`, on its stdin, and waits on the status
+/// pipe until the helper has exec'd the command or reported why it could not.
 fn spawn_sandboxed(
     policy: &ResolvedPolicy,
     net: Option<NetPlan>,
-    argv: Argv,
-    cwd: &AbsPath,
-    env: BTreeMap<String, String>,
+    op: crate::helper::JobOp,
     io: Io,
     workload: Option<&Workload>,
+    limits: &Limits,
 ) -> Result<(Spawned, Held)> {
-    use crate::helper::{Job, JobOp};
-
-    let job = Job {
+    let job = crate::helper::Job {
         policy: policy.clone(),
-        op: JobOp::Exec {
-            argv,
-            cwd: cwd.clone(),
-            env,
-        },
+        op,
     };
     let exe = crate::helper::exe()?;
     let plan = crate::sandbox::Plan {
@@ -1007,18 +1024,21 @@ fn spawn_sandboxed(
     };
     let prepared = crate::sandbox::prepare(&plan, &job)?;
     let frame = crate::helper::encode_job(&job);
-    let spawned = spawn_helper(prepared.command, &frame, io, workload)?;
+    let spawned = spawn_helper(prepared.command, &frame, io, workload, limits)?;
     Ok((spawned, (prepared.placeholders, prepared.netns)))
 }
 
 /// With `tty`, the terminal is the helper's stdout and stderr and its controlling terminal; the
 /// helper makes it the command's stdin too, once it has read the job.
+/// `limits` apply to the helper too: with bubblewrap, to bubblewrap and the helper's own
+/// processes in the sandbox.
 #[cfg(unix)]
 fn spawn_helper(
     mut command: Command,
     frame: &[u8],
     io: Io,
     workload: Option<&Workload>,
+    limits: &Limits,
 ) -> Result<Spawned> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -1042,11 +1062,12 @@ fn spawn_helper(
         pty.give_to(workload)?;
     }
     crate::identity::run_as(&mut command, workload, None)?;
+    process::limit(&mut command, limits);
     let child = command.spawn();
     drop((status_writer, command));
     let Spawned {
         mut child, tree, ..
-    } = adopt(child?)?;
+    } = adopt(child?, limits)?;
 
     let mut pipe = child.stdin.take().expect("stdin is piped");
     // A helper that dies early closes its stdin; the status pipe then says why.
@@ -1071,12 +1092,15 @@ fn spawn_helper(
 
 /// Windows passes the status pipe's write end by duplicating it into the suspended helper and
 /// telling it the handle in a preamble on stdin (`helper::STATUS_MAGIC`).
+/// The broker is in the job with `limits`, one more process allowed for itself, and copies them to
+/// the job of the runner, which it starts outside its own (sandbox/windows/broker.rs).
 #[cfg(windows)]
 fn spawn_helper(
     mut command: Command,
     frame: &[u8],
     io: Io,
     workload: Option<&Workload>,
+    limits: &Limits,
 ) -> Result<Spawned> {
     if let Some(workload) = workload {
         match *workload {}
@@ -1096,9 +1120,13 @@ fn spawn_helper(
             return Err(err.into());
         }
     };
+    let outer = Limits {
+        processes: limits.processes.map(|n| n.saturating_add(1)),
+        ..*limits
+    };
     let Spawned {
         mut child, tree, ..
-    } = adopt(child)?;
+    } = adopt(child, &outer)?;
 
     let mut pipe = child.stdin.take().expect("stdin is piped");
     // A helper that dies early closes its stdin; the status pipe then says why.
@@ -1227,15 +1255,27 @@ mod tests {
         std::fs::write(&status, crate::wire::to_cbor(&reported)).unwrap();
         let mut fails = Command::new("/bin/sh");
         fails.args(["-c", r#"cat "$0" >&3; exit 127"#]).arg(&status);
-        let err = spawn_helper(fails, b"frame", Io::Pipes { stdin: false }, None)
-            .err()
-            .unwrap();
+        let err = spawn_helper(
+            fails,
+            b"frame",
+            Io::Pipes { stdin: false },
+            None,
+            &Limits::default(),
+        )
+        .err()
+        .unwrap();
         assert_eq!(err, Error::not_found("no such program"));
 
         let mut execs = Command::new("/bin/sh");
         execs.args(["-c", "exec 3>&-; dd bs=5 count=1 >/dev/null 2>&1; exec cat"]);
-        let Spawned { mut child, .. } =
-            spawn_helper(execs, b"frame", Io::Pipes { stdin: true }, None).unwrap();
+        let Spawned { mut child, .. } = spawn_helper(
+            execs,
+            b"frame",
+            Io::Pipes { stdin: true },
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
         child
             .stdin
             .take()

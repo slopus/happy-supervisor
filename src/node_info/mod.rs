@@ -76,6 +76,7 @@ pub fn collect(
         gpus: gpus.join().unwrap_or_default(),
         sandbox: sandbox.clone(),
         identity: identity.info(),
+        limits: crate::process::limit_support(),
         default_env: default_env(identity),
         collected_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)

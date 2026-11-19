@@ -167,11 +167,16 @@ fn curl(args: &[&str]) -> Vec<String> {
     argv
 }
 
-/// Git for Windows' curl, built with OpenSSL.
-fn git_curl(args: &[&str]) -> Vec<String> {
-    let mut argv = curl(args);
-    argv[0] = r"C:\Program Files\Git\mingw64\bin\curl.exe".to_string();
-    argv
+/// Git for Windows, whose HTTPS is OpenSSL's when asked.
+fn git_ls_remote(url: &str, reference: &str) -> Vec<String> {
+    vec![
+        r"C:\Program Files\Git\cmd\git.exe".to_string(),
+        "-c".to_string(),
+        "http.sslBackend=openssl".to_string(),
+        "ls-remote".to_string(),
+        url.to_string(),
+        reference.to_string(),
+    ]
 }
 
 fn powershell(script: &str) -> Vec<String> {
@@ -497,8 +502,11 @@ fn policy_combinations_and_their_outcomes() {
         (
             "host: TLS through OpenSSL, write-restricted",
             none(),
-            git_curl(&["-o", "NUL", "-w", "%{http_code}", "https://example.com"]),
-            ok("200"),
+            git_ls_remote(
+                "https://github.com/octocat/Hello-World",
+                "refs/heads/master",
+            ),
+            ok("7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\trefs/heads/master\n"),
         ),
         (
             "isolated: the internet, directly",
@@ -563,6 +571,40 @@ fn policy_combinations_and_their_outcomes() {
         std::fs::read_dir(t("out/locked")).unwrap().count(),
         1,
         "only keep.txt"
+    );
+}
+
+/// Every ACE is inherited by the whole tree below its path, which Windows writes file by file
+/// when the ACE is added and again when it is revoked.
+#[test]
+fn a_grant_reaches_the_bottom_of_a_large_tree() {
+    let tree = Tree::new();
+    let big = tree.path("big");
+    for dir in 0..20 {
+        let dir = big.join(format!("d{dir}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..100 {
+            std::fs::write(dir.join(format!("f{file}")), "x").unwrap();
+        }
+    }
+    let deep = big.join(r"d7\a\b\c");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("leaf.txt"), "leaf\n").unwrap();
+    let started = Instant::now();
+    let (outcome, output) = run(
+        &grants(&[], &[&big]),
+        &tree.path("state"),
+        None,
+        &cmd(format!(
+            r"type {0}\leaf.txt&& echo more>{0}\new.txt",
+            deep.display()
+        )),
+    );
+    eprintln!("2001 files: {:?}", started.elapsed());
+    assert_eq!(outcome, ok("leaf\n"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(deep.join("new.txt")).unwrap(),
+        "more\r\n"
     );
 }
 

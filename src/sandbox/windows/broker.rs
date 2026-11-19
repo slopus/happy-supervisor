@@ -4,9 +4,12 @@ use std::fs::File;
 use std::io::{self, Read, Write as _};
 use std::os::windows::io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows_sys::Win32::Foundation::{
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -270,28 +273,42 @@ fn launch(
         .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
         .join("System32");
     let mut info = PROCESS_INFORMATION::default();
-    // SAFETY: every string is NUL-terminated and lives across the call; the std handles are
-    // open in this process, and the call copies them into the runner.
-    check(unsafe {
-        CreateProcessWithLogonW(
-            wide(account).as_ptr(),
-            wide(".").as_ptr(),
-            wide(password).as_ptr(),
-            0,
-            wide(&exe).as_ptr(),
-            command_line.as_mut_ptr(),
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            std::ptr::null(),
-            wide(&system).as_ptr(),
-            &startup,
-            &mut info,
-        )
-    })
-    .map_err(|err| {
-        Error::sandbox_unavailable(format!(
-            "cannot start the sandbox runner as {account}: {err}"
-        ))
-    })?;
+    // The secondary logon service sometimes refuses a call while it serves another
+    // (ERROR_SERVICE_ALREADY_RUNNING, seen with concurrent brokers); those take milliseconds.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // SAFETY: every string is NUL-terminated and lives across the call; the std handles
+        // are open in this process, and the call copies them into the runner.
+        let started = check(unsafe {
+            CreateProcessWithLogonW(
+                wide(account).as_ptr(),
+                wide(".").as_ptr(),
+                wide(password).as_ptr(),
+                0,
+                wide(&exe).as_ptr(),
+                command_line.as_mut_ptr(),
+                CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                std::ptr::null(),
+                wide(&system).as_ptr(),
+                &startup,
+                &mut info,
+            )
+        });
+        match started {
+            Ok(()) => break,
+            Err(err)
+                if err.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                return Err(Error::sandbox_unavailable(format!(
+                    "cannot start the sandbox runner as {account}: {err}"
+                )));
+            }
+        }
+    }
     drop(stdin_reader);
     // SAFETY: fresh handles from CreateProcessWithLogonW.
     let (process, thread) = unsafe { (owned(info.hProcess), owned(info.hThread)) };

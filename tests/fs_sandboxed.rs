@@ -58,6 +58,8 @@ fn abs(path: &Path) -> AbsPath {
 
 /// Linux and macOS always enforce sandboxes, so a missing one fails the test.
 fn require_sandbox() {
+    // The probe runs the helper too; without this it runs the test harness instead.
+    helper::set_exe(env!("CARGO_BIN_EXE_happy-supervisor").into());
     if let Err(err) = sandbox::probe().require_available() {
         panic!("this node cannot run sandboxed requests: {err}");
     }

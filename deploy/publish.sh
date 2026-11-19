@@ -3,8 +3,10 @@
 # https://get.happy.engineering/ (deploy/README.md, Hosting). It is the publish step of the Cloud
 # Build trigger happy-supervisor-publish, run as service account happy-supervisor-publish, and
 # runs none of the repository's code: it reads the release release.yml staged, checks
-# SHA256SUMS, signs it with minisign, uploads releases/<version>/ (never over an existing one),
-# checks what is served, and only with --latest moves the installers and releases/latest.
+# SHA256SUMS, signs it with minisign, uploads releases/<version>/ with its installers (never over
+# an existing one), checks what is served, and only with --latest moves the installers and
+# releases/latest. The publish trigger runs it without --latest; happy-supervisor-promote moves
+# them later, from releases/<version>/.
 #
 #   deploy/publish.sh <dir holding happy-supervisor-*, SHA256SUMS, VERSION, installers> [--latest]
 #
@@ -40,12 +42,10 @@ for f in "${files[@]}" SHA256SUMS; do [[ -f $f && ! -L $f && -s $f ]] || { echo 
 sha256sum --strict -c SHA256SUMS >&2
 installers=(install.sh)
 [[ " ${files[*]} " == *" happy-supervisor-windows-x86_64.exe "* ]] && installers+=(install.ps1)
-if [[ -n $latest ]]; then
-	for f in "${installers[@]}"; do
-		[[ -f $f && ! -L $f && -s $f ]] || { echo "--latest needs $f" >&2; exit 1; }
-		grep -qF "$MINISIGN_PUBLIC_KEY" "$f" || { echo "$f must embed the release public key" >&2; exit 1; }
-	done
-fi
+for f in "${installers[@]}"; do
+	[[ -f $f && ! -L $f && -s $f ]] || { echo "missing $f" >&2; exit 1; }
+	grep -qF "$MINISIGN_PUBLIC_KEY" "$f" || { echo "$f must embed the release public key" >&2; exit 1; }
+done
 
 status=$(curl -s -o /dev/null -w '%{http_code}' "$base/releases/$version/SHA256SUMS")
 [[ $status == 404 ]] || { echo "releases/$version exists (HTTP $status); versions are immutable" >&2; exit 1; }
@@ -64,8 +64,10 @@ put() { # <local file> <object> <content type> <cache>; a new object only, unles
 	echo "uploaded $2" >&2
 }
 immutable="public, max-age=31536000, immutable"
-# Binaries first, the signed list last: a half-done upload is never a valid release.
+# Binaries and the release's installers first, the signed list last: a half-done upload is never a
+# valid release. Promoting the release later copies its installers from here.
 for f in "${files[@]}"; do put "$f" "releases/$version/$f" application/octet-stream "$immutable" new; done
+for f in "${installers[@]}"; do put "$f" "releases/$version/$f" "text/plain; charset=utf-8" "$immutable" new; done
 put SHA256SUMS.minisig "releases/$version/SHA256SUMS.minisig" text/plain "$immutable" new
 put SHA256SUMS "releases/$version/SHA256SUMS" "text/plain; charset=utf-8" "$immutable" new
 
@@ -76,6 +78,10 @@ for f in "${files[@]}" SHA256SUMS SHA256SUMS.minisig; do
 done
 (cd "$work/served" && minisign -V -q -P "$MINISIGN_PUBLIC_KEY" -m SHA256SUMS -x SHA256SUMS.minisig &&
 	sha256sum --strict -c SHA256SUMS >&2)
+for f in "${installers[@]}"; do
+	curl -fsS -o "$work/served/$f" "$base/releases/$version/$f"
+	cmp "$f" "$work/served/$f"
+done
 
 if [[ -n $latest ]]; then
 	for f in "${installers[@]}"; do put "$f" "$f" "text/plain; charset=utf-8" "public, max-age=60" replace; done

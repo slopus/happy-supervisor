@@ -2,6 +2,7 @@
 //! watch for changes on this machine. The contract is in `docs/`.
 
 pub mod client;
+pub mod connect;
 pub mod controller;
 pub mod dispatch;
 pub mod enroll;

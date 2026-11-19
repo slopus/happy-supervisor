@@ -652,6 +652,53 @@ fn isolated_reaches_the_proxies_through_the_bridge() {
     );
 }
 
+/// A SOCKS5 proxy on a Unix socket that accepts any CONNECT and answers with the target it got.
+fn stub_socks(path: &Path) {
+    let listener = UnixListener::bind(path).unwrap();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let mut client = client.unwrap();
+            let mut head = [0u8; 3];
+            client.read_exact(&mut head).unwrap();
+            client.write_all(&[5, 0]).unwrap();
+            let mut request = [0u8; 5];
+            client.read_exact(&mut request).unwrap();
+            let mut name = vec![0u8; request[4] as usize + 2];
+            client.read_exact(&mut name).unwrap();
+            let port = u16::from_be_bytes([name[name.len() - 2], name[name.len() - 1]]);
+            let host = String::from_utf8_lossy(&name[..name.len() - 2]).into_owned();
+            client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+            let _ = write!(client, "connected to {host}:{port}");
+        }
+    });
+}
+
+#[test]
+fn connect_runs_inside_an_isolated_sandbox_through_the_bridge() {
+    // Unix socket paths are short (108 bytes), so this tree lives in /tmp.
+    let tree = Tree::in_dir(Path::new("/tmp"));
+    let net_dir = tree.dir("state/net/1");
+    let (http, socks) = (net_dir.join("http.sock"), net_dir.join("socks.sock"));
+    stub_socks(&socks);
+    let _http = UnixListener::bind(&http).unwrap();
+    let p = tree.resolve(read_all(&tree), write_none(&tree), isolated(false, false));
+    let net = NetPlan {
+        http: Endpoint::Unix(http),
+        socks: Endpoint::Unix(socks),
+    };
+    let run = run(
+        &p,
+        Some(net),
+        &[EXE, "__connect", "github.com", "22"],
+        &[("ALL_PROXY", "socks5h://127.0.0.1:1080")],
+    );
+    assert_eq!(
+        (run.code, run.stdout.as_str()),
+        (Some(0), "connected to github.com:22"),
+        "{run:?}"
+    );
+}
+
 #[test]
 fn tcp_open_reaches_a_listener_inside_the_namespace() {
     let tree = Tree::new();

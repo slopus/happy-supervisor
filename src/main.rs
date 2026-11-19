@@ -8,6 +8,8 @@ use happy_supervisor::{Error, ErrorKind, enroll, helper, node_info, sandbox, ser
 
 /// The argument that makes this binary the sandbox helper.
 const HELPER_ARG: &str = "__sandbox";
+/// The argument that makes this binary an isolated command's SSH `ProxyCommand` (proxy.md).
+const CONNECT_ARG: &str = "__connect";
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +68,12 @@ fn main() -> ExitCode {
         .is_some_and(|arg| arg == HELPER_ARG)
     {
         helper::main();
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == CONNECT_ARG)
+    {
+        return happy_supervisor::connect::main(std::env::args().skip(2));
     }
     let cli = Cli::parse();
     tracing_subscriber::fmt()

@@ -65,13 +65,13 @@ impl Controller {
         R: DeserializeOwned,
     {
         self.link.opened(OPEN_TIMEOUT).await?;
-        self.link.command(kind, params).await
+        Ok(self.link.command(kind, params).await?)
     }
 
     /// [`Controller::command`] with an untyped body and result.
     pub async fn call(&self, kind: &str, body: Value) -> Result<Value> {
         self.link.opened(OPEN_TIMEOUT).await?;
-        self.link.call(kind, body).await
+        Ok(self.link.call(kind, body).await?)
     }
 
     /// Every event the node sends from now on: `exec.output`, `exec.exit`, `watch.event`,

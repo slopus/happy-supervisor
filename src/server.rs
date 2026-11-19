@@ -70,7 +70,7 @@ enum Control {
     Command {
         kind: String,
         body: Value,
-        reply: oneshot::Sender<Result<Value>>,
+        reply: oneshot::Sender<CallResult<Value>>,
     },
     Proxy(ProxyMessage),
     Tcp(TcpMessage),
@@ -110,24 +110,20 @@ impl ControlPlaneLink {
         let _ = self.control.send(Control::Attach(Box::new(socket)));
     }
 
-    /// Sends a command and waits for its reply, as `R`. An `error` reply is the `Err`, and so
-    /// is having no open session, or losing it before the reply.
-    pub async fn command<P, R>(&self, kind: &str, params: P) -> Result<R>
+    /// Sends a command and waits for its reply, as `R`. [`CallError`] says whether the node
+    /// answered with an error or the command may not have run.
+    pub async fn command<P, R>(&self, kind: &str, params: P) -> CallResult<R>
     where
         P: Serialize,
         R: DeserializeOwned,
     {
         let reply = self.call(kind, crate::wire::to_value(&params)).await?;
-        crate::wire::from_value(reply).map_err(|err| {
-            Error::new(
-                ErrorKind::Io,
-                format!("the {kind} reply did not parse: {err}"),
-            )
-        })
+        crate::wire::from_value(reply)
+            .map_err(|err| CallError::BadReply(format!("the {kind} reply did not parse: {err}")))
     }
 
     /// [`ControlPlaneLink::command`] with an untyped body and result.
-    pub async fn call(&self, kind: &str, body: Value) -> Result<Value> {
+    pub async fn call(&self, kind: &str, body: Value) -> CallResult<Value> {
         let (reply, replied) = oneshot::channel();
         self.control
             .send(Control::Command {
@@ -135,8 +131,8 @@ impl ControlPlaneLink {
                 body,
                 reply,
             })
-            .map_err(|_| gone())?;
-        replied.await.map_err(|_| gone())?
+            .map_err(|_| CallError::Closed)?;
+        replied.await.map_err(|_| CallError::Closed)?
     }
 
     /// Every event from now on.
@@ -188,6 +184,47 @@ impl Drop for ControlPlaneLink {
     }
 }
 
+pub type CallResult<T> = std::result::Result<T, CallError>;
+
+/// Why a command has no result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallError {
+    /// The node ran it and replied with this error.
+    Node(Error),
+    /// No session was open. The command was not sent.
+    NoSession,
+    /// The session was lost before the reply. The command may or may not have run.
+    Lost,
+    /// The link was closed or dropped. The command may or may not have run.
+    Closed,
+    /// The node replied, but not with the type asked for.
+    BadReply(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Node(err) => write!(f, "{err}"),
+            CallError::NoSession => f.write_str("no session is open"),
+            CallError::Lost => f.write_str("the session was lost before the reply"),
+            CallError::Closed => f.write_str("the link to the node is gone"),
+            CallError::BadReply(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for CallError {}
+
+/// The node's error as it is; the link's own failures as `io`.
+impl From<CallError> for Error {
+    fn from(err: CallError) -> Error {
+        match err {
+            CallError::Node(err) => err,
+            other => Error::new(ErrorKind::Io, other.to_string()),
+        }
+    }
+}
+
 fn gone() -> Error {
     Error::new(ErrorKind::Io, "the link to the node is gone")
 }
@@ -202,7 +239,7 @@ struct Actor {
     outbox: Outbox,
     clock: Arc<dyn Clock>,
     socket: Option<Connection>,
-    pending: HashMap<MsgId, oneshot::Sender<Result<Value>>>,
+    pending: HashMap<MsgId, oneshot::Sender<CallResult<Value>>>,
     subscribers: Subscribers,
     opened: watch::Sender<Option<SessionId>>,
 }
@@ -332,7 +369,7 @@ impl Actor {
             }
             Control::Command { kind, body, reply } => {
                 if self.session.session().is_none() {
-                    let _ = reply.send(Err(Error::new(ErrorKind::Io, "no session is open")));
+                    let _ = reply.send(Err(CallError::NoSession));
                     return;
                 }
                 let id = self.outbox.command(&kind, &body);
@@ -373,16 +410,13 @@ impl Actor {
             },
             Incoming::Reply { to, result } => {
                 if let Some(waiting) = self.pending.remove(&to) {
-                    let _ = waiting.send(result);
+                    let _ = waiting.send(result.map_err(CallError::Node));
                 }
             }
             Incoming::Lost { session, reason } => {
                 tracing::info!(%session, "the session was lost: {reason:?}");
                 for (_, waiting) in self.pending.drain() {
-                    let _ = waiting.send(Err(Error::new(
-                        ErrorKind::Io,
-                        "the session was lost before the reply",
-                    )));
+                    let _ = waiting.send(Err(CallError::Lost));
                 }
                 self.opened.send_replace(None);
                 self.publish(LinkEvent::Lost { session, reason });

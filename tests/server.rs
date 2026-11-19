@@ -6,8 +6,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use happy_supervisor::protocol::{ByeReason, NodeInfo};
-use happy_supervisor::server::{ControlPlaneLink, LinkEvent, LinkEvents, RESUME_WINDOW_MS};
+use happy_supervisor::server::{
+    CallError, ControlPlaneLink, LinkEvent, LinkEvents, RESUME_WINDOW_MS,
+};
 use happy_supervisor::state::{Credentials, StateDir};
+use happy_supervisor::{Error, ErrorKind};
 use http::{Request, Response, StatusCode, header};
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -120,7 +123,13 @@ async fn a_control_plane_accepts_a_node_and_revokes_it() {
         .call("node.nope", happy_supervisor::protocol::Value::Null)
         .await
         .unwrap_err();
-    assert_eq!(unknown.message, "unknown message kind `node.nope`");
+    assert_eq!(
+        unknown,
+        CallError::Node(Error::new(
+            ErrorKind::UnknownKind,
+            "unknown message kind `node.nope`"
+        ))
+    );
 
     link.bye(ByeReason::Revoked, Some("revoked by the test".to_string()));
     let status = tokio::time::timeout(WAIT, node.wait())
@@ -135,4 +144,9 @@ async fn a_control_plane_accepts_a_node_and_revokes_it() {
         }
     }
     assert_eq!(link.session(), None);
+    assert_eq!(
+        link.call("node.info", happy_supervisor::protocol::Value::Null)
+            .await,
+        Err(CallError::NoSession)
+    );
 }

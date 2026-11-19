@@ -968,8 +968,9 @@ feature is the supervisor. Two pieces connect the link to a server:
 * `server::ControlPlaneLink::new(resume_window_ms)` is one node's link, as the control plane. Give
   it each socket the node connects with (`attach`, which drops the previous one). It pings, drops
   silent connections, acknowledges, resends and resumes. Use it with:
-  * `command(kind, params)` / `call(kind, body)`: a command and its reply. With no open session,
-    or when the session is lost before the reply, the result is an `io` error.
+  * `command(kind, params)` / `call(kind, body)`: a command and its reply. `CallError` tells
+    the node's error reply (`Node`) from the link's: `NoSession` (not sent), `Lost` (the session
+    was lost before the reply, so it may or may not have run), `Closed`, and `BadReply`.
   * `events()`: `Opened { session, resumed, hello }`, every node event as `Event`, `Lost`, and
     `Disconnected { replaced }`, in order.
   * `send_proxy`, `send_tcp`: the control plane's side of proxy streams and tunnels.

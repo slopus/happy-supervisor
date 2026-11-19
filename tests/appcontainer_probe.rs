@@ -425,6 +425,60 @@ fn appcontainer_probe() {
     drop(users_block.stdin.take());
     let _ = users_block.wait();
 
+    for (rule, cases) in [
+        (
+            "block-member:S-1-5-32-545:80",
+            &[
+                ("nothing dropped", "none"),
+                ("Users deny-only", "Users"),
+                ("Everyone deny-only", "Everyone"),
+                ("Users and Everyone deny-only", "Users,Everyone"),
+                (
+                    "user, Users, Everyone, Administrators deny-only",
+                    "user,Users,Everyone,Administrators",
+                ),
+            ][..],
+        ),
+        (
+            "block-member:S-1-5-32-546:80",
+            &[("Guests rule, nothing dropped", "none")][..],
+        ),
+    ] {
+        let mut held = Command::new(winbox())
+            .args(["wfp-hold", rule])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0u8; 5];
+        let got = held.stdout.as_mut().unwrap().read_exact(&mut ready);
+        eprintln!("wfp-hold {rule}: {got:?}");
+        for (label, disable) in cases {
+            let output = Command::new(winbox())
+                .args([
+                    "escape",
+                    disable,
+                    &curl,
+                    "-sS",
+                    "--max-time",
+                    "10",
+                    "-o",
+                    "NUL",
+                    "-w",
+                    "%{http_code}",
+                    "http://example.com",
+                ])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            eprintln!("PROBE admin, {rule}, {label}: {}", show(output));
+        }
+        drop(held.stdin.take());
+        let output = held.wait_with_output().unwrap();
+        eprintln!("wfp-hold {rule} ended: {}", show(output));
+    }
+
     let in_range = (47800..=47999)
         .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())
         .unwrap();

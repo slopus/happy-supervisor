@@ -1052,10 +1052,32 @@ fn token_escapes() {
     let base = || grants(&[&examples], &[]);
     let row = |label: &str, grants: Grants, argv: Vec<String>| {
         let net = matches!(grants.net, Net::Isolated).then(|| net_plan.clone());
-        let (outcome, output) = run(&grants, &state, net, &argv);
+        let mut started = start(&grants, &state, net, &argv);
+        let pid = started.child.id();
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if finished.recv_timeout(Duration::from_secs(40)).is_err() {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .output();
+                return true;
+            }
+            false
+        });
+        let mut status = Vec::new();
+        let _ = started.status.read_to_end(&mut status);
+        let output = started.child.wait_with_output().unwrap();
+        let _ = done.send(());
+        let killed = watchdog.join().unwrap();
         eprintln!(
-            "ROW {label}: {outcome:?}\n    {}",
-            output.replace('\n', "\n    ")
+            "ROW {label}: exit {:?}{}\n    status: {:?}\n    stdout: {}\n    stderr: {}",
+            output.status.code(),
+            if killed { " (killed after 40 s)" } else { "" },
+            helper::parse_exec_status(&status).map_err(|err| err.to_string()),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .replace('\n', "\n      ")
         );
     };
 
@@ -1095,6 +1117,26 @@ fn token_escapes() {
     );
     let users: Vec<String> = users.trim().split(',').map(str::to_string).collect();
     eprintln!("slot users: {users:?}");
+
+    let isolated = admin_powershell(
+        "([Security.Principal.NTAccount]'happy-sbx-isolated').Translate([Security.Principal.SecurityIdentifier]).Value",
+    );
+    let held = hold_wfp(&[format!("block-member:{}:80", isolated.trim())]);
+    for (label, disable) in [
+        ("nothing dropped", "none"),
+        ("happy-sbx-isolated deny-only", "happy-sbx-isolated"),
+        (
+            "happy-sbx-isolated, Everyone, user deny-only",
+            "happy-sbx-isolated,Everyone,user",
+        ),
+    ] {
+        row(
+            &format!("deny-ACE keying on happy-sbx-isolated, port 80, {label}"),
+            base(),
+            escape(disable, http()),
+        );
+    }
+    release(held);
 
     let held = hold_wfp(
         &users

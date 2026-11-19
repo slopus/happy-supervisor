@@ -9,6 +9,7 @@
 //! winbox logon USER PASSWORD PROGRAM [ARGS...]   (with the user's profile loaded)
 //! winbox wfp-hold RULE...        (until stdin closes; prints "ready")
 //!   block-package:SID  permit-package-loopback:SID:LO:HI  block-user:SID:PORT
+//!   block-member:SID:PORT
 //! ```
 //!
 //! CAP is internetClient, internetClientServer or privateNetwork. The exit code is the
@@ -344,7 +345,7 @@ mod win {
         }
         made.map_err(|err| io::Error::other(format!("CreateRestrictedToken: {err}")))?;
         let disabled: Vec<String> = sids.iter().map(Sid::text).collect();
-        eprintln!("winbox: deny-only {disabled:?}");
+        eprintln!("winbox: deny-only {disabled:?}; starting {argv:?}");
         let mut line = command_line(argv);
         let startup = startup();
         let mut info = PROCESS_INFORMATION::default();
@@ -365,6 +366,7 @@ mod win {
             )
         })
         .map_err(|err| io::Error::other(format!("CreateProcessAsUserW: {err}")))?;
+        eprintln!("winbox: started pid {}", info.dwProcessId);
         wait(info)
     }
 
@@ -616,8 +618,15 @@ mod win {
                         &mut conds,
                     )?;
                 }
-                ["block-user", sid, port] => {
-                    let sddl = wide(&format!("O:LSD:(A;;CC;;;{sid})"));
+                ["block-user" | "block-member", sid, port] => {
+                    // block-member: a token holding SID in any state fails the access check
+                    // (a deny ACE matches deny-only SIDs too), so NOT_EQUAL matches it.
+                    let member = parts[0] == "block-member";
+                    let sddl = wide(&if member {
+                        format!("O:LSD:(D;;CC;;;{sid})(A;;CC;;;WD)")
+                    } else {
+                        format!("O:LSD:(A;;CC;;;{sid})")
+                    });
                     let mut sd: PSECURITY_DESCRIPTOR = null_mut();
                     let mut size = 0u32;
                     // SAFETY: a NUL-terminated string in, a LocalAlloc'd descriptor out.
@@ -637,7 +646,11 @@ mod win {
                     let mut conds = [
                         FWPM_FILTER_CONDITION0 {
                             fieldKey: FWPM_CONDITION_ALE_USER_ID,
-                            matchType: FWP_MATCH_EQUAL,
+                            matchType: if member {
+                                FWP_MATCH_NOT_EQUAL
+                            } else {
+                                FWP_MATCH_EQUAL
+                            },
                             conditionValue: FWP_CONDITION_VALUE0 {
                                 r#type: FWP_SECURITY_DESCRIPTOR_TYPE,
                                 Anonymous: FWP_CONDITION_VALUE0_0 { sd: &mut blob },

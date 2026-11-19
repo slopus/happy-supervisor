@@ -95,7 +95,8 @@ Held in happy-terraform:
   `MINISIGN_PUBLIC_KEY=RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr` and
   `MINISIGN_SECRET_KEY_B64` from the secret.
 * Trigger `happy-supervisor-promote`, run by hand with the version, approval required: checks the
-  served release against the release key and moves the installers and `releases/latest` to it.
+  served release against the release key, then copies its installers from
+  `releases/<version>/` to the root and points `releases/latest` at it.
 
 ## Hosting
 

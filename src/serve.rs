@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::client::RunExit;
 use crate::error::{Error, Result};
 use crate::state::StateDir;
-use crate::ws::{SUBPROTOCOL, Socket};
+use crate::ws::Socket;
 
 /// Where `serve` listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,49 +195,21 @@ impl Accept {
         if !presented.is_some_and(|token| same(token.as_bytes(), self.token.as_bytes())) {
             return refuse(StatusCode::UNAUTHORIZED, "a wrong or missing token");
         }
-        let offers_link = headers
-            .get(header::SEC_WEBSOCKET_PROTOCOL)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.split(',').any(|p| p.trim() == SUBPROTOCOL));
-        if !offers_link {
-            return refuse(StatusCode::BAD_REQUEST, "offer happy-supervisor.v1");
-        }
-        let offers_deflate = headers
-            .get(header::SEC_WEBSOCKET_EXTENSIONS)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(',')
-                    .any(|e| e.trim().starts_with("permessage-deflate"))
-            });
-        if !offers_deflate {
-            return refuse(StatusCode::BAD_REQUEST, "permessage-deflate is required");
-        }
-        let options = crate::ws::options(true, crate::ws::node_level());
-        let (response, upgraded) =
-            match yawc::WebSocket::upgrade_with_options(&mut request, options) {
-                Ok(upgrade) => upgrade,
-                Err(err) => return refuse(StatusCode::BAD_REQUEST, &err.to_string()),
-            };
-        let (mut parts, _) = response.into_parts();
-        parts.headers.insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static(SUBPROTOCOL),
-        );
-        let extensions = parts
-            .headers
-            .get(header::SEC_WEBSOCKET_EXTENSIONS)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let (response, upgrading) = match crate::ws::upgrade(&mut request, crate::ws::node_level())
+        {
+            Ok(upgrade) => upgrade,
+            Err(refused) => return refuse(refused.status, refused.reason),
+        };
         let sockets = self.sockets.clone();
         tokio::spawn(async move {
-            match upgraded.await {
-                Ok(ws) => {
-                    let _ = sockets.send(Box::new(Socket::new(ws, extensions)));
+            match upgrading.socket().await {
+                Ok(socket) => {
+                    let _ = sockets.send(Box::new(socket));
                 }
                 Err(err) => tracing::warn!("a listener upgrade failed: {err}"),
             }
         });
-        Response::from_parts(parts, Full::new(Bytes::new()))
+        response.map(|_| Full::new(Bytes::new()))
     }
 }
 

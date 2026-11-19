@@ -18,6 +18,7 @@ pub mod protocol;
 pub mod proxy;
 pub mod sandbox;
 pub mod serve;
+pub mod server;
 pub mod state;
 pub mod streams;
 #[cfg(feature = "testing")]

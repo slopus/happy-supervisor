@@ -932,3 +932,28 @@ session, `node.ready` goes first.
 | Watches | 64 |
 | Outgoing queue, droppable messages | 16 MiB |
 | Outgoing queue, everything else | 64 MiB, then the session is lost |
+
+## Control-plane library
+
+A control plane written in Rust uses this crate's side of the link instead of reimplementing it.
+The protocol types are in `protocol`, the codec in `wire`, and every link rule in
+`link::Session`. Two pieces connect them to a server:
+
+* `ws::upgrade(&mut request, level)` accepts a node's WebSocket after the control plane has
+  checked its `Authorization`. It works with any `http::Request` that hyper upgrades, including
+  axum's `Request`. It answers `400` (`ws::Refused`) when the request does not offer
+  `happy-supervisor.v1` and `permessage-deflate`, and otherwise returns the `101` response to
+  send and an `Upgrading` whose `socket()` resolves once the node has switched protocols.
+* `server::ControlPlaneLink::new(resume_window_ms)` is one node's link, as the control plane. Give
+  it each socket the node connects with (`attach`, which drops the previous one). It pings, drops
+  silent connections, acknowledges, resends and resumes. Use it with:
+  * `command(kind, params)` / `call(kind, body)`: a command and its reply. With no open session,
+    or when the session is lost before the reply, the result is an `io` error.
+  * `events()`: `Opened { session, resumed, hello }`, every node event as `Event`, `Lost`, and
+    `Disconnected { replaced }`, in order.
+  * `send_proxy`, `send_tcp`: the control plane's side of proxy streams and tunnels.
+  * `bye(reason, message)`: ends the session; `revoked` makes the node exit.
+  * `session()`, `opened(timeout)`, `close()`.
+
+One `ControlPlaneLink` serves one node for as long as the control plane wants it, across
+connections and sessions. `Controller` (serve.md) is the same link over a WebSocket it dials.

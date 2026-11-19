@@ -74,6 +74,75 @@ pub fn options(deflate: bool, level: u32) -> Options {
     }
 }
 
+/// Why [`upgrade`] refused a request: the status to answer, and a line for the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub status: StatusCode,
+    pub reason: &'static str,
+}
+
+/// Accepts a link WebSocket (api.md, Connecting): checks that the request offers
+/// `happy-supervisor.v1` and permessage-deflate, and answers with both, compressing at `level`.
+/// Authentication is the caller's, before this. Returns the response to send, and the socket
+/// once the client has switched protocols.
+pub fn upgrade<B>(
+    request: &mut Request<B>,
+    level: u32,
+) -> Result<(http::Response<Empty<Bytes>>, Upgrading), Refused> {
+    let refuse = |reason| Refused {
+        status: StatusCode::BAD_REQUEST,
+        reason,
+    };
+    let offered = |name, wanted: &dyn Fn(&str) -> bool| {
+        request
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|item| wanted(item.trim()))
+    };
+    if !offered(header::SEC_WEBSOCKET_PROTOCOL, &|p| p == SUBPROTOCOL) {
+        return Err(refuse("offer happy-supervisor.v1"));
+    }
+    if !offered(header::SEC_WEBSOCKET_EXTENSIONS, &|e| {
+        e.starts_with("permessage-deflate")
+    }) {
+        return Err(refuse("permessage-deflate is required"));
+    }
+    let (response, upgrading) = WebSocket::upgrade_with_options(request, options(true, level))
+        .map_err(|_| refuse("not a WebSocket upgrade"))?;
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static(SUBPROTOCOL),
+    );
+    let extensions = parts
+        .headers
+        .get(header::SEC_WEBSOCKET_EXTENSIONS)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    Ok((
+        http::Response::from_parts(parts, body),
+        Upgrading {
+            upgrading,
+            extensions,
+        },
+    ))
+}
+
+/// An accepted upgrade, until the client switches protocols.
+pub struct Upgrading {
+    upgrading: yawc::UpgradeFut,
+    extensions: Option<String>,
+}
+
+impl Upgrading {
+    pub async fn socket(self) -> Result<Socket, WebSocketError> {
+        Ok(Socket::new(self.upgrading.await?, self.extensions))
+    }
+}
+
 /// An open link WebSocket.
 pub struct Socket<S = HttpStream> {
     ws: WebSocket<S>,
@@ -86,6 +155,11 @@ pub struct Socket<S = HttpStream> {
     /// The code of the close frame the peer sent.
     peer_close: Option<u16>,
 }
+
+/// Each side pings a quiet connection this often, and drops one that stays silent for
+/// [`DEAD_AFTER`] (api.md, Connecting).
+pub const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+pub const DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// The close code a listening node closes a connection with when a newer one takes over
 /// (serve.md). A client that gets it does not redial.
@@ -523,6 +597,50 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(20), flooded)
             .await
             .expect("the two sides deadlocked");
+    }
+
+    #[test]
+    fn an_upgrade_needs_the_subprotocol_and_deflate() {
+        let request = |protocol: &str, extensions: &str| {
+            Request::get("/")
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+                .header(header::SEC_WEBSOCKET_PROTOCOL, protocol)
+                .header(header::SEC_WEBSOCKET_EXTENSIONS, extensions)
+                .body(())
+                .unwrap()
+        };
+        let refused = |reason| {
+            Err::<(), _>(Refused {
+                status: StatusCode::BAD_REQUEST,
+                reason,
+            })
+        };
+        let deflate = "permessage-deflate; client_max_window_bits";
+        let mut other = request("chat", deflate);
+        assert_eq!(
+            upgrade(&mut other, 2).map(|_| ()),
+            refused("offer happy-supervisor.v1")
+        );
+        let mut plain = request("x, happy-supervisor.v1", "");
+        assert_eq!(
+            upgrade(&mut plain, 2).map(|_| ()),
+            refused("permessage-deflate is required")
+        );
+        let mut good = request("x, happy-supervisor.v1", deflate);
+        let (response, _) = upgrade(&mut good, 2).unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let header = |name| response.headers().get(name).unwrap().to_str().unwrap();
+        assert_eq!(
+            header(header::SEC_WEBSOCKET_PROTOCOL),
+            "happy-supervisor.v1"
+        );
+        assert_eq!(
+            header(header::SEC_WEBSOCKET_EXTENSIONS),
+            "permessage-deflate; client_max_window_bits=15"
+        );
     }
 
     #[test]

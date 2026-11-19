@@ -33,11 +33,10 @@ use crate::protocol::{
     SessionId, TcpMessage, Value,
 };
 use crate::wire::from_cbor;
-use crate::ws::{SUBPROTOCOL, Socket};
+use crate::ws::{PING_EVERY, SUBPROTOCOL, Socket};
 
 const JOIN_PATH: &str = "/api/nodes/join";
 const CONNECT_PATH: &str = "/nodes/connect";
-const PING_EVERY: Duration = Duration::from_secs(15);
 
 /// api.md's join endpoint and the WebSocket endpoint it hands out, served by axum on
 /// `127.0.0.1:0`.
@@ -639,7 +638,7 @@ impl Actor {
                 _ = self.session.changed() => Wake::Changed,
                 _ = sleep_until(deadline) => Wake::Tick,
                 _ = ping.tick() => Wake::Ping,
-                _ = sleep_until(last_frame.map(|t| t + crate::client::DEAD_AFTER)) => Wake::Dead,
+                _ = sleep_until(last_frame.map(|t| t + crate::ws::DEAD_AFTER)) => Wake::Dead,
             };
             match wake {
                 Wake::Socket(None) | Wake::Control(None) => return,

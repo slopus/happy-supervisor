@@ -24,10 +24,8 @@ use crate::link::{
 };
 use crate::protocol::{ByeReason, MsgId, SessionId, Value};
 use crate::state::StateDir;
-use crate::ws::{Dialed, Event, Socket};
+use crate::ws::{DEAD_AFTER, Dialed, Event, PING_EVERY, Socket};
 
-pub const PING_EVERY: Duration = Duration::from_secs(15);
-pub const DEAD_AFTER: Duration = Duration::from_secs(45);
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A connection up this long resets the backoff.

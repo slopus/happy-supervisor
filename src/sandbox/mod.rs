@@ -86,12 +86,18 @@ impl Prepared {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use linux::NetnsControl;
+
 /// The node's side of the control socket to a sandbox helper that owns a network namespace.
+/// Only Linux isolates an exec's network in a namespace of its own.
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 pub struct NetnsControl {
     _private: (),
 }
 
+#[cfg(not(target_os = "linux"))]
 impl NetnsControl {
     /// Connects to `127.0.0.1:port` inside the namespace. Blocking: call it from
     /// `spawn_blocking`.

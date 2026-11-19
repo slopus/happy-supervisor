@@ -345,14 +345,14 @@ async fn a_host_outside_egress_is_refused() {
         http_connect(&mut tcp, "evil.test:443").await,
         (
             403,
-            "happy-supervisor refused evil.test:443: the host is not allowed by the network policy\n"
+            "happy-supervisor: the sandbox's network policy blocked evil.test:443 (host not allowed); to reach it, run the command again with escalated permissions or full access\n"
                 .to_string()
         )
     );
     let (stdout, _) = run(h.curl(&["-w", " %{http_code}", "http://EVIL.test./x"])).await;
     assert_eq!(
         stdout,
-        "happy-supervisor refused evil.test:80: the host is not allowed by the network policy\n 403"
+        "happy-supervisor: the sandbox's network policy blocked evil.test:80 (host not allowed); to reach it, run the command again with escalated permissions or full access\n 403"
     );
     let (reply, _) = socks_connect(&h, Target::Domain("evil.test"), 22).await;
     assert_eq!(reply, 2);
@@ -389,7 +389,7 @@ async fn a_port_outside_ports_is_refused() {
         (
             403,
             format!(
-                "happy-supervisor refused {target}: the port is not allowed by the network policy\n"
+                "happy-supervisor: the sandbox's network policy blocked {target} (port not allowed); to reach it, run the command again with escalated permissions or full access\n"
             )
         )
     );
@@ -418,39 +418,34 @@ async fn a_name_resolving_to_an_internal_address_is_refused() {
     )
     .await;
 
-    let internal = "the host resolves only to internal addresses";
-    for (target, shown, reason) in [
+    let internal = |shown: &str| {
+        format!(
+            "happy-supervisor: the sandbox's network policy blocked {shown} (resolves only to \
+             internal addresses); to reach it, run the command again with escalated permissions \
+             or full access\n"
+        )
+    };
+    for (target, body) in [
         (
             format!("loop.test:{port}"),
-            format!("loop.test:{port}"),
-            internal,
+            internal(&format!("loop.test:{port}")),
         ),
-        (
-            "intranet.test:80".into(),
-            "intranet.test:80".into(),
-            internal,
-        ),
+        ("intranet.test:80".into(), internal("intranet.test:80")),
         (
             format!("127.0.0.1:{port}"),
-            format!("127.0.0.1:{port}"),
-            internal,
+            internal(&format!("127.0.0.1:{port}")),
         ),
         (
             format!("[::ffff:127.0.0.1]:{port}"),
-            format!("127.0.0.1:{port}"),
-            internal,
+            internal(&format!("127.0.0.1:{port}")),
         ),
         (
             "nowhere.test:80".into(),
-            "nowhere.test:80".into(),
-            "the host does not resolve",
+            "happy-supervisor: nowhere.test does not resolve\n".into(),
         ),
     ] {
         let mut tcp = TcpStream::connect(h.http()).await.unwrap();
-        assert_eq!(
-            http_connect(&mut tcp, &target).await,
-            (403, format!("happy-supervisor refused {shown}: {reason}\n")),
-        );
+        assert_eq!(http_connect(&mut tcp, &target).await, (403, body));
     }
     let (reply, _) = socks_connect(&h, Target::Domain("loop.test"), port).await;
     assert_eq!(reply, 2);
@@ -670,7 +665,7 @@ async fn a_credential_host_outside_egress_is_refused_in_isolated_mode() {
     let (stdout, _) = run(h.curl(&["-w", " %{http_code}", "http://api.example.test/"])).await;
     assert_eq!(
         stdout,
-        "happy-supervisor refused api.example.test:80: the host is not allowed by the network policy\n 403"
+        "happy-supervisor: the sandbox's network policy blocked api.example.test:80 (host not allowed); to reach it, run the command again with escalated permissions or full access\n 403"
     );
     assert_eq!(
         h.events(),

@@ -39,6 +39,9 @@ jobs:
       - run: cargo clippy --lib --no-default-features --features control-plane -- -D warnings
       - run: cargo test --lib --no-default-features --features control-plane
       - run: cargo build --all-targets --all-features
+      # The runner is an administrator; the tests run as the same account, as the supervisor would.
+      - run: cargo run --all-features -- install-sandbox
+        if: runner.os == 'Windows'
       - run: cargo test --all-features
       # Timing tests, alone so nothing else competes for the CPU, and in release as shipped.
       - run: cargo test --release --all-features --test e2e -- --ignored --nocapture

@@ -166,6 +166,41 @@ fn appcontainer_probe() {
     );
     contain("git --version", "none", &[git, "--version"]);
     contain(
+        "read win.ini without NUL",
+        "none",
+        &[&cmd, "/c", r"type C:\Windows\win.ini"],
+    );
+    contain(
+        "read hosts without NUL",
+        "none",
+        &[&cmd, "/c", r"type C:\Windows\System32\drivers\etc\hosts"],
+    );
+    contain(
+        "list Program Files\\Git",
+        "none",
+        &[&cmd, "/c", r#"dir /b "C:\Program Files\Git""#],
+    );
+    contain(
+        "open NUL from PowerShell",
+        "none",
+        &[
+            &powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            r"try { [IO.File]::OpenWrite('\\.\NUL').Close(); 'nul-ok' } catch { $_.Exception.Message }; try { [IO.File]::ReadAllText('C:\Windows\win.ini').Length } catch { $_.Exception.Message }",
+        ],
+    );
+    admin(
+        "NUL's security descriptor",
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-Command",
+            r"$h = [Microsoft.Win32.SafeHandles.SafeFileHandle]; (Get-Item \\.\GLOBALROOT\Device\Null -ErrorAction SilentlyContinue | Get-Acl -ErrorAction SilentlyContinue).Sddl; sc.exe sdshow null",
+        ],
+    );
+    contain(
         "write NUL",
         "none",
         &[&cmd, "/c", "echo x>NUL && echo nul-ok"],

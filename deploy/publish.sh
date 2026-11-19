@@ -2,7 +2,7 @@
 # Publishes one supervisor release to the bucket RELEASE_BUCKET, served at
 # https://get.happy.engineering/ (deploy/README.md, Hosting). It is the publish step of the Cloud
 # Build trigger happy-supervisor-publish, run as service account happy-supervisor-publish, and
-# runs none of the repository's code: it reads the release the build trigger staged, checks
+# runs none of the repository's code: it reads the release release.yml staged, checks
 # SHA256SUMS, signs it with minisign, uploads releases/<version>/ (never over an existing one),
 # checks what is served, and only with --latest moves the installers and releases/latest.
 #

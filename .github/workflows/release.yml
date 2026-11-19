@@ -1,77 +1,140 @@
 name: release
-# Builds happy-supervisor for every supported OS and architecture and uploads one flat artifact,
-# `happy-supervisor-<version>`: the five binaries, SHA256SUMS over exactly those five, the
-# installers and VERSION. No secrets: infra signs SHA256SUMS and publishes the artifact
-# (deploy/publish.sh <dir> [--latest]). Releases normally come from Cloud Build instead, Linux
-# only: push a change to deploy/VERSION to main and approve both builds (deploy/README.md).
-#   gh workflow run release.yml --ref main -f version=0.2.0
+# A release, started by a push to main that changes deploy/VERSION (deploy/README.md, Releasing):
+# the full test suite (ci.yml) on every OS, then the five binaries, each built and started on its
+# own OS and architecture, SHA256SUMS over exactly those five and a build provenance attestation.
+# `stage` puts them in Google Cloud under the commit, where the approval-gated publish trigger
+# verifies, signs and publishes them at https://get.happy.engineering. Once the signed SHA256SUMS
+# is served there, `github-release` makes the same files GitHub Release v<version>.
+#
+# No job holds the signing key. Only `stage` reaches Google Cloud, as service account
+# happy-supervisor-github through Workload Identity Federation, which accepts this repository's
+# push events to main from this file only, and may only create objects in the staging bucket.
+# Actions that run with a token are pinned by commit.
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Release version (0-9, A-Z, a-z, '.', '+', '-')
-        required: true
+  push:
+    branches: [main]
+    paths: [deploy/VERSION]
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_BASE: https://get.happy.engineering
+  MINISIGN_PUBLIC_KEY: RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr
+  STAGING_BUCKET: happy-supervisor-staging-1023659980090
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Versions are immutable: one already served or released is refused before anything builds.
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '\n' < deploy/VERSION)
+          [[ $version =~ ^[0-9A-Za-z.+-]+$ ]] || { echo "bad version: $version" >&2; exit 1; }
+          status=$(curl -s -o /dev/null -w '%{http_code}' "$RELEASE_BASE/releases/$version/SHA256SUMS")
+          [[ $status == 404 ]] || { echo "releases/$version exists (HTTP $status)" >&2; exit 1; }
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub release v$version exists" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: [version, test]
     strategy:
       fail-fast: true
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-x86_64, zig: true }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, name: linux-aarch64, zig: true }
-          - { os: macos-14, target: aarch64-apple-darwin, name: macos-aarch64 }
-          - { os: macos-14, target: x86_64-apple-darwin, name: macos-x86_64 }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-x86_64, arch: x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-aarch64, arch: aarch64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64, arch: aarch64 }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, name: macos-x86_64, arch: x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, arch: x86_64, exe: .exe }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Check the version
-        shell: bash
-        env:
-          VERSION: ${{ inputs.version }}
-        run: '[[ "$VERSION" =~ ^[0-9A-Za-z.+-]+$ ]]'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-      - if: matrix.zig
+      # Linux binaries are static musl, built with cargo-zigbuild and the Zig the Linux release
+      # has always used.
+      - name: Zig
+        if: runner.os == 'Linux'
         run: |
-          pip3 install ziglang
-          cargo install --locked cargo-zigbuild
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) sum=d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea ;;
+            aarch64) sum=041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556 ;;
+          esac
+          curl -fsSL --proto "=https" --tlsv1.2 -o "$RUNNER_TEMP/zig.tar.xz" \
+            "https://ziglang.org/download/0.13.0/zig-linux-$(uname -m)-0.13.0.tar.xz"
+          echo "$sum  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild@0.24.1
       - name: Build
         shell: bash
         env:
-          HAPPY_SUPERVISOR_VERSION: ${{ inputs.version }}
+          HAPPY_SUPERVISOR_VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          NAME: ${{ matrix.name }}
+          ARCH: ${{ matrix.arch }}
+          EXE: ${{ matrix.exe }}
         run: |
-          if [[ "${{ matrix.zig }}" == "true" ]]; then
-            cargo zigbuild --locked --release --bin happy-supervisor --target ${{ matrix.target }}
+          set -euo pipefail
+          if [[ $RUNNER_OS == Linux ]]; then
+            cargo zigbuild --locked --release --bin happy-supervisor --target "$TARGET"
           else
-            cargo build --locked --release --bin happy-supervisor --target ${{ matrix.target }}
+            cargo build --locked --release --bin happy-supervisor --target "$TARGET"
           fi
           mkdir -p out
-          cp target/${{ matrix.target }}/release/happy-supervisor${{ matrix.exe }} out/happy-supervisor-${{ matrix.name }}${{ matrix.exe }}
-      - uses: actions/upload-artifact@v4
+          bin=out/happy-supervisor-$NAME$EXE
+          cp "target/$TARGET/release/happy-supervisor$EXE" "$bin"
+          grep -aqF "$HAPPY_SUPERVISOR_VERSION" "$bin" ||
+            { echo "$bin does not carry $HAPPY_SUPERVISOR_VERSION" >&2; exit 1; }
+          # The binary as shipped starts here and describes this machine.
+          "$bin" info --state-dir "$RUNNER_TEMP/state" > "$RUNNER_TEMP/info.json"
+          jq -e --arg arch "$ARCH" '.os.arch == $arch' "$RUNNER_TEMP/info.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: build-${{ matrix.name }}
           path: out/*
           if-no-files-found: error
 
   artifact:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           pattern: build-*
@@ -83,17 +146,106 @@ jobs:
           [ "$(ls happy-supervisor-* | wc -l)" = 5 ]
           sha256sum happy-supervisor-* > SHA256SUMS
           cat SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+      - id: attest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: dist/happy-supervisor-*
-      - name: Installers
+      - name: Installers, VERSION and the attestation
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
-          grep -q RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr deploy/install.sh
-          grep -q RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr deploy/install.ps1
+          set -euo pipefail
+          grep -qF "$MINISIGN_PUBLIC_KEY" deploy/install.sh
+          grep -qF "$MINISIGN_PUBLIC_KEY" deploy/install.ps1
           cp deploy/install.sh deploy/install.ps1 dist/
-          printf '%s\n' "${{ inputs.version }}" > dist/VERSION
-      - uses: actions/upload-artifact@v4
+          printf '%s\n' "$VERSION" > dist/VERSION
+          cp "$BUNDLE" dist/attestation.sigstore.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: happy-supervisor-${{ inputs.version }}
+          name: happy-supervisor-${{ needs.version.outputs.version }}
           path: dist/*
           if-no-files-found: error
+
+  # The release under gs://<staging>/<commit>/<run>-<attempt>/, SHA256SUMS last: its arrival starts
+  # the publish trigger. The identity may only create objects, so these are JSON API media uploads
+  # that never replace one (ifGenerationMatch=0); a re-run stages under its own attempt.
+  stage:
+    needs: [version, artifact]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: happy-supervisor-${{ needs.version.outputs.version }}
+          path: release
+      - id: gcp
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: projects/1023659980090/locations/global/workloadIdentityPools/github/providers/happy-supervisor
+          service_account: happy-supervisor-github@engaged-symbol-514900-n1.iam.gserviceaccount.com
+          token_format: access_token
+          create_credentials_file: false
+      - name: Stage
+        working-directory: release
+        env:
+          TOKEN: ${{ steps.gcp.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          [[ $GITHUB_SHA =~ ^[0-9a-f]{40}$ ]]
+          prefix=$GITHUB_SHA/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
+          (umask 077 && printf 'Authorization: Bearer %s\n' "$TOKEN" > "$RUNNER_TEMP/auth")
+          trap 'rm -f "$RUNNER_TEMP/auth"' EXIT
+          put() {
+            curl -fsS --proto "=https" -H @"$RUNNER_TEMP/auth" -H "Content-Type: $2" \
+              --data-binary @"$1" -o /dev/null \
+              "https://storage.googleapis.com/upload/storage/v1/b/$STAGING_BUCKET/o?uploadType=media&ifGenerationMatch=0&name=$prefix/$1"
+            echo "staged $prefix/$1"
+          }
+          for f in happy-supervisor-*; do put "$f" application/octet-stream; done
+          for f in install.sh install.ps1 VERSION; do put "$f" "text/plain; charset=utf-8"; done
+          put attestation.sigstore.json application/json
+          put SHA256SUMS "text/plain; charset=utf-8"
+
+  # Waits for the publish trigger (it needs a person's approval) to serve this release's signed
+  # SHA256SUMS, checks it is this run's list under the release key, then releases the same files
+  # on GitHub. When approval comes later than this job's six hours, re-run this job.
+  github-release:
+    needs: [version, artifact, stage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: happy-supervisor-${{ needs.version.outputs.version }}
+          path: release
+      - run: sudo apt-get update -q && sudo apt-get install -yq minisign
+      - name: Wait for the signed release
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          url=$RELEASE_BASE/releases/$VERSION
+          until curl -fsS -o release/SHA256SUMS.minisig "$url/SHA256SUMS.minisig" 2>/dev/null; do sleep 60; done
+          curl -fsS -o "$RUNNER_TEMP/SHA256SUMS" "$url/SHA256SUMS"
+          cmp "$RUNNER_TEMP/SHA256SUMS" release/SHA256SUMS
+          minisign -V -q -P "$MINISIGN_PUBLIC_KEY" -m release/SHA256SUMS -x release/SHA256SUMS.minisig
+          (cd release && sha256sum --strict -c SHA256SUMS)
+      - name: GitHub Release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "happy-supervisor $VERSION, also at $RELEASE_BASE/releases/$VERSION/." "" \
+            "SHA256SUMS is signed with the release key (minisign \`$MINISIGN_PUBLIC_KEY\`)," \
+            "which the installers embed. Install: deploy/README.md." > "$RUNNER_TEMP/notes.md"
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "happy-supervisor $VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            happy-supervisor-* SHA256SUMS SHA256SUMS.minisig install.sh install.ps1

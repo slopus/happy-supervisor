@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, "v2/**"]
   pull_request:
+  # release.yml runs the whole suite before it builds a release.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

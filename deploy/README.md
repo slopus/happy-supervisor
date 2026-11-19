@@ -23,9 +23,8 @@ half lives only in Secret Manager secret `happy-supervisor-signing-key`.
 | `VERSION` | The next release's version, one line. A change to it on `main` starts a release. |
 | `install.sh`, `install.ps1` | The installers (below). |
 | `test_install.py` | `install.sh` in a scratch filesystem: `python3 -m unittest discover -s deploy -p 'test_*.py'`. CI runs it with shellcheck. |
-| `Dockerfile`, `cloudbuild.yaml` | The Linux release as Cloud Build builds it. |
-| `publish.sh` | Signs a built release and publishes it. |
-| `../.github/workflows/release.yml` | All five binaries on GitHub's hosted runners, by hand. |
+| `publish.sh` | Signs a staged release and publishes it (the publish trigger runs a byte copy). |
+| `../.github/workflows/release.yml` | Tests, builds and stages a release, then makes it a GitHub Release. |
 
 ## The installers
 
@@ -60,62 +59,51 @@ release and `HAPPY_INSTALL_BASE` serves releases from elsewhere.
 
 ## Releasing
 
-Push a change to `VERSION` to `main` and approve the two Cloud Build triggers:
+Push a change to `VERSION` to `main`. `.github/workflows/release.yml` then:
 
-1. `happy-supervisor-release` builds `Dockerfile` with that version (Linux x86_64 and aarch64,
-   musl, `HAPPY_SUPERVISOR_VERSION` set so nodes report it) and stages the release in the
-   staging bucket under the commit: `gs://<staging>/<commit>/`.
-2. `happy-supervisor-publish` waits for that commit's staged `SHA256SUMS`, signs it and publishes
-   it with `publish.sh --latest`. It runs none of the repository's code at build time: its steps,
-   with a byte copy of `publish.sh`, are held in happy-terraform.
+1. refuses a version that is already served or released (versions are immutable);
+2. runs the whole suite, `ci.yml`, on Linux x86_64 and aarch64, macOS aarch64 and x86_64, and
+   Windows;
+3. builds each binary on its own OS and architecture, with `HAPPY_SUPERVISOR_VERSION` set so
+   nodes report it (Linux: static musl through `cargo-zigbuild`), and starts it there (`info`);
+4. writes `SHA256SUMS` over exactly the five and a build provenance attestation for them;
+5. stages the release, the installers, `VERSION` and the attestation (`attestation.sigstore.json`)
+   at `gs://happy-supervisor-staging-<project number>/<commit>/<run id>-<attempt>/`,
+   `SHA256SUMS` last;
+6. once the publish trigger serves the signed `SHA256SUMS`, checks it is this run's list under the
+   release key and creates GitHub Release `v<version>` with the same files.
 
-macOS and Windows cannot be built on a Linux builder (their SDKs cannot be fetched there under
-their licences), so a Cloud Build release is Linux only, and its `install.ps1` is not published.
-For all five, run `gh workflow run release.yml -f version=<version>` and publish its artifact
-with `deploy/publish.sh <dir> --latest`, with the environment below.
+A person approves the publish in Cloud Build, and later moves `latest` with the promote trigger:
+publishing a version never changes what a new install gets.
 
-### The triggers
+### Google Cloud
 
-`happy-supervisor-release`:
+Held in happy-terraform:
 
-* Event: push to branch `^main$` of GitHub repository `slopus/happy-supervisor`, included files
-  `deploy/VERSION`. Requires approval.
-* Configuration: `deploy/cloudbuild.yaml` from the repository, substitution
-  `_STAGING_BUCKET=happy-supervisor-staging-<project number>`.
-* Service account: one that may write the staging bucket and nothing else (today
-  `happy-cluster-build`).
-
-`happy-supervisor-publish`:
-
-* Event: the same push (`^main$` of `slopus/happy-supervisor`, included files `deploy/VERSION`).
-  Requires approval.
-* Configuration: inline, in happy-terraform. Service account `happy-supervisor-publish`, the only
-  identity that may read secret `happy-supervisor-signing-key`; it reads the staging bucket and
-  writes the releases bucket.
-* Steps, in an image with `gcloud`, `curl`, `minisign` and `sha256sum`:
-  1. Poll for `gs://happy-supervisor-staging-<project number>/$COMMIT_SHA/SHA256SUMS` for up to
-     an hour, then copy that prefix to `/workspace/release`.
-  2. Run the byte copy of `deploy/publish.sh` as the script, with `PUBLISH_DIR=/workspace/release`,
-     `LATEST=1`, `RELEASE_BUCKET=<the bucket behind get.happy.engineering>`,
-     `MINISIGN_PUBLIC_KEY=RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr`, and
-     `MINISIGN_SECRET_KEY_B64` from `happy-supervisor-signing-key` (`secretEnv`).
-
-Against today's triggers (on `slopus/happy-cluster`) that is a new repository, `deploy/VERSION`
-instead of `deploy/supervisor/VERSION`, `deploy/cloudbuild.yaml` instead of the inline build, the
-staged files directly under the commit, `deploy/publish.sh` instead of
-`deploy/gke/publish-supervisor.sh`, and the new bucket.
+* Workload Identity pool `github`, provider `happy-supervisor`: GitHub's OIDC tokens for this
+  repository (`repository_id` and `repository_owner_id`), push events to `refs/heads/main`, from
+  `.github/workflows/release.yml` on `main` only.
+* Service account `happy-supervisor-github`, impersonable only through that provider, allowed to
+  create objects in the staging bucket and nothing else (no read, no replace).
+* Trigger `happy-supervisor-publish`, approval required, run by `happy-supervisor-publish`, the
+  only identity that may read secret `happy-supervisor-signing-key`. A Pub/Sub notification of the
+  staging bucket starts it when a `<commit>/<run id>-<attempt>/SHA256SUMS` arrives. Its steps are
+  inline and run none of the repository's code: copy that prefix; check that the five binaries
+  match `SHA256SUMS` and that the attestation names each of them, this repository's
+  `release.yml` on `refs/heads/main` and that commit; then run the byte copy of `publish.sh`
+  without `--latest`, with `RELEASE_BUCKET=<the bucket behind get.happy.engineering>`,
+  `MINISIGN_PUBLIC_KEY=RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr` and
+  `MINISIGN_SECRET_KEY_B64` from the secret.
+* Trigger `happy-supervisor-promote`, run by hand with the version, approval required: checks the
+  served release against the release key and moves the installers and `releases/latest` to it.
 
 ## Hosting
 
-Infra sets up, once:
-
-* A Cloud Storage bucket for releases, publicly readable (`allUsers: roles/storage.objectViewer`),
-  and the `happy-supervisor-publish` service account allowed to create objects in it.
-* The DNS name `get.happy.engineering` and TLS for it, serving that bucket at the root (a load
-  balancer with a backend bucket and a managed certificate).
-* The staging bucket `happy-supervisor-staging-<project number>`, private.
-* The signing key in Secret Manager as `happy-supervisor-signing-key` (the existing key).
-* The two Cloud Build triggers above, connected to this repository.
+* The releases bucket, publicly readable, served at `https://get.happy.engineering` (and
+  `https://get.happy-clusters.com`); only `happy-supervisor-publish` writes it.
+* The staging bucket `happy-supervisor-staging-<project number>`, private, objects deleted after
+  30 days.
+* The signing key in Secret Manager as `happy-supervisor-signing-key`.
 
 ## Release notes
 

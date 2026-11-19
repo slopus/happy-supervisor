@@ -748,3 +748,53 @@ async fn a_sandboxed_command_runs_through_the_helper() {
     assert_eq!(err.kind, ErrorKind::PermissionDenied);
     assert!(!state.path().join("x.log").exists());
 }
+
+/// A bind the sandbox refuses (`localBind: false`) is reported as `net.bindDenied`, before the
+/// exit of the process that asked for it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_bind_is_reported_before_the_exit() {
+    use happy_supervisor::protocol::NetBindDenied;
+
+    happy_supervisor::helper::set_exe(env!("CARGO_BIN_EXE_happy-supervisor").into());
+    let sandbox = happy_supervisor::sandbox::probe();
+    sandbox.require_available().unwrap();
+    let mut node = Node::new();
+    let state = tempfile::tempdir().unwrap();
+    let policy = allow_list(
+        sandbox.baseline_read.clone(),
+        Vec::<String>::new(),
+        false,
+        false,
+    );
+    let resolved = ResolvedPolicy::resolve(&policy, state.path()).unwrap();
+    let script = "import socket\n\
+                  try: socket.socket().bind(('127.0.0.1', 8765))\n\
+                  except OSError as err: print(err)";
+    let params = json!({ "execId": "bind", "argv": ["/usr/bin/python3", "-c", script],
+                         "cwd": "/", "env": {} });
+    node.start_with(params, Confinement::Sandboxed(resolved))
+        .await
+        .unwrap();
+    assert_eq!(node.exit("bind").await.exit, ExitStatus::Exited { code: 0 });
+    assert_eq!(
+        node.streamed("bind", Stream::Stdout),
+        "[Errno 1] Operation not permitted\n"
+    );
+    let order: Vec<String> = node
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::NetBindDenied(denied) => Some(format!("{denied:?}")),
+            Event::ExecExit(exit) if exit.exec_id.as_str() == "bind" => Some("exit".into()),
+            _ => None,
+        })
+        .collect();
+    let denied = NetBindDenied {
+        exec_id: id("bind"),
+        host: "127.0.0.1".into(),
+        port: 8765,
+        dropped: None,
+    };
+    assert_eq!(order, [format!("{denied:?}"), "exit".to_string()]);
+}

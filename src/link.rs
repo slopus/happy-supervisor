@@ -34,9 +34,10 @@ use crate::error::{Error, Result};
 use crate::protocol::{
     ACK_DELAY_MS, ACK_EVERY_MSGS, Ack, Bye, ByeReason, Bytes, Change, DROPPABLE_QUEUE_BYTES, Event,
     ExecExit, ExecId, ExecOutput, ExecSummary, ExecTimedOut, ExitStatus, Frame, Hello,
-    MAX_MESSAGE_BYTES, MAX_PART_BYTES, MAX_PARTIAL_BYTES, MsgId, NetDenied, NodeInfo, NodeReady,
-    Outcome, Part, ProxyMessage, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply, SessionId, Stream,
-    TcpMessage, TimeoutAction, True, WatchEvent, WatchEventBody, WatchId, Welcome,
+    MAX_MESSAGE_BYTES, MAX_PART_BYTES, MAX_PARTIAL_BYTES, MsgId, NetBindDenied, NetDenied,
+    NodeInfo, NodeReady, Outcome, Part, ProxyMessage, REPLY_KIND, RETAINED_QUEUE_BYTES, Reply,
+    SessionId, Stream, TcpMessage, TimeoutAction, True, WatchEvent, WatchEventBody, WatchId,
+    Welcome,
 };
 use crate::wire::{Value, from_cbor, from_value, msg_head, to_cbor, to_value};
 
@@ -772,6 +773,13 @@ impl Outbox {
     pub fn net_denied(&self, event: NetDenied) {
         let lane = Lane::Exec(event.exec_id.to_string());
         let body = msg_body("net.denied", &to_cbor(&event));
+        self.lock().enqueue(lane, body, Class::Retained, None);
+    }
+
+    /// Queues a `net.bindDenied` in its process's lane. The exec rate-limits them.
+    pub fn net_bind_denied(&self, event: NetBindDenied) {
+        let lane = Lane::Exec(event.exec_id.to_string());
+        let body = msg_body("net.bindDenied", &to_cbor(&event));
         self.lock().enqueue(lane, body, Class::Retained, None);
     }
 

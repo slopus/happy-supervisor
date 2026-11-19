@@ -6,6 +6,8 @@
 //! because `seccompiler` matches syscall numbers only exactly, refuses every x32 call on x86_64:
 //! x32 shares the x86_64 audit arch, so without it each rule would need its x32 twin. The
 //! architecture check `seccompiler` emits kills any other ABI, such as i386 through `int 0x80`.
+//! A fourth, hand-written too, hands `bind` to a user-notification listener where the policy
+//! refuses it, so the node can report the address ([`notify_bind`], binds.rs).
 //!
 //! Compared with Codex and srt: their namespace, mount, io_uring and ptrace rules are all here.
 //! `ioctl(TIOCSTI)` is added because the sandbox shares the node's session (see `prepare`).
@@ -29,6 +31,9 @@ pub struct NetRules {
     pub unix_sockets: bool,
     /// Refuse `bind` and `listen` for every socket family.
     pub deny_bind: bool,
+    /// `bind` goes to the listener of [`notify_bind`], which refuses it, rather than failing in
+    /// this filter: a call this filter refused would never reach the listener.
+    pub bind_notified: bool,
 }
 
 /// When a call is refused.
@@ -175,8 +180,10 @@ pub fn denials(net: NetRules) -> Vec<Denial> {
         ));
     }
     if net.deny_bind {
+        if !net.bind_notified {
+            denials.push(eperm("bind", libc::SYS_bind, When::Always));
+        }
         // listen too: listening on an unbound socket binds it to an ephemeral port.
-        denials.push(eperm("bind", libc::SYS_bind, When::Always));
         denials.push(eperm("listen", libc::SYS_listen, When::Always));
     }
     denials
@@ -188,6 +195,74 @@ pub fn apply(net: NetRules) -> Result<()> {
         seccompiler::apply_filter(&program).map_err(unavailable)?;
     }
     Ok(())
+}
+
+/// Installs a filter that hands every native `bind` to a seccomp user-notification listener,
+/// and returns the listener (close-on-exec). The listener's holder answers each call; once it
+/// closes, the kernel fails `bind` with `ENOSYS`. Needs Linux 5.0, and fails with `EBUSY` when a
+/// filter installed earlier, by a container runtime for example, already has a listener.
+/// Other ABIs pass this filter, and the arch check and x32 filter of [`apply`] refuse them.
+pub fn notify_bind() -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    let mut program = notify_bind_program();
+    let prog = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_mut_ptr(),
+    };
+    // SAFETY: prctl and seccomp read only `prog`, which points at `program`, alive for the call.
+    // seccomp needs no_new_privs, which `apply` sets too.
+    let fd = unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            &raw const prog,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: with NEW_LISTENER, seccomp returns a new descriptor that nothing else owns.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// `SECCOMP_RET_USER_NOTIF` for the native `bind`, `SECCOMP_RET_ALLOW` for everything else.
+fn notify_bind_program() -> Vec<libc::sock_filter> {
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 0xc000_003e;
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 0xc000_00b7;
+    const ARCH_OFFSET: u32 = 4;
+    const NR_OFFSET: u32 = 0;
+    let ld = |k| libc::sock_filter {
+        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jeq = |k, jt, jf| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let ret = |k| libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    vec![
+        ld(ARCH_OFFSET),
+        jeq(AUDIT_ARCH, 0, 3),
+        ld(NR_OFFSET),
+        jeq(libc::SYS_bind as u32, 0, 1),
+        ret(libc::SECCOMP_RET_USER_NOTIF),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ]
 }
 
 fn unavailable(err: impl std::fmt::Display) -> Error {
@@ -299,6 +374,7 @@ mod tests {
             isolated: false,
             unix_sockets: true,
             deny_bind: false,
+            bind_notified: false,
         });
         assert_eq!(host_open.len(), 1 + 1 + 7 + 8);
         assert_eq!(host_open[0], "clone3 Always 38");
@@ -310,6 +386,7 @@ mod tests {
             isolated: true,
             unix_sockets: false,
             deny_bind: true,
+            bind_notified: false,
         });
         let tail: Vec<(&str, When)> = isolated_closed[isolated_closed.len() - 5..]
             .iter()
@@ -325,15 +402,52 @@ mod tests {
                 ("listen", When::Always),
             ]
         );
+
+        let notified = denials(NetRules {
+            isolated: true,
+            unix_sockets: false,
+            deny_bind: true,
+            bind_notified: true,
+        });
+        let tail: Vec<&str> = notified[notified.len() - 2..]
+            .iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(tail, ["socket", "listen"]);
+    }
+
+    #[test]
+    fn the_notify_filter_hands_on_the_native_bind_only() {
+        let program = notify_bind_program();
+        let k: Vec<u32> = program.iter().map(|insn| insn.k).collect();
+        let arch = if cfg!(target_arch = "x86_64") {
+            0xc000_003e
+        } else {
+            0xc000_00b7
+        };
+        assert_eq!(
+            k,
+            [
+                4,
+                arch,
+                0,
+                libc::SYS_bind as u32,
+                libc::SECCOMP_RET_USER_NOTIF,
+                libc::SECCOMP_RET_ALLOW
+            ]
+        );
+        assert_eq!((program[1].jt, program[1].jf), (0, 3));
+        assert_eq!((program[3].jt, program[3].jf), (0, 1));
     }
 
     #[test]
     fn every_table_compiles() {
-        for bits in 0..8 {
+        for bits in 0..16 {
             let net = NetRules {
                 isolated: bits & 1 != 0,
                 unix_sockets: bits & 2 != 0,
                 deny_bind: bits & 4 != 0,
+                bind_notified: bits & 8 != 0,
             };
             let programs = compile(&denials(net)).unwrap();
             let expected = if cfg!(target_arch = "x86_64") { 3 } else { 2 };

@@ -38,8 +38,8 @@ pub enum LinkEvent {
         resumed: bool,
         hello: Box<Hello>,
     },
-    /// An event from the node: `exec.*`, `watch.event`, `net.denied`, `node.ready`, or a
-    /// `proxy.*` or `tcp.*` stream message.
+    /// An event from the node: `exec.*`, `watch.event`, `net.denied`, `net.bindDenied`,
+    /// `node.ready`, or a `proxy.*` or `tcp.*` stream message.
     Event(Event),
     /// The session cannot be resumed. Commands it carried were failed.
     Lost {

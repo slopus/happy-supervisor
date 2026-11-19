@@ -75,7 +75,8 @@ impl Controller {
     }
 
     /// Every event the node sends from now on: `exec.output`, `exec.exit`, `watch.event`,
-    /// `net.denied`, `node.ready`, and the `proxy.*` and `tcp.*` stream messages.
+    /// `net.denied`, `net.bindDenied`, `node.ready`, and the `proxy.*` and `tcp.*` stream
+    /// messages.
     pub fn events(&self) -> Events {
         Events {
             events: self.link.events(),

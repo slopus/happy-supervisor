@@ -764,6 +764,31 @@ resolved address was internal), `resolve` (no address), or
 At most 20 a second per process. `dropped` (int) is present on the next event after some were
 rate-limited, and counts them. Sent in the process's lane, `exec:<execId>`.
 
+### `net.bindDenied` (event)
+
+```json
+{ "execId": "e_1", "host": "127.0.0.1", "port": 8765 }
+```
+
+The process's sandbox refused to bind a TCP or UDP port, because its policy has
+`localBind: false` (policy.md, Network). `host` is the local address it asked for (`0.0.0.0`,
+`127.0.0.1`, `::`, ...), and `port` the port, `0` for one the system would have picked. The
+command got `EPERM`. Rate-limited like `net.denied`, with `dropped`, and sent in the process's
+lane before its `exec.exit`.
+
+Only Linux reports it, and only where seccomp refuses the bind: with `unixSockets: false`, or on
+a kernel without Landlock ABI 4 (Linux 6.7). Where Landlock refuses TCP binds instead
+(`unixSockets: true`), and on macOS and Windows, a refused bind sends nothing. Nor do `listen`
+without `bind`, a bind whose address the node cannot read (Yama `ptrace_scope` 2 or 3, a command
+that is not dumpable), or any bind where seccomp user notifications are unavailable: Linux before
+5.0, or a container runtime whose own filter already has a listener, since a process's filters
+may have only one (policy.md, Linux: gaps and errors).
+
+`net.bindDenied` is newer than the key registry: its kind travels as text, so a control plane
+whose registry predates it still reads the frame, replies `unknown_kind`, and the node ignores
+the reply (Errors). It has no registry number until control planes have had a release to learn
+it.
+
 ### `exec.log`
 
 Params `{ "execId": "build-1", "offset": 0, "length": 65536 }`. Reads the process's log, running

@@ -29,7 +29,7 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | `Error { kind: ErrorKind, message }`, `ErrorKind` ↔ `kind` string table | `error` | scaffold |
 | `Policy` (`RuleSet` read and write, `Network::{Host, Isolated}`; validated when built or parsed), `ResolvedPolicy` (entries resolved, state dir denied, `can_read`/`can_write`, `layers()` by depth, `allow_read_file` for the CA bundle), `host_allowed`, `resolve_path`, `Confinement::{Raw, Sandboxed(ResolvedPolicy)}` | `policy` | scaffold |
 | `Job { policy: ResolvedPolicy, op: JobOp }`, `JobOp::{Exec, Fs}`, the length-prefixed job framing on the helper's stdin, the exec status pipe, `helper::main` | `helper` | scaffold |
-| `sandbox::prepare(&Plan, &Job) -> Result<Prepared>` (`Plan { policy, net, exe }`; `Prepared { command, placeholders, netns }`), `sandbox::probe() -> SandboxInfo`, `sandbox::baseline_read()`, `Placeholders`, `NetnsControl` | `sandbox/{mod,placeholders,linux,macos,windows}` | `mod` scaffold; backends Linux / macOS / Windows tracks |
+| `sandbox::prepare(&Plan, &Job) -> Result<Prepared>` (`Plan { policy, net, exe }`; `Prepared { command, placeholders, netns, binds }`), `sandbox::probe() -> SandboxInfo`, `sandbox::baseline_read()`, `Placeholders`, `NetnsControl`, `BindReports` | `sandbox/{mod,placeholders,linux,macos,windows}` | `mod` scaffold; backends Linux / macOS / Windows tracks |
 | `StateDir` (paths, `private_dir`/`public_dir`, installation ID, credentials load/store, `lock` for one running node) | `state` | transport track |
 | `link::Session`: the sans-IO session state machine (lanes with deficit round robin, parts and their reassembly, droppable/retained budgets and drop accounting, UUIDv7 frame IDs assigned as frames are written, kept frames and resend on resume, cursor acks, dedup by frame ID, lost-session detection). `link::lane_of` derives a message's lane. Used unchanged by the node and `testing::ControlPlane`; `Role` is the only difference | `link` | scaffold |
 | `Outbox`: the cloneable handle exec, watch and the driver use to send events, commands and replies into the session | `link` | scaffold |
@@ -63,8 +63,13 @@ big-endian length followed by that many bytes of CBOR, the same encoding as the 
 nothing past the job is consumed. Then:
 
 * Linux: the parent spawned it as `bwrap <namespaces> <mounts> -- <exe> __sandbox`, and the helper
-  calls `sandbox::enter(&job.policy)` on itself: in an isolated exec it forks a parent that
-  bridges the proxy sockets and serves `tcp.open`, then the child installs seccomp. It is a fresh
+  calls `sandbox::enter(&job.policy)` on itself: in an isolated exec, or one whose binds seccomp
+  refuses, it forks a parent that bridges the proxy sockets, serves `tcp.open`, and answers the
+  command's binds, then the child installs seccomp. The binds go to a seccomp user notification
+  whose listener the child hands to the parent; the parent refuses each one and reports its
+  address to the node over a socket pair, which `exec` turns into `net.bindDenied`
+  (sandbox/linux/binds.rs). The parent is not dumpable from before the fork, so the command,
+  as the same user, can neither read its memory nor take its descriptors. It is a fresh
   single-threaded process, so it may allocate freely.
 * macOS: the parent spawned it as `/usr/bin/sandbox-exec -p <profile> <exe> __sandbox`, so it is
   already confined.

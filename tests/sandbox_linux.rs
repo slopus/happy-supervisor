@@ -127,6 +127,7 @@ struct Run {
 struct Started {
     child: Child,
     netns: Option<sandbox::NetnsControl>,
+    binds: Option<sandbox::BindReports>,
     _placeholders: sandbox::Placeholders,
 }
 
@@ -159,6 +160,7 @@ fn start(
         mut command,
         placeholders,
         netns,
+        binds,
     } = sandbox::prepare(&plan, &job).unwrap();
     let (mut status_reader, status_writer) = std::io::pipe().unwrap();
     let status_fd = status_writer.as_raw_fd();
@@ -188,6 +190,7 @@ fn start(
     Started {
         child,
         netns,
+        binds,
         _placeholders: placeholders,
     }
 }
@@ -266,6 +269,8 @@ fn child_action() {
     let result: std::io::Result<String> = match action.as_str() {
         "tcp" => TcpListener::bind("127.0.0.1:0").map(|_| "ok".into()),
         "udp" => std::net::UdpSocket::bind("127.0.0.1:0").map(|_| "ok".into()),
+        "tcp-at" => TcpListener::bind(&arg).map(|_| "ok".into()),
+        "udp-at" => std::net::UdpSocket::bind(&arg).map(|_| "ok".into()),
         "unix" => UnixListener::bind(&arg).map(|_| "ok".into()),
         "socketpair" => std::os::unix::net::UnixStream::pair().map(|_| "ok".into()),
         "connect" => {
@@ -581,6 +586,74 @@ fn unix_sockets_and_local_bind_follow_the_policy() {
             assert_eq!(got, expected, "{network:?}");
         }
     }
+}
+
+/// Runs [`child_action`] and returns its result and the binds its sandbox reported.
+fn act_reported(policy: &ResolvedPolicy, action: &str, arg: &str) -> (String, Option<Vec<String>>) {
+    let started = start(
+        policy,
+        None,
+        &child_argv(),
+        &[(ACTION_VAR, action), (ARG_VAR, arg)],
+    );
+    let output = started.child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let result = result_of(&stdout).unwrap_or_else(|| panic!("no result from {action}: {stdout}"));
+    let reported = started
+        .binds
+        .map(|binds| std::iter::from_fn(|| binds.next().map(|a| a.to_string())).collect());
+    (result, reported)
+}
+
+#[test]
+fn binds_seccomp_refuses_are_reported_with_their_address() {
+    let tree = Tree::new();
+    for network in [host(false, false), isolated(false, false)] {
+        let p = tree.resolve(read_all(&tree), write_none(&tree), network.clone());
+        let table = [
+            ("tcp-at", "127.0.0.1:8765", "127.0.0.1:8765"),
+            ("tcp-at", "0.0.0.0:0", "0.0.0.0:0"),
+            ("udp-at", "[::]:5353", "[::]:5353"),
+        ];
+        for (action, arg, reported) in table {
+            assert_eq!(
+                act_reported(&p, action, arg),
+                ("EPERM".to_string(), Some(vec![reported.to_string()])),
+                "{network:?} {action} {arg}"
+            );
+        }
+        // The listener that answers the binds stays out of the command's reach: not among its
+        // descriptors, and its holder's are not readable.
+        let (fds, _) = out(
+            &p,
+            "ls -l /proc/self/fd/; ls -l /proc/$PPID/fd/ 2>&1; grep Name /proc/$PPID/status",
+        );
+        assert!(!fds.contains("seccomp"), "{fds}");
+        assert!(fds.contains("Permission denied"), "{fds}");
+        assert!(fds.ends_with("Name:\thappy-superviso\n"), "{fds}");
+        // A Unix socket is no port, and the policy refuses creating it anyway.
+        assert_eq!(
+            act_reported(&p, "unix", tree.path("s").to_str().unwrap()),
+            ("EPERM".to_string(), Some(vec![])),
+        );
+    }
+
+    // Where Landlock refuses TCP bind (unixSockets, Linux 6.7), nothing is reported.
+    let p = tree.resolve(read_all(&tree), write_none(&tree), host(false, true));
+    let (result, reported) = act_reported(&p, "tcp-at", "127.0.0.1:8765");
+    match result.as_str() {
+        "EACCES" => assert_eq!(reported, None),
+        _ => assert_eq!(
+            (result, reported),
+            ("EPERM".into(), Some(vec!["127.0.0.1:8765".into()]))
+        ),
+    }
+
+    let p = tree.resolve(read_all(&tree), write_none(&tree), host(true, false));
+    assert_eq!(
+        act_reported(&p, "tcp-at", "127.0.0.1:0"),
+        ("ok".into(), None)
+    );
 }
 
 #[test]

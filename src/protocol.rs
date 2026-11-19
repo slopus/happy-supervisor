@@ -249,6 +249,8 @@ pub enum Event {
     WatchEvent(WatchEvent),
     #[serde(rename = "net.denied")]
     NetDenied(NetDenied),
+    #[serde(rename = "net.bindDenied")]
+    NetBindDenied(NetBindDenied),
     /// A `proxy.*` stream message (proxy.md), which carries its own `kind`.
     #[serde(untagged)]
     Proxy(ProxyMessage),
@@ -258,13 +260,14 @@ pub enum Event {
 }
 
 impl Event {
-    pub const KINDS: [&str; 6] = [
+    pub const KINDS: [&str; 7] = [
         "node.ready",
         "exec.output",
         "exec.exit",
         "exec.timedOut",
         "watch.event",
         "net.denied",
+        "net.bindDenied",
     ];
 
     /// Parses a received message as an event. `None` for a kind that is not an event.
@@ -980,6 +983,19 @@ pub struct NetDenied {
     pub port: u16,
     pub via: Via,
     pub reason: DenyReason,
+    /// Refusals not reported since the last event, over the rate limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
+}
+
+/// A process's sandbox refused to bind a TCP or UDP port, because its policy has
+/// `localBind: false` (api.md, `net.bindDenied`). `host` is the local address it asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetBindDenied {
+    pub exec_id: ExecId,
+    pub host: String,
+    pub port: u16,
     /// Refusals not reported since the last event, over the rate limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped: Option<u64>,
@@ -2700,6 +2716,33 @@ mod tests {
                 ..
             })
         ));
+
+        let bind: Event = round_trip(
+            json!({ "kind": "net.bindDenied", "body": { "execId": "e_1", "host": "127.0.0.1", "port": 8765 } }),
+        );
+        assert_eq!(
+            bind,
+            Event::NetBindDenied(NetBindDenied {
+                exec_id: ExecId::try_from("e_1").unwrap(),
+                host: "127.0.0.1".to_string(),
+                port: 8765,
+                dropped: None,
+            })
+        );
+        let counted: Event = round_trip(
+            json!({ "kind": "net.bindDenied", "body": { "execId": "e_1", "host": "::", "port": 0, "dropped": 3 } }),
+        );
+        assert!(matches!(
+            counted,
+            Event::NetBindDenied(NetBindDenied {
+                dropped: Some(3),
+                ..
+            })
+        ));
+        // Not in the registry, so a control plane whose registry predates it still reads the
+        // frame, and answers the kind it does not know with unknown_kind (api.md).
+        let head = crate::wire::msg_head("net.bindDenied");
+        assert!(head.windows(14).any(|w| w == b"net.bindDenied"));
 
         let log: ExecLogParams =
             round_trip(json!({ "execId": "build-1", "offset": 0, "length": 65536 }));

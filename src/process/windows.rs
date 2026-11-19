@@ -137,6 +137,39 @@ fn resume(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Hands the write end of an exec's status pipe to `child`, the sandbox helper, still
+/// suspended: the handle is duplicated into it and closed here. Returns the preamble to write
+/// to its stdin before the job, which tells the helper the handle's value there.
+pub(crate) fn status_preamble(child: &Child, writer: std::io::PipeWriter) -> io::Result<[u8; 12]> {
+    use std::os::windows::io::IntoRawHandle as _;
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut theirs: HANDLE = std::ptr::null_mut();
+    // SAFETY: our pipe handle is open, and closed by the call whatever it returns; the child's
+    // process handle is open while `child` lives.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            writer.into_raw_handle() as HANDLE,
+            child.as_raw_handle() as HANDLE,
+            &mut theirs,
+            0,
+            0,
+            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut preamble = [0u8; 12];
+    preamble[..4].copy_from_slice(crate::helper::STATUS_MAGIC);
+    preamble[4..].copy_from_slice(&(theirs as u64).to_le_bytes());
+    Ok(preamble)
+}
+
 /// Blocks until `child` exits. The process handle stays open, so the job can still be
 /// signalled safely until the caller records the exit.
 pub(crate) fn wait_exit(child: &Child) -> io::Result<()> {

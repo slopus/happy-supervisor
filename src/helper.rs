@@ -14,7 +14,9 @@
 //! big-endian length, then CBOR.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write as _};
+use std::io::Read;
+#[cfg(unix)]
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -32,6 +34,11 @@ pub const MAX_JOB_BYTES: usize = 32 << 20;
 
 /// The helper's fd for the exec status pipe.
 pub const STATUS_FD: i32 = 3;
+
+/// Windows: what precedes the job on the helper's stdin when the parent passes a status pipe,
+/// followed by the pipe's handle in the helper as a little-endian u64. A frame's first byte is
+/// at most 0x02, so it cannot be mistaken for a frame.
+pub const STATUS_MAGIC: &[u8; 4] = b"HSS1";
 
 /// The exit code of a helper that could not read its job.
 pub const EXIT_BAD_JOB: i32 = 125;
@@ -176,6 +183,14 @@ pub fn exe() -> Result<PathBuf> {
 /// The entry point of `happy-supervisor __sandbox`. `main.rs` calls it before starting any
 /// runtime or thread.
 pub fn main() -> ! {
+    #[cfg(windows)]
+    crate::sandbox::windows::helper_main();
+    #[cfg(unix)]
+    unix_main()
+}
+
+#[cfg(unix)]
+fn unix_main() -> ! {
     let Job { policy, op } = match read_stdin_job() {
         Ok(job) => job,
         Err(err) => {
@@ -198,13 +213,7 @@ fn read_stdin_job() -> Result<Job> {
     read_job(&mut std::fs::File::from(fd))
 }
 
-#[cfg(not(unix))]
-fn read_stdin_job() -> Result<Job> {
-    Err(Error::sandbox_unavailable(
-        "the sandbox helper runs only on Linux and macOS",
-    ))
-}
-
+#[cfg(unix)]
 /// Confines this process. On macOS `sandbox-exec` already did.
 fn confine(policy: &ResolvedPolicy) -> Result<()> {
     #[cfg(target_os = "linux")]
@@ -216,6 +225,7 @@ fn confine(policy: &ResolvedPolicy) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn run_exec(
     policy: &ResolvedPolicy,
     argv: &Argv,
@@ -251,11 +261,6 @@ fn exec(argv: &Argv, cwd: &AbsPath, env: &BTreeMap<String, String>) -> Error {
     Error::from(err)
 }
 
-#[cfg(not(unix))]
-fn exec(_argv: &Argv, _cwd: &AbsPath, _env: &BTreeMap<String, String>) -> Error {
-    Error::sandbox_unavailable("the sandbox helper runs only on Linux and macOS")
-}
-
 /// Takes fd 3 if the parent installed it, marked close-on-exec so a successful exec closes it.
 #[cfg(unix)]
 fn take_status_pipe() -> Option<std::fs::File> {
@@ -272,17 +277,17 @@ fn take_status_pipe() -> Option<std::fs::File> {
     }))
 }
 
-#[cfg(not(unix))]
-fn take_status_pipe() -> Option<std::fs::File> {
-    None
-}
-
-fn run_fs(policy: &ResolvedPolicy, request: &FsRequest) -> ! {
-    let reply = match confine(policy).and_then(|()| crate::fs::perform(request)) {
+/// The frame a file job's helper writes to stdout, which [`parse_fs_reply`] reads.
+pub fn encode_fs_reply(result: Result<FsResponse>) -> Vec<u8> {
+    encode_frame(&match result {
         Ok(response) => FsReply::Ok(response),
         Err(err) => FsReply::Err(err),
-    };
-    let frame = encode_frame(&reply);
+    })
+}
+
+#[cfg(unix)]
+fn run_fs(policy: &ResolvedPolicy, request: &FsRequest) -> ! {
+    let frame = encode_fs_reply(confine(policy).and_then(|()| crate::fs::perform(request)));
     let mut stdout = std::io::stdout().lock();
     let written = stdout.write_all(&frame).and_then(|()| stdout.flush());
     std::process::exit(if written.is_ok() { 0 } else { 1 })

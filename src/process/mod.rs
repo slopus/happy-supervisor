@@ -9,4 +9,4 @@ mod windows;
 #[cfg(unix)]
 pub(crate) use unix::{Tree, default_interrupt, exit_status, isolate, wait_exit};
 #[cfg(windows)]
-pub(crate) use windows::{Tree, exit_status, isolate, wait_exit};
+pub(crate) use windows::{Tree, exit_status, isolate, status_preamble, wait_exit};

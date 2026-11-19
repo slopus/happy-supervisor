@@ -852,7 +852,6 @@ fn adopt(mut child: Child) -> Result<Spawned> {
 
 /// Runs the sandbox helper with the job on its stdin, and waits on the status pipe until the
 /// helper has exec'd the command or reported why it could not.
-#[cfg(unix)]
 fn spawn_sandboxed(
     policy: &ResolvedPolicy,
     net: Option<NetPlan>,
@@ -922,17 +921,44 @@ fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawn
     Ok(Spawned { child, tree })
 }
 
+/// Windows passes the status pipe's write end by duplicating it into the suspended helper and
+/// telling it the handle in a preamble on stdin (`helper::STATUS_MAGIC`).
 #[cfg(windows)]
-fn spawn_sandboxed(
-    _policy: &ResolvedPolicy,
-    _net: Option<NetPlan>,
-    _program: &Path,
-    _argv: &Argv,
-    _cwd: &AbsPath,
-    _env: BTreeMap<String, String>,
-    _stdin: bool,
-) -> Result<(Spawned, Held)> {
-    Err(Error::sandbox_unavailable("Windows has no sandbox backend"))
+fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawned> {
+    let (mut status, status_writer) = std::io::pipe()?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process::isolate(&mut command);
+    let mut child = command.spawn()?;
+    let preamble = match process::status_preamble(&child, status_writer) {
+        Ok(preamble) => preamble,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err.into());
+        }
+    };
+    let Spawned { mut child, tree } = adopt(child)?;
+
+    let mut pipe = child.stdin.take().expect("stdin is piped");
+    // A helper that dies early closes its stdin; the status pipe then says why.
+    let _ = pipe
+        .write_all(&preamble)
+        .and_then(|()| pipe.write_all(frame));
+    if stdin {
+        child.stdin = Some(pipe);
+    } else {
+        drop(pipe);
+    }
+    let mut report = Vec::new();
+    status.read_to_end(&mut report)?;
+    if let Err(err) = crate::helper::parse_exec_status(&report) {
+        let _ = child.wait();
+        return Err(err);
+    }
+    Ok(Spawned { child, tree })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

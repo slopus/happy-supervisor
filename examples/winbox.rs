@@ -218,7 +218,8 @@ mod win {
                 TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
                 &mut token,
             )
-        })?;
+        })
+        .map_err(|err| io::Error::other(format!("OpenProcessToken: {err}")))?;
         Ok(token)
     }
 
@@ -299,7 +300,8 @@ mod win {
                 null(),
                 &mut token,
             )
-        })?;
+        })
+        .map_err(|err| io::Error::other(format!("CreateRestrictedToken: {err}")))?;
         let disabled: Vec<String> = sids.iter().map(Sid::text).collect();
         eprintln!("winbox: deny-only {disabled:?}");
         let mut line = command_line(argv);
@@ -320,7 +322,8 @@ mod win {
                 &startup,
                 &mut info,
             )
-        })?;
+        })
+        .map_err(|err| io::Error::other(format!("CreateProcessAsUserW: {err}")))?;
         wait(info)
     }
 
@@ -342,13 +345,14 @@ mod win {
                 &mut psid,
             )
         };
-        if code == ALREADY_EXISTS {
+        if code != 0 && code != ALREADY_EXISTS {
+            eprintln!("winbox: CreateAppContainerProfile {code:#010x}; deriving the SID only");
+        }
+        if code != 0 {
             // SAFETY: as above.
             hresult(unsafe {
                 DeriveAppContainerSidFromAppContainerName(wname.as_ptr(), &mut psid)
             })?;
-        } else {
-            hresult(code)?;
         }
         // SAFETY: a valid SID until FreeSid.
         let sid = unsafe { Sid::copy(psid) };

@@ -162,6 +162,29 @@ fn appcontainer_probe() {
     );
     contain("git --version", "none", &[git, "--version"]);
     contain(
+        "write NUL",
+        "none",
+        &[&cmd, "/c", "echo x>NUL && echo nul-ok"],
+    );
+    contain(
+        "read hosts",
+        "none",
+        &[
+            &cmd,
+            "/c",
+            r"type C:\Windows\System32\drivers\etc\hosts >NUL && echo read",
+        ],
+    );
+    admin(
+        "acls",
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-Command",
+            r"icacls C:\Windows\win.ini; icacls 'C:\Program Files\Git'; icacls 'C:\Program Files'; icacls C:\Windows\System32\drivers\etc\hosts; (Get-Acl \\.\NUL -ErrorAction SilentlyContinue).Sddl",
+        ],
+    );
+    contain(
         "whoami /groups",
         "none",
         &[&system32("whoami.exe"), "/groups"],

@@ -52,16 +52,26 @@ pub enum ListenOn {
     UnixDir(PathBuf),
 }
 
-/// The one line an HTTP client gets with `403`.
+/// The one line an HTTP client gets with `403`. A command's output is often all a model reads,
+/// so a refusal by the policy says that the sandbox blocked the host and that the command needs
+/// more access to reach it. The control plane names that access, so the line names none of its
+/// tools, and it tells nothing of the policy beyond the host and port.
 pub(crate) fn explain(reason: DenyReason, host: &str, port: u16) -> String {
     let why = match reason {
-        DenyReason::Egress => "the host is not allowed by the network policy",
-        DenyReason::Port => "the port is not allowed by the network policy",
-        DenyReason::Address => "the host resolves only to internal addresses",
-        DenyReason::Resolve => "the host does not resolve",
-        DenyReason::Credential => "credential-route hosts are reachable only over HTTP",
+        DenyReason::Egress => "host not allowed",
+        DenyReason::Port => "port not allowed",
+        DenyReason::Address => "resolves only to internal addresses",
+        DenyReason::Resolve => return format!("happy-supervisor: {host} does not resolve\n"),
+        DenyReason::Credential => {
+            return format!(
+                "happy-supervisor: {host}:{port} is reachable only through the HTTP proxy\n"
+            );
+        }
     };
-    format!("happy-supervisor refused {host}:{port}: {why}\n")
+    format!(
+        "happy-supervisor: the sandbox's network policy blocked {host}:{port} ({why}); to reach \
+         it, run the command again with escalated permissions or full access\n"
+    )
 }
 
 /// What happens to one outbound request.

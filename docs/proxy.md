@@ -52,9 +52,21 @@ For each outbound request the command proxy decides, in order:
 4. **Tunnel.** HTTP `CONNECT` and SOCKS5 `CONNECT` splice bytes; absolute-form `http://` requests
    are forwarded with hop-by-hop headers removed. Only the credential route terminates TLS.
 
-A refusal is HTTP `403` with a one-line reason, or SOCKS5 reply `0x02`. SOCKS5 offers no
-authentication (`0x00`), `CONNECT` only (`UDP ASSOCIATE` and `BIND` get `0x07`), and address types
-domain, IPv4 and IPv6. The HTTP proxy takes `CONNECT` and absolute-form `http://` requests; other
+A refusal is HTTP `403` with a one-line `text/plain` body, or SOCKS5 reply `0x02`. Many clients
+print that body, and it may be all a model reads of a failed command, so a refusal by the policy
+(`egress`, `port`, `address`) says that the sandbox blocked the host and that the command needs
+more access, in words that name no control plane's tools:
+
+```
+happy-supervisor: the sandbox's network policy blocked example.com:443 (host not allowed); to reach it, run the command again with escalated permissions or full access
+```
+
+The parenthesis is `port not allowed` or `resolves only to internal addresses` for the other two
+reasons. A name that does not resolve gets `happy-supervisor: <host> does not resolve`. The body
+names only the host and port, never the policy's entries.
+
+SOCKS5 offers no authentication (`0x00`), `CONNECT` only (`UDP ASSOCIATE` and `BIND` get `0x07`),
+and address types domain, IPv4 and IPv6. The HTTP proxy takes `CONNECT` and absolute-form `http://` requests; other
 forms get `400`.
 
 Every refusal sends a `net.denied` event (api.md), at most 20 a second per exec; the rest are

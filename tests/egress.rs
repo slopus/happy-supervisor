@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
-use happy_supervisor::policy::{Default, HostRules};
+use happy_supervisor::policy::{Default, HostEntry, HostRules};
 use happy_supervisor::protocol::{
     Bytes, DenyReason, ExecId, HostPattern, NetDenied, ProxyEnd, ProxyMessage, ProxyResponse,
     ProxySpec, ProxyToken, Scheme, TcpMessage, Via,
@@ -55,8 +55,14 @@ impl Upstream for Channel {
 fn rules(default: Default, allow: &[&str], deny: &[&str]) -> HostRules {
     HostRules {
         default,
-        allow: allow.iter().map(|s| s.to_string()).collect(),
-        deny: deny.iter().map(|s| s.to_string()).collect(),
+        allow: allow
+            .iter()
+            .map(|s| HostEntry::try_from(*s).unwrap())
+            .collect(),
+        deny: deny
+            .iter()
+            .map(|s| HostEntry::try_from(*s).unwrap())
+            .collect(),
     }
 }
 
@@ -481,6 +487,47 @@ async fn an_internal_address_named_in_egress_allow_is_reached() {
     assert_eq!(reply, 0, "10.0.0.5 is dropped, 127.0.0.1 is allowed");
     assert_eq!(get_over(&mut tcp, "/mixed").await, "hello from /mixed");
     assert_eq!(h.events(), []);
+}
+
+#[tokio::test]
+async fn prefixes_decide_the_addresses_of_allowed_names() {
+    let port = upstream().await;
+    let mut h = Harness::isolated(
+        rules(
+            Default::Deny,
+            &["loop.test", "mixed.test", "intranet.test", "127.0.0.0/8"],
+            &["10.0.0.0/8"],
+        ),
+        None,
+    )
+    .await;
+
+    let (stdout, stderr) = run(h.curl(&[&format!("http://loop.test:{port}/loop")])).await;
+    assert_eq!(stdout, "hello from /loop", "{stderr}");
+    let (reply, mut tcp) = socks_connect(&h, Target::Ip("127.0.0.1".parse().unwrap()), port).await;
+    assert_eq!(reply, 0, "127.0.0.1 is allowed by 127.0.0.0/8");
+    assert_eq!(get_over(&mut tcp, "/literal").await, "hello from /literal");
+    let (reply, mut tcp) = socks_connect(&h, Target::Domain("mixed.test"), port).await;
+    assert_eq!(
+        reply, 0,
+        "10.0.0.5 is denied by 10.0.0.0/8, 127.0.0.1 is allowed"
+    );
+    assert_eq!(get_over(&mut tcp, "/mixed").await, "hello from /mixed");
+    let (reply, _) = socks_connect(&h, Target::Domain("intranet.test"), 80).await;
+    assert_eq!(reply, 2);
+    let (reply, _) = socks_connect(&h, Target::Ip("10.0.0.5".parse().unwrap()), 80).await;
+    assert_eq!(reply, 2);
+    let (reply, _) = socks_connect(&h, Target::Domain("allowed.test"), port).await;
+    assert_eq!(reply, 2, "127.0.0.0/8 does not admit a name");
+
+    assert_eq!(
+        h.events(),
+        [
+            denied("intranet.test", 80, Via::Socks5, DenyReason::Egress),
+            denied("10.0.0.5", 80, Via::Socks5, DenyReason::Egress),
+            denied("allowed.test", port, Via::Socks5, DenyReason::Egress),
+        ]
+    );
 }
 
 #[tokio::test]

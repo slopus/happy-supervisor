@@ -723,8 +723,9 @@ process. `logBytes` is the output produced so far.
 ```
 
 The process's command proxy refused a connection (proxy.md, Egress proxy). `via` is `http` or
-`socks5`. `reason` is `egress` (the host failed `network.egress`), `port` (not in
-`network.ports`), `address` (every resolved address was filtered), `resolve` (no address), or
+`socks5`. `reason` is `egress` (`network.egress` denied the host, or every address it resolved to
+was dropped and a prefix denied at least one), `port` (not in `network.ports`), `address` (every
+resolved address was internal), `resolve` (no address), or
 `credential` (a credential host asked through SOCKS5, which cannot carry the credential route).
 At most 20 a second per process. `dropped` (int) is present on the next event after some were
 rate-limited, and counts them. Sent in the process's lane, `exec:<execId>`.

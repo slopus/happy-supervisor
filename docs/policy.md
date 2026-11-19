@@ -101,10 +101,28 @@ egress rules.
 | Field | Meaning |
 |---|---|
 | `egress.default` | `"allow"` or `"deny"`: hosts no entry matches. `{ "default": "deny", "allow": [], "deny": [] }` is no network at all. |
-| `egress.allow`, `egress.deny` | Host patterns: an exact DNS name, or `*.` and a suffix (matches names under it, not the suffix itself). An IP literal matches only that address. The most specific match wins; on a tie, deny. At most 1024 each. |
+| `egress.allow`, `egress.deny` | Host entries: an exact DNS name, `*.` and a suffix (matches names under it, not the suffix itself), or an address prefix such as `10.0.0.0/8` or `2001:db8::/32` (no bits set below the length). An IP literal is the prefix of its full length. At most 1024 each. How they decide is below. |
 | `ports` | The destination ports allowed, or `null` for any port. |
 | `localBind` | May bind and listen on TCP and UDP ports. In isolated mode those listeners are in the sandbox's own network, reachable only from inside it and through `tcp.open` with the command's `execId` (tunnels.md). |
 | `unixSockets` | May create Unix domain sockets (bind or connect). Filesystem sockets also need their directory writable. |
+
+How `egress` decides, in two steps that never compare a name with a prefix:
+
+1. **The host.** A DNS name is decided by the name entries alone: the most specific match wins (an
+   exact name over any `*.` pattern, a longer suffix over a shorter one), deny on a tie, and
+   `default` when none matches. An IP literal is decided the same way by the prefixes alone, the
+   longest one winning. A prefix never admits a name, so a name no entry allows is refused under
+   `default: "deny"` without being resolved.
+2. **Its addresses.** Each address the host resolves to is decided by the longest prefix
+   containing it, deny on a tie. A prefix that denies an address drops it even when a name entry
+   allowed the host, and a prefix that denies the IPv4 address an IPv6 one carries (NAT64, 6to4)
+   drops that too. A prefix that allows an address lets it through even if it is internal. An
+   address no prefix contains is dropped if it is internal (below). The connection uses the
+   addresses that are left.
+
+So `allow: ["db.corp.example"]` with `deny: ["10.0.0.0/8"]` refuses `db.corp.example` if it
+resolves only into `10.0.0.0/8`, and `allow: ["10.0.0.0/8"]` alone lets a command reach
+`10.1.2.3` but not a name that resolves to it.
 
 How isolated networking works (proxy.md, "Egress proxy"):
 
@@ -115,14 +133,15 @@ How isolated networking works (proxy.md, "Egress proxy"):
   Windows a firewall filter keyed on the sandbox's identity allows only those ports on loopback.
 * The proxies resolve the name themselves, check the host against `egress` and the port against
   `ports`, and then refuse any resolved address that is loopback, private, link-local, CGNAT,
-  multicast or the node's own, unless the policy names that literal IP in `egress.allow`.
+  multicast or the node's own, unless a prefix in `egress.allow` decides that address.
 * Seatbelt cannot tell loopback from other local addresses, so on macOS an isolated command
   with `localBind` may listen on any local address and accept connections from other hosts, and
   it cannot connect to its own listeners. The macOS probe lists this in `gaps`.
 * UDP (including direct DNS) and other protocols have no route in isolated mode. Name resolution
   happens in the proxy.
 * Hosts listed in the command's credential `proxy.hosts` (proxy.md) go to the control plane, which
-  can inject credentials. They must also pass `egress`.
+  can inject credentials. They must also pass `egress` step 1; their addresses are the control
+  plane's to resolve and check.
 
 ## What each platform requires
 

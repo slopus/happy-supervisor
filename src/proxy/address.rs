@@ -48,7 +48,7 @@ fn internal_v6(ip: Ipv6Addr) -> bool {
 
 /// The IPv4 address an IPv6 address delivers to: IPv4-compatible `::a.b.c.d`, NAT64
 /// `64:ff9b::a.b.c.d` and 6to4 `2002:aabb:ccdd::`. IPv4-mapped is already canonical.
-fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+pub(crate) fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = ip.segments();
     let low = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
     match s {

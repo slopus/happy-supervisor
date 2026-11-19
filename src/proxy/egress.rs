@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
 use super::{ProxyManager, address, http, socks5};
-use crate::policy::{HostRules, host_allowed};
+use crate::policy::HostRules;
 use crate::protocol::{
     DenyReason, ExecId, HostPattern, NetDenied, ProxyToken, TCP_CONNECT_TIMEOUT_MS, Via,
 };
@@ -80,8 +80,6 @@ pub(crate) enum Route {
 struct Egress {
     rules: HostRules,
     ports: Option<Vec<u16>>,
-    /// IP literals in `egress.allow`, which the address filter lets through.
-    literals: Vec<IpAddr>,
 }
 
 /// One command's proxies, shared by their connections.
@@ -105,7 +103,7 @@ impl Command {
         if self.credential_host(host) {
             return match (via, &self.egress) {
                 (Via::Socks5, _) => self.refuse(host, port, via, DenyReason::Credential),
-                (Via::Http, Some(egress)) if !host_allowed(&egress.rules, host) => {
+                (Via::Http, Some(egress)) if !egress.rules.allows_host(host) => {
                     self.refuse(host, port, via, DenyReason::Egress)
                 }
                 (Via::Http, _) => Route::Credential,
@@ -117,7 +115,7 @@ impl Command {
                 None => Route::Unresolved,
             };
         };
-        if !host_allowed(&egress.rules, host) {
+        if !egress.rules.allows_host(host) {
             return self.refuse(host, port, via, DenyReason::Egress);
         }
         if egress
@@ -131,13 +129,17 @@ impl Command {
             return self.refuse(host, port, via, DenyReason::Resolve);
         };
         let own = address::own_addresses();
-        let allowed: Vec<SocketAddr> = ips
-            .into_iter()
-            .filter(|ip| egress.literals.contains(ip) || !address::internal(*ip, &own))
-            .map(|ip| (ip, port).into())
-            .collect();
+        let mut allowed = Vec::new();
+        let mut reason = DenyReason::Address;
+        for ip in ips {
+            match reachable(&egress.rules, ip, &own) {
+                Ok(()) => allowed.push((ip, port).into()),
+                Err(DenyReason::Egress) => reason = DenyReason::Egress,
+                Err(_) => {}
+            }
+        }
         if allowed.is_empty() {
-            return self.refuse(host, port, via, DenyReason::Address);
+            return self.refuse(host, port, via, reason);
         }
         Route::Direct(allowed)
     }
@@ -179,6 +181,26 @@ impl Command {
             });
         }
         Route::Refused(reason)
+    }
+}
+
+/// Whether an isolated command may connect to `ip`, one address of a host `egress` allows. The
+/// most specific prefix containing it decides (`egress` when it denies); one that denies the
+/// IPv4 address it carries (NAT64, 6to4) also drops it. With no prefix, it must not be internal
+/// (`address`).
+fn reachable(rules: &HostRules, ip: IpAddr, own: &[IpAddr]) -> Result<(), DenyReason> {
+    let carried = match ip {
+        IpAddr::V6(v6) => address::embedded_v4(v6),
+        IpAddr::V4(_) => None,
+    };
+    if carried.is_some_and(|v4| rules.address(v4.into()) == Some(false)) {
+        return Err(DenyReason::Egress);
+    }
+    match rules.address(ip) {
+        Some(true) => Ok(()),
+        Some(false) => Err(DenyReason::Egress),
+        None if address::internal(ip, own) => Err(DenyReason::Address),
+        None => Ok(()),
     }
 }
 
@@ -375,15 +397,7 @@ pub async fn start(cfg: CommandProxyConfig, node: &ProxyManager) -> io::Result<C
         }
         _ => None,
     };
-    let egress = egress.map(|(rules, ports)| Egress {
-        literals: rules
-            .allow
-            .iter()
-            .filter_map(|entry| normalize(entry).parse::<IpAddr>().ok())
-            .collect(),
-        rules,
-        ports,
-    });
+    let egress = egress.map(|(rules, ports)| Egress { rules, ports });
     let command = Arc::new(Command {
         exec_id,
         egress,

@@ -42,12 +42,13 @@ For each outbound request the command proxy decides, in order:
    host must also pass `egress`, or the request is refused; `ports` does not apply, since the
    control plane decides where the request goes. Through SOCKS5 a credential host is refused,
    since the node can only rewrite HTTP.
-2. **Egress check**, isolated mode only. The host must pass `network.egress` and the port must be
-   in `network.ports`.
+2. **Egress check**, isolated mode only. The host must pass `network.egress` (policy.md, How
+   `egress` decides, step 1) and the port must be in `network.ports`.
 3. **Resolve and connect.** The proxy resolves the name itself. In isolated mode it drops every
-   address that is loopback, private (RFC 1918, ULA), link-local, CGNAT (100.64/10), Azure's 168.63.129.16, multicast,
-   unspecified or one of the node's own, unless `egress.allow` names that literal IP. It tries
-   the remaining addresses in order and uses the first that accepts.
+   address that an `egress` prefix denies, and every address no prefix decides that is loopback,
+   private (RFC 1918, ULA), link-local, CGNAT (100.64/10), Azure's 168.63.129.16, multicast,
+   unspecified or one of the node's own (policy.md, How `egress` decides, step 2). It tries the
+   remaining addresses in order and uses the first that accepts.
 4. **Tunnel.** HTTP `CONNECT` and SOCKS5 `CONNECT` splice bytes; absolute-form `http://` requests
    are forwarded with hop-by-hop headers removed. Only the credential route terminates TLS.
 
@@ -63,10 +64,11 @@ counted in the next event's `dropped`:
 { "kind": "net.denied", "body": { "execId": "e_1", "host": "evil.example", "port": 443, "via": "http", "reason": "egress" } }
 ```
 
-`reason` is `egress`, `port`, `address` (every resolved address was filtered), `resolve` (no
-address) or `credential` (a credential host through SOCKS5). `via` is `http` or `socks5`. In host
-mode a name that does not resolve is not a policy decision: the client gets HTTP `502` or SOCKS5
-reply `0x04`, and no event is sent.
+`reason` is `egress` (`egress` denied the host, or every address was dropped and a prefix denied
+at least one), `port`, `address` (every resolved address was internal), `resolve` (no address) or
+`credential` (a credential host through SOCKS5). `via` is `http` or `socks5`. In host mode a name
+that does not resolve is not a policy decision: the client gets HTTP `502` or SOCKS5 reply
+`0x04`, and no event is sent.
 
 ## What the command gets
 

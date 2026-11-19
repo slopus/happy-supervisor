@@ -34,8 +34,8 @@ pub struct RuleSet {
 #[serde(deny_unknown_fields)]
 pub struct HostRules {
     pub default: Default,
-    pub allow: Vec<String>,
-    pub deny: Vec<String>,
+    pub allow: Vec<HostEntry>,
+    pub deny: Vec<HostEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,9 +139,6 @@ impl Policy {
         if let Network::Isolated { egress, ports, .. } = &self.network {
             for (list, hosts) in [("allow", &egress.allow), ("deny", &egress.deny)] {
                 check_len(&format!("egress.{list}"), hosts.len())?;
-                for host in hosts {
-                    validate_host_pattern(host)?;
-                }
             }
             if ports.as_ref().is_some_and(|ports| ports.contains(&0)) {
                 return Err(Error::invalid_params("policy ports cannot contain 0"));
@@ -191,18 +188,186 @@ fn validate_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// An exact DNS name, `*.` and a DNS name, or an IP literal (IPv6 with or without brackets).
-fn validate_host_pattern(pattern: &str) -> Result<()> {
-    if ip_literal(pattern).is_some() {
-        return Ok(());
+/// One `egress.allow` or `egress.deny` entry (policy.md, Network).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum HostEntry {
+    /// Exactly this DNS name, lowercase.
+    Name(String),
+    /// `*.suffix`: every name under `suffix`, not `suffix` itself.
+    Suffix(String),
+    /// An address prefix. A bare IP literal is the prefix of its full length.
+    Prefix(Prefix),
+}
+
+impl HostEntry {
+    /// How specific the entry is for the DNS name `host` (the labels it names, one more for an
+    /// exact name), or `None` when it does not match.
+    fn name_match(&self, host: &str) -> Option<usize> {
+        let labels = |name: &str| name.split('.').count();
+        match self {
+            HostEntry::Name(name) => name.eq_ignore_ascii_case(host).then(|| labels(name) + 1),
+            HostEntry::Suffix(suffix) => {
+                let cut = host.len().checked_sub(suffix.len() + 1)?;
+                let below = cut > 0
+                    && host.as_bytes()[cut] == b'.'
+                    && host[cut + 1..].eq_ignore_ascii_case(suffix);
+                below.then(|| labels(suffix))
+            }
+            HostEntry::Prefix(_) => None,
+        }
     }
-    let name = pattern.strip_prefix("*.").unwrap_or(pattern);
-    if is_dns_name(name) {
-        return Ok(());
+
+    /// The prefix length when the entry is a prefix containing `ip`.
+    fn address_match(&self, ip: IpAddr) -> Option<usize> {
+        match self {
+            HostEntry::Prefix(prefix) => prefix.contains(ip).then_some(prefix.len.into()),
+            HostEntry::Name(_) | HostEntry::Suffix(_) => None,
+        }
     }
-    Err(Error::invalid_params(format!(
-        "policy host {pattern:?} is not a DNS name, *.name or an IP address"
-    )))
+}
+
+impl TryFrom<String> for HostEntry {
+    type Error = Error;
+
+    fn try_from(entry: String) -> Result<HostEntry> {
+        if let Some(prefix) = Prefix::parse(&entry)? {
+            return Ok(HostEntry::Prefix(prefix));
+        }
+        let lower = entry.to_ascii_lowercase();
+        match lower.strip_prefix("*.") {
+            Some(suffix) if is_dns_name(suffix) => Ok(HostEntry::Suffix(suffix.to_owned())),
+            None if is_dns_name(&lower) => Ok(HostEntry::Name(lower)),
+            _ => Err(Error::invalid_params(format!(
+                "policy host {entry:?} is not a DNS name, *.name, an IP address or a prefix"
+            ))),
+        }
+    }
+}
+
+impl TryFrom<&str> for HostEntry {
+    type Error = Error;
+
+    fn try_from(entry: &str) -> Result<HostEntry> {
+        HostEntry::try_from(entry.to_owned())
+    }
+}
+
+impl From<HostEntry> for String {
+    fn from(entry: HostEntry) -> String {
+        match entry {
+            HostEntry::Name(name) => name,
+            HostEntry::Suffix(suffix) => format!("*.{suffix}"),
+            HostEntry::Prefix(prefix) => prefix.to_string(),
+        }
+    }
+}
+
+/// An IPv4 or IPv6 network: `network/len`, with no bits set below `len`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    network: IpAddr,
+    len: u8,
+}
+
+impl Prefix {
+    /// `a.b.c.d/n`, `v6/n`, or a bare IP literal (IPv6 with or without brackets). `None` when
+    /// `text` is not an address at all. An IPv4-mapped IPv6 prefix becomes the IPv4 one.
+    fn parse(text: &str) -> Result<Option<Prefix>> {
+        let bad = |why: String| Error::invalid_params(format!("policy host {text:?} {why}"));
+        let (network, len) = match text.split_once('/') {
+            None => match ip_literal(text) {
+                Some(ip) => (ip, None),
+                None => return Ok(None),
+            },
+            Some((address, len)) => {
+                let Ok(address) = address.parse::<IpAddr>() else {
+                    return Err(bad("is not an IP address and a prefix length".into()));
+                };
+                let len = len
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|len| *len <= max_len(address))
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "has a prefix length that is not 0 to {}",
+                            max_len(address)
+                        ))
+                    })?;
+                (address, Some(len))
+            }
+        };
+        let mut len = len.unwrap_or(max_len(network));
+        let network = match network {
+            IpAddr::V6(v6) if len >= 96 => match v6.to_ipv4_mapped() {
+                Some(v4) => {
+                    len -= 96;
+                    IpAddr::V4(v4)
+                }
+                None => network,
+            },
+            _ => network,
+        };
+        let prefix = Prefix { network, len };
+        if prefix.host_bits(network) != 0 {
+            return Err(bad(format!(
+                "has bits set below its prefix length; the network is {}",
+                Prefix {
+                    network: prefix.masked(),
+                    len
+                }
+            )));
+        }
+        Ok(Some(prefix))
+    }
+
+    /// Whether `ip` (IPv4-mapped counts as IPv4) is in the network.
+    pub fn contains(self, ip: IpAddr) -> bool {
+        let bits = |ip: IpAddr| match ip {
+            IpAddr::V4(v4) => u128::from(u32::from(v4)),
+            IpAddr::V6(v6) => u128::from(v6),
+        };
+        let ip = ip.to_canonical();
+        if self.network.is_ipv4() != ip.is_ipv4() {
+            return false;
+        }
+        let shift = u32::from(max_len(ip) - self.len);
+        (bits(ip) ^ bits(self.network))
+            .checked_shr(shift)
+            .unwrap_or(0)
+            == 0
+    }
+
+    fn host_bits(self, ip: IpAddr) -> u128 {
+        let shift = u32::from(max_len(ip) - self.len);
+        let mask = 1u128.checked_shl(shift).unwrap_or(0).wrapping_sub(1);
+        match ip {
+            IpAddr::V4(v4) => u128::from(u32::from(v4)) & mask,
+            IpAddr::V6(v6) => u128::from(v6) & mask,
+        }
+    }
+
+    fn masked(self) -> IpAddr {
+        let host = self.host_bits(self.network);
+        match self.network {
+            IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & !(host as u32)).into()),
+            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !host).into()),
+        }
+    }
+}
+
+impl std::fmt::Display for Prefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.len == max_len(self.network) {
+            write!(f, "{}", self.network)
+        } else {
+            write!(f, "{}/{}", self.network, self.len)
+        }
+    }
+}
+
+fn max_len(ip: IpAddr) -> u8 {
+    if ip.is_ipv4() { 32 } else { 128 }
 }
 
 fn is_dns_name(name: &str) -> bool {
@@ -224,45 +389,37 @@ fn ip_literal(text: &str) -> Option<IpAddr> {
         .strip_prefix('[')
         .and_then(|t| t.strip_suffix(']'))
         .unwrap_or(text);
-    bare.parse().ok()
+    bare.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
 }
 
-/// Whether `rules` let a connection to `host` through: the most specific matching pattern
-/// decides, deny on a tie, and `default` when none matches. An exact name is more specific than
-/// any `*.` pattern that matches it, and a longer suffix more than a shorter one. An IP host
-/// matches only the same IP literal.
-pub fn host_allowed(rules: &HostRules, host: &str) -> bool {
-    let host = host.strip_suffix('.').unwrap_or(host);
-    let most_specific = |patterns: &[String]| {
-        patterns
-            .iter()
-            .filter_map(|pattern| host_match(pattern, host))
-            .max()
-    };
-    match (most_specific(&rules.allow), most_specific(&rules.deny)) {
-        (Some(allow), Some(deny)) => allow > deny,
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => rules.default == Default::Allow,
-    }
-}
-
-/// How specific `pattern` is for `host` (the labels it names, one more for an exact match), or
-/// `None` when it does not match.
-fn host_match(pattern: &str, host: &str) -> Option<usize> {
-    if let Some(ip) = ip_literal(host) {
-        return (ip_literal(pattern) == Some(ip)).then_some(usize::MAX);
-    }
-    let labels = |name: &str| name.split('.').count();
-    match pattern.strip_prefix("*.") {
-        Some(suffix) => {
-            let cut = host.len().checked_sub(suffix.len() + 1)?;
-            let below = cut > 0
-                && host.as_bytes()[cut] == b'.'
-                && host[cut + 1..].eq_ignore_ascii_case(suffix);
-            below.then(|| labels(suffix))
+impl HostRules {
+    /// Whether a connection to `host` may go on to be resolved: a DNS name is decided by the
+    /// name entries alone, an IP literal by the prefixes alone. The most specific matching entry
+    /// decides, deny on a tie, and `default` when none matches.
+    pub fn allows_host(&self, host: &str) -> bool {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        match ip_literal(host) {
+            Some(ip) => self.address(ip),
+            None => self.decide(|entry| entry.name_match(host)),
         }
-        None => pattern.eq_ignore_ascii_case(host).then(|| labels(host) + 1),
+        .unwrap_or(self.default == Default::Allow)
+    }
+
+    /// What the prefixes decide for one address of an allowed host: `Some(true)` lets it
+    /// through even if it is internal, `Some(false)` drops it, and `None` (no prefix contains
+    /// it) leaves it to the internal-address filter.
+    pub fn address(&self, ip: IpAddr) -> Option<bool> {
+        self.decide(|entry| entry.address_match(ip))
+    }
+
+    fn decide(&self, specificity: impl Fn(&HostEntry) -> Option<usize>) -> Option<bool> {
+        let most_specific = |entries: &[HostEntry]| entries.iter().filter_map(&specificity).max();
+        match (most_specific(&self.allow), most_specific(&self.deny)) {
+            (Some(allow), Some(deny)) => Some(allow > deny),
+            (Some(_), None) => Some(true),
+            (None, Some(_)) => Some(false),
+            (None, None) => None,
+        }
     }
 }
 
@@ -662,7 +819,10 @@ mod tests {
                 network: Network::Isolated {
                     egress: HostRules {
                         default: Default::Deny,
-                        allow: vec!["github.com".into(), "*.githubusercontent.com".into()],
+                        allow: vec![
+                            HostEntry::Name("github.com".into()),
+                            HostEntry::Suffix("githubusercontent.com".into()),
+                        ],
                         deny: vec![],
                     },
                     ports: Some(vec![443, 22]),
@@ -739,8 +899,9 @@ mod tests {
             "ports": null, "localBind": false, "unixSockets": false
         });
         assert!(
-            error(serde_json::json!({ "filesystem": fs, "network": bad_host }))
-                .contains(r#"policy host "git*.com" is not a DNS name, *.name or an IP address"#)
+            error(serde_json::json!({ "filesystem": fs, "network": bad_host })).contains(
+                r#"policy host "git*.com" is not a DNS name, *.name, an IP address or a prefix"#
+            )
         );
     }
 
@@ -896,19 +1057,32 @@ mod tests {
         assert_eq!(paths, [private, bundle]);
     }
 
+    fn hosts(default: Default, allow: &[&str], deny: &[&str]) -> HostRules {
+        let entries = |list: &[&str]| -> Vec<HostEntry> {
+            list.iter()
+                .map(|entry| HostEntry::try_from(*entry).unwrap())
+                .collect()
+        };
+        HostRules {
+            default,
+            allow: entries(allow),
+            deny: entries(deny),
+        }
+    }
+
     #[test]
     fn hosts_match_the_most_specific_pattern() {
-        let rules = HostRules {
-            default: Default::Deny,
-            allow: vec![
-                "github.com".into(),
-                "*.githubusercontent.com".into(),
-                "*.example.com".into(),
-                "10.0.0.1".into(),
-                "[::1]".into(),
+        let rules = hosts(
+            Default::Deny,
+            &[
+                "github.com",
+                "*.githubusercontent.com",
+                "*.example.com",
+                "10.0.0.1",
+                "[::1]",
             ],
-            deny: vec!["*.evil.example.com".into(), "github.com".into()],
-        };
+            &["*.evil.example.com", "GitHub.com"],
+        );
         let cases = [
             ("github.com", false),
             ("raw.githubusercontent.com", true),
@@ -922,19 +1096,81 @@ mod tests {
             ("10.0.0.2", false),
             ("::1", true),
             ("[0:0::1]", true),
+            ("::ffff:10.0.0.1", true),
             ("other.org", false),
         ];
         for (host, allowed) in cases {
-            assert_eq!(host_allowed(&rules, host), allowed, "{host}");
+            assert_eq!(rules.allows_host(host), allowed, "{host}");
         }
-        let open = HostRules {
-            default: Default::Allow,
-            allow: vec![],
-            deny: vec!["*.tracker.net".into(), "1.2.3.4".into()],
-        };
-        assert!(host_allowed(&open, "anything.org"));
-        assert!(!host_allowed(&open, "a.tracker.net"));
-        assert!(!host_allowed(&open, "1.2.3.4"));
-        assert!(host_allowed(&open, "tracker.net"));
+        let open = hosts(Default::Allow, &[], &["*.tracker.net", "1.2.3.4"]);
+        assert!(open.allows_host("anything.org"));
+        assert!(!open.allows_host("a.tracker.net"));
+        assert!(!open.allows_host("1.2.3.4"));
+        assert!(open.allows_host("tracker.net"));
+    }
+
+    #[test]
+    fn prefixes_decide_addresses_and_never_names() {
+        let rules = hosts(
+            Default::Deny,
+            &[
+                "10.0.0.0/8",
+                "10.1.2.3",
+                "2001:db8::/32",
+                "api.corp.example",
+            ],
+            &["10.1.0.0/16", "2001:db8:bad::/48", "0.0.0.0/0"],
+        );
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let cases = [
+            ("10.9.9.9", Some(true)),
+            ("10.1.9.9", Some(false)),
+            ("10.1.2.3", Some(true)),
+            ("::ffff:10.9.9.9", Some(true)),
+            ("192.0.2.1", Some(false)),
+            ("2001:db8::1", Some(true)),
+            ("2001:db8:bad::1", Some(false)),
+            ("2001:db9::1", None),
+        ];
+        for (address, verdict) in cases {
+            assert_eq!(rules.address(ip(address)), verdict, "{address}");
+        }
+        assert!(rules.allows_host("10.9.9.9"));
+        assert!(!rules.allows_host("10.1.9.9"));
+        assert!(!rules.allows_host("2001:db9::1"));
+        // A name is decided by the names alone, whatever its addresses are.
+        assert!(rules.allows_host("api.corp.example"));
+        assert!(!rules.allows_host("db.corp.example"));
+        assert_eq!(rules.address(ip("10.1.0.1")), Some(false));
+    }
+
+    #[test]
+    fn host_entries_parse_and_print_canonically() {
+        let round = |entry: &str| String::from(HostEntry::try_from(entry).unwrap());
+        assert_eq!(round("10.0.0.0/8"), "10.0.0.0/8");
+        assert_eq!(round("10.0.0.1/32"), "10.0.0.1");
+        assert_eq!(round("[::1]"), "::1");
+        assert_eq!(round("2001:DB8::/32"), "2001:db8::/32");
+        assert_eq!(round("::ffff:10.0.0.0/104"), "10.0.0.0/8");
+        assert_eq!(round("0.0.0.0/0"), "0.0.0.0/0");
+        assert_eq!(round("::/0"), "::/0");
+        assert_eq!(round("*.Example.COM"), "*.example.com");
+        let error = |entry: &str| HostEntry::try_from(entry).unwrap_err().to_string();
+        assert_eq!(
+            error("10.0.0.1/8"),
+            r#"policy host "10.0.0.1/8" has bits set below its prefix length; the network is 10.0.0.0/8"#
+        );
+        assert_eq!(
+            error("10.0.0.0/33"),
+            r#"policy host "10.0.0.0/33" has a prefix length that is not 0 to 32"#
+        );
+        assert_eq!(
+            error("example.com/8"),
+            r#"policy host "example.com/8" is not an IP address and a prefix length"#
+        );
+        assert_eq!(
+            error("git*.com"),
+            r#"policy host "git*.com" is not a DNS name, *.name, an IP address or a prefix"#
+        );
     }
 }

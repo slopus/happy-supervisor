@@ -28,6 +28,7 @@ The contract:
 * [docs/policy.md](docs/policy.md) covers what a sandbox policy grants, and how each platform enforces it.
 * [docs/node-info.md](docs/node-info.md) covers the machine description the node reports.
 * [docs/serve.md](docs/serve.md) covers the local listener and the Rust `Controller`.
+* [SECURITY.md](SECURITY.md) lists the security requirements every change must keep.
 * [docs/architecture.md](docs/architecture.md) covers the modules, the sandbox helper and the link session.
 
 The library exports the wire types (`happy_supervisor::protocol`), the sans-IO link session

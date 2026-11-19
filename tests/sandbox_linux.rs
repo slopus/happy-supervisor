@@ -14,7 +14,7 @@ use std::process::{Child, Stdio};
 
 use happy_supervisor::helper::{self, Job, JobOp};
 use happy_supervisor::policy::{Default, HostRules, Network, Policy, ResolvedPolicy, RuleSet};
-use happy_supervisor::protocol::{AbsPath, Argv, SandboxStatus};
+use happy_supervisor::protocol::{AbsPath, Argv, Mechanism, SandboxStatus};
 use happy_supervisor::sandbox::{self, Endpoint, NetPlan, Plan, Prepared};
 
 const EXE: &str = env!("CARGO_BIN_EXE_happy-supervisor");
@@ -325,6 +325,13 @@ fn probe_runs_a_sandboxed_true() {
     helper::set_exe(EXE.into());
     let info = sandbox::probe();
     assert_eq!(info.status, SandboxStatus::Available);
+    let Mechanism::Bubblewrap {
+        version: Some(version),
+    } = info.mechanism
+    else {
+        panic!("not bubblewrap: {:?}", info.mechanism);
+    };
+    assert!(version.starts_with("0."), "{version}");
     assert_eq!(info.baseline_read, sandbox::baseline_read());
     assert!(info.gaps.len() >= 4, "{:?}", info.gaps);
 }
@@ -399,12 +406,11 @@ fn read_default_deny_with_allow_holes_and_deeper_denies() {
 }
 
 #[test]
-fn write_allows_changes_and_deeper_write_denies_hold() {
+fn write_implies_read_and_deeper_write_denies_hold() {
     let tree = Tree::new();
     tree.file("work/existing", "old");
     tree.file("work/locked/file", "keep");
-    let mut allow: Vec<String> = sandbox::baseline_read();
-    allow.push(tree.path("work").to_str().unwrap().to_string());
+    let allow: Vec<String> = sandbox::baseline_read();
     let allow: Vec<&str> = allow.iter().map(String::as_str).collect();
     let p = tree.resolve(
         tree.rules(Default::Deny, &allow, &[]),
@@ -420,7 +426,8 @@ fn write_allows_changes_and_deeper_write_denies_hold() {
             ),
             ("oldnew\n".into(), 0),
         ),
-        (format!("cat {w}/locked/file"), ("keep".into(), 0)),
+        // Write-denied, and the read rules do not allow it either.
+        (format!("cat {w}/locked/file"), ("".into(), 1)),
         (format!("echo x > {w}/locked/file"), ("".into(), 2)),
         (format!("touch {w}/locked/new"), ("".into(), 1)),
         (format!("rm {w}/locked/file"), ("".into(), 1)),

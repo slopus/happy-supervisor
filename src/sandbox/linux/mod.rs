@@ -429,9 +429,8 @@ pub fn probe() -> SandboxInfo {
         SandboxStatus::Unavailable { .. } => Vec::new(),
     };
     SandboxInfo {
-        // Becomes `Bubblewrap { version }` with the v2 SandboxInfo.
-        mechanism: Mechanism::Landlock {
-            abi: Some(landlock_abi()),
+        mechanism: Mechanism::Bubblewrap {
+            version: Bwrap::get().ok().map(|bwrap| bwrap.version),
         },
         status,
         baseline_read: super::baseline_read(),

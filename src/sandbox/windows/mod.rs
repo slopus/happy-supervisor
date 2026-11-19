@@ -44,6 +44,7 @@ const MIN_BUILD: u32 = 17763;
 const GAPS: &[&str] = &[
     "the sandbox reads as a separate unprivileged account: under read.default deny it can still read what any local user can (the Windows and Program Files directories and other world-readable data), and under read.default allow it cannot read the supervisor account's private files (its profile) unless read.allow lists them",
     "under write.default allow the sandbox writes what an unprivileged local account may write, plus write.allow",
+    "under write.default deny the token is write-restricted, and Windows gives a restricted token no Schannel credentials: TLS through Schannel (curl.exe, PowerShell and .NET) fails with SEC_E_NO_CREDENTIALS, while programs with their own TLS (OpenSSL, rustls, Go, Node, Python) work",
     "an ACE is added at each policy path and inherited below it; a file or directory below with inheritance disabled or its own explicit ACE keeps that",
     "unixSockets false is not enforced: AF_UNIX sockets can be created and connected in directories the policy lets the sandbox use",
     "localBind false blocks TCP listen; UDP sockets can still be bound",

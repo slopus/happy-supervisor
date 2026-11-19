@@ -935,9 +935,16 @@ session, `node.ready` goes first.
 
 ## Control-plane library
 
-A control plane written in Rust uses this crate's side of the link instead of reimplementing it.
-The protocol types are in `protocol`, the codec in `wire`, and every link rule in
-`link::Session`. Two pieces connect them to a server:
+A control plane written in Rust uses this crate's side of the link instead of reimplementing it:
+
+```toml
+happy-supervisor = { git = "https://github.com/slopus/happy-supervisor", default-features = false, features = ["control-plane"] }
+```
+
+The `control-plane` feature builds only `protocol` (the types), `wire` (the codec), `link`
+(`Session`, every link rule), `ws` (the socket and `upgrade`), `server` and `error`, with none of
+the node: no processes, sandbox, files, watches, proxies or state directory. The default `node`
+feature is the supervisor. Two pieces connect the link to a server:
 
 * `ws::upgrade(&mut request, level)` accepts a node's WebSocket after the control plane has
   checked its `Authorization`. It works with any `http::Request` that hyper upgrades, including

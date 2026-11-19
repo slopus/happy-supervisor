@@ -35,6 +35,9 @@ jobs:
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent true
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The control plane's library alone, so no node-only dependency leaks into it.
+      - run: cargo clippy --lib --no-default-features --features control-plane -- -D warnings
+      - run: cargo test --lib --no-default-features --features control-plane
       - run: cargo build --all-targets --all-features
       - run: cargo test --all-features
       # Timing tests, alone so nothing else competes for the CPU, and in release as shipped.

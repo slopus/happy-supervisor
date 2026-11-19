@@ -1,9 +1,10 @@
 # happy-supervisor architecture
 
 One Rust crate, `happy-supervisor`, with a library (`src/lib.rs`) and a binary (`src/main.rs`).
-The library is what the binary runs, and what a Rust control plane can depend on for the wire
-types (`protocol`) and the in-process test control plane (`testing`, behind the `testing`
-feature).
+The library is what the binary runs (feature `node`, the default), and what a Rust control plane
+depends on for its side of the link (feature `control-plane` alone: `protocol`, `wire`, `link`,
+`ws`, `server`; api.md, Control-plane library). The in-process test control plane is `testing`,
+behind the `testing` feature.
 
 Targets: `x86_64`/`aarch64` × `linux` (gnu), `apple-darwin`, `pc-windows-msvc`.
 

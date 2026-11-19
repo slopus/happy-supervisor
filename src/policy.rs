@@ -300,22 +300,23 @@ impl Rules {
 
     /// The decision of the entry that is the longest whole-component prefix of `path`.
     fn allows(&self, path: &Path) -> bool {
+        self.entry(path).unwrap_or(self.default == Default::Allow)
+    }
+
+    /// The decision of the deepest entry at or above `path`, or `None` when the default decides.
+    fn entry(&self, path: &Path) -> Option<bool> {
         path.ancestors()
             .find_map(|ancestor| self.entries.get(ancestor).copied())
-            .unwrap_or(self.default == Default::Allow)
     }
 }
 
-/// The decisions only change at an entry, and a path below an entry that no deeper entry names
-/// is decided like the entry. So checking every entry and the defaults covers every path.
+/// A path a `read.deny` entry decides but the write rules allow. A read default never
+/// contradicts: writing implies reading. The decisions only change at an entry, and a path below
+/// an entry that no deeper entry names is decided like the entry, so checking every entry covers
+/// every path.
 fn check_contradiction(read: &Rules, write: &Rules) -> Result<()> {
-    if write.default == Default::Allow && read.default == Default::Deny {
-        return Err(Error::invalid_params(
-            "policy denies reading by default but allows writing by default",
-        ));
-    }
     for path in read.entries.keys().chain(write.entries.keys()) {
-        if write.allows(path) && !read.allows(path) {
+        if write.allows(path) && read.entry(path) == Some(false) {
             return Err(Error::invalid_params(format!(
                 "policy denies reading {} but allows writing it",
                 path.display()
@@ -829,20 +830,24 @@ mod tests {
             rules(Default::Deny, &[], &[]),
             rules(Default::Deny, &["/work"], &[]),
         );
-        assert_eq!(
-            p.validate(),
-            Err(Error::invalid_params(
-                "policy denies reading /work but allows writing it"
-            ))
-        );
+        let resolved = ResolvedPolicy::resolve(&p, Path::new("/nonexistent/state")).unwrap();
+        assert!(resolved.can_read(Path::new("/work/a")));
+        assert!(!resolved.can_read(Path::new("/elsewhere")));
         let p = policy(
             rules(Default::Deny, &[], &[]),
+            rules(Default::Allow, &[], &[]),
+        );
+        let resolved = ResolvedPolicy::resolve(&p, Path::new("/nonexistent/state")).unwrap();
+        assert!(resolved.can_read(Path::new("/anything")));
+        assert!(!resolved.can_read(Path::new("/nonexistent/state/key")));
+        let p = policy(
+            rules(Default::Allow, &[], &["/work"]),
             rules(Default::Allow, &[], &[]),
         );
         assert_eq!(
             p.validate(),
             Err(Error::invalid_params(
-                "policy denies reading by default but allows writing by default"
+                "policy denies reading /work but allows writing it"
             ))
         );
         let p = policy(

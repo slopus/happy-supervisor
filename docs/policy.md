@@ -40,8 +40,9 @@ fixed rules in "Fixed rules".
 entry matches, `default` decides. The rule is the same for reads and writes.
 
 **Writing implies reading.** A path the write rules allow is also readable, whatever the read rules
-say about it. A path the read rules deny but the write rules allow is a contradiction the policy
-must not contain; it is `invalid_params`.
+say about it, including `read.default: "deny"`. A path that a `read.deny` entry decides (the most
+specific read entry for it is a deny) but the write rules allow is a contradiction the policy must
+not contain; it is `invalid_params`.
 
 Examples, with `read.default: "deny"`, `read.allow: ["/home/me"]`, `read.deny: ["/home/me/.ssh"]`:
 `/home/me/repo/a.rs` is readable, `/home/me/.ssh/id_ed25519` is not, `/etc/passwd` is not.

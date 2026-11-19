@@ -129,3 +129,5 @@ triggers and `release.yml` do.
 * **0.2.0-linux.3.** The first published release: the code of 0.2.0-linux.2 (never published),
   now built, tested and released by `release.yml` for all five platforms, so it is the first
   with macOS and Windows binaries and `install.ps1`. It is also a GitHub Release.
+* **0.2.0-linux.4.** The first published release, the code of 0.2.0-linux.2 for all five
+  platforms (0.2.0-linux.3 never built: release.yml checked the version by grepping the binary).

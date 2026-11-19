@@ -332,6 +332,15 @@ mod win {
             "winbox: own restricting SIDs {:?}",
             own_restricting.iter().map(Sid::text).collect::<Vec<_>>()
         );
+        // A fully restricted child also needs to read the system's files, which grant Users
+        // and Authenticated Users rather than Everyone.
+        let mut widened = own_restricting;
+        widened.extend([
+            Sid::parse("S-1-5-32-545")?,
+            Sid::parse("S-1-5-11")?,
+            Sid::parse("S-1-5-4")?,
+        ]);
+        let own_restricting = &widened;
         let inherited: Vec<SID_AND_ATTRIBUTES> = own_restricting
             .iter()
             .map(|sid| SID_AND_ATTRIBUTES {
@@ -347,8 +356,8 @@ mod win {
         // Which combination this token accepts depends on how it was itself restricted.
         let mut made = Err(io::Error::other("no attempt"));
         for (flags, restricting) in [
-            (WRITE_RESTRICTED, &inherited[..]),
             (0, &inherited[..]),
+            (WRITE_RESTRICTED, &inherited[..]),
             (0, &[][..]),
             (WRITE_RESTRICTED, &[][..]),
             (WRITE_RESTRICTED, &restrict[..]),

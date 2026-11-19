@@ -379,5 +379,11 @@ async fn commands_and_file_operations_run_as_the_workload_user() {
             None => panic!("the events ended"),
         }
     }
-    assert!(seen.iter().all(|path| expected.contains(path)), "{seen:?}");
+    // FSEvents may also report the root, whose modification time the mkdir changed.
+    let root = shared.display().to_string();
+    assert!(
+        seen.iter()
+            .all(|path| expected.contains(path) || *path == root),
+        "{seen:?}"
+    );
 }

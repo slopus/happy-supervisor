@@ -250,6 +250,104 @@ fn appcontainer_probe() {
         &[&system32("PING.EXE"), "-n", "1", "-w", "500", "example.com"],
     );
 
+    let password = format!("Pr0be!{}", std::process::id());
+    admin(
+        "create a plain user",
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "New-LocalUser -Name hsbxplain -Password (ConvertTo-SecureString '{password}' -AsPlainText -Force) -PasswordNeverExpires | Out-Null; 'created'"
+            ),
+        ],
+    );
+    for (label, argv) in [
+        ("plain user: whoami", vec![system32("whoami.exe")]),
+        (
+            "plain user, container: cmd echo",
+            vec![
+                winbox().to_str().unwrap().to_string(),
+                "container".into(),
+                "hsbx-plain".into(),
+                "none".into(),
+                cmd.clone(),
+                "/c".into(),
+                "echo inside".into(),
+            ],
+        ),
+        (
+            "plain user, container: read win.ini",
+            vec![
+                winbox().to_str().unwrap().to_string(),
+                "container".into(),
+                "hsbx-plain".into(),
+                "none".into(),
+                cmd.clone(),
+                "/c".into(),
+                r"type C:\Windows\win.ini >NUL && echo read".into(),
+            ],
+        ),
+        (
+            "plain user, container: write NUL",
+            vec![
+                winbox().to_str().unwrap().to_string(),
+                "container".into(),
+                "hsbx-plain".into(),
+                "none".into(),
+                cmd.clone(),
+                "/c".into(),
+                "echo x>NUL && echo nul-ok".into(),
+            ],
+        ),
+        (
+            "plain user, container: git --version",
+            vec![
+                winbox().to_str().unwrap().to_string(),
+                "container".into(),
+                "hsbx-plain".into(),
+                "none".into(),
+                git.to_string(),
+                "--version".into(),
+            ],
+        ),
+        (
+            "plain user, container: Schannel",
+            vec![
+                winbox().to_str().unwrap().to_string(),
+                "container".into(),
+                "hsbx-plain".into(),
+                "internetClient".into(),
+                curl.clone(),
+                "-sS".into(),
+                "--max-time".into(),
+                "15".into(),
+                "-w".into(),
+                "%{http_code}".into(),
+                "-o".into(),
+                r"C:\Users\Public\x".into(),
+                "https://example.com".into(),
+            ],
+        ),
+    ] {
+        let output = Command::new(winbox())
+            .args(["logon", "hsbxplain", &password])
+            .args(&argv)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        eprintln!("PROBE {label}: {}", show(output));
+    }
+    admin(
+        "remove the plain user",
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-Command",
+            "Remove-LocalUser -Name hsbxplain; 'removed'",
+        ],
+    );
+
     let in_range = (47800..=47999)
         .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())
         .unwrap();

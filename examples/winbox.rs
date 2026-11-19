@@ -6,6 +6,7 @@
 //! winbox escape <none|user|NAME[,NAME...]> PROGRAM [ARGS...]
 //! winbox container NAME <none|CAP[,CAP...]> PROGRAM [ARGS...]
 //! winbox package-sid NAME
+//! winbox logon USER PASSWORD PROGRAM [ARGS...]   (with the user's profile loaded)
 //! winbox wfp-hold RULE...        (until stdin closes; prints "ready")
 //!   block-package:SID  permit-package-loopback:SID:LO:HI  block-user:SID:PORT
 //! ```
@@ -30,6 +31,7 @@ fn main() {
             0
         }),
         Some("wfp-hold") => win::wfp_hold(&args[1..]),
+        Some("logon") if args.len() >= 4 => win::logon(&args[1], &args[2], &args[3..]),
         _ => Err(std::io::Error::other(
             "bad arguments; see examples/winbox.rs",
         )),
@@ -62,9 +64,10 @@ mod win {
     };
     use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
-        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+        CreateProcessAsUserW, CreateProcessW, CreateProcessWithLogonW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+        GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LOGON_WITH_PROFILE,
+        LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
         STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute, WaitForSingleObject,
     };
@@ -90,6 +93,7 @@ mod win {
 
     const ALREADY_EXISTS: i32 = 0x800700b7_u32 as i32;
     const SE_GROUP_ENABLED: u32 = 0x4;
+    const WRITE_RESTRICTED: u32 = 0x8;
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain([0]).collect()
@@ -287,21 +291,30 @@ mod win {
             })
             .collect();
         let mut token: HANDLE = null_mut();
-        // SAFETY: the SIDs outlive the call.
-        check(unsafe {
-            CreateRestrictedToken(
-                own,
-                0,
-                entries.len() as u32,
-                entries.as_ptr(),
-                0,
-                null(),
-                0,
-                null(),
-                &mut token,
-            )
-        })
-        .map_err(|err| io::Error::other(format!("CreateRestrictedToken: {err}")))?;
+        // A write-restricted token only yields write-restricted ones (ERROR_INVALID_PARAMETER
+        // otherwise), which keeps whatever this process could already do.
+        let mut made = Err(io::Error::other("no attempt"));
+        for flags in [0, WRITE_RESTRICTED] {
+            // SAFETY: the SIDs outlive the call.
+            made = check(unsafe {
+                CreateRestrictedToken(
+                    own,
+                    flags,
+                    entries.len() as u32,
+                    entries.as_ptr(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    &mut token,
+                )
+            });
+            if made.is_ok() {
+                eprintln!("winbox: restricted token flags {flags:#x}");
+                break;
+            }
+        }
+        made.map_err(|err| io::Error::other(format!("CreateRestrictedToken: {err}")))?;
         let disabled: Vec<String> = sids.iter().map(Sid::text).collect();
         eprintln!("winbox: deny-only {disabled:?}");
         let mut line = command_line(argv);
@@ -324,6 +337,35 @@ mod win {
             )
         })
         .map_err(|err| io::Error::other(format!("CreateProcessAsUserW: {err}")))?;
+        wait(info)
+    }
+
+    /// Starts `argv` as `user` with its profile loaded.
+    pub fn logon(user: &str, password: &str, argv: &[String]) -> io::Result<u32> {
+        let mut line = command_line(argv);
+        let startup = startup();
+        let mut info = PROCESS_INFORMATION::default();
+        let system = format!(
+            r"{}\System32",
+            std::env::var("SystemRoot").unwrap_or_default()
+        );
+        // SAFETY: NUL-terminated strings that live across the call; the std handles are open.
+        check(unsafe {
+            CreateProcessWithLogonW(
+                wide(user).as_ptr(),
+                wide(".").as_ptr(),
+                wide(password).as_ptr(),
+                LOGON_WITH_PROFILE,
+                null(),
+                line.as_mut_ptr(),
+                0,
+                null(),
+                wide(&system).as_ptr(),
+                &startup,
+                &mut info,
+            )
+        })
+        .map_err(|err| io::Error::other(format!("CreateProcessWithLogonW: {err}")))?;
         wait(info)
     }
 

@@ -78,6 +78,7 @@ fn grant(path: &Path, sid: &str, rights: &str) {
 }
 
 #[test]
+#[ignore = "an experiment; run it by name"]
 fn appcontainer_probe() {
     let sid = String::from_utf8(
         Command::new(winbox())

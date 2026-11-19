@@ -1019,6 +1019,7 @@ fn release(mut child: std::process::Child) {
 /// its own token deny-only (`winbox escape`), against our group-keyed filters and against
 /// user-keyed blocks as Codex installs them (a WFP filter and a firewall rule).
 #[test]
+#[ignore = "an experiment; CI runs it with --include-ignored"]
 fn token_escapes() {
     let _serial = serial();
     let tree = Tree::new();
@@ -1056,7 +1057,7 @@ fn token_escapes() {
         let pid = started.child.id();
         let (done, finished) = std::sync::mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
-            if finished.recv_timeout(Duration::from_secs(40)).is_err() {
+            if finished.recv_timeout(Duration::from_secs(25)).is_err() {
                 let _ = std::process::Command::new("taskkill")
                     .args(["/F", "/T", "/PID", &pid.to_string()])
                     .output();
@@ -1072,7 +1073,7 @@ fn token_escapes() {
         eprintln!(
             "ROW {label}: exit {:?}{}\n    status: {:?}\n    stdout: {}\n    stderr: {}",
             output.status.code(),
-            if killed { " (killed after 40 s)" } else { "" },
+            if killed { " (killed after 25 s)" } else { "" },
             helper::parse_exec_status(&status).map_err(|err| err.to_string()),
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr)

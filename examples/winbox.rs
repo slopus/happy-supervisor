@@ -61,7 +61,8 @@ mod win {
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, GetTokenInformation, LookupAccountNameW, PSECURITY_DESCRIPTOR, PSID,
         SECURITY_CAPABILITIES, SID, SID_AND_ATTRIBUTES, SID_NAME_USE, TOKEN_ADJUST_DEFAULT,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+        TokenRestrictedSids, TokenUser,
     };
     use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
     use windows_sys::Win32::System::Threading::{
@@ -249,6 +250,32 @@ mod win {
         Ok(unsafe { Sid::copy(user.User.Sid) })
     }
 
+    fn restricting_sids(token: HANDLE) -> io::Result<Vec<Sid>> {
+        let mut buffer = vec![0u64; 512];
+        let mut len = 0u32;
+        // SAFETY: the buffer is 4096 aligned bytes.
+        check(unsafe {
+            GetTokenInformation(
+                token,
+                TokenRestrictedSids,
+                buffer.as_mut_ptr() as *mut c_void,
+                4096,
+                &mut len,
+            )
+        })?;
+        // SAFETY: TokenRestrictedSids fills a TOKEN_GROUPS at the start of the buffer.
+        let groups = unsafe { &*(buffer.as_ptr() as *const TOKEN_GROUPS) };
+        // SAFETY: GroupCount entries follow, each pointing into the buffer.
+        let entries = unsafe {
+            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+        };
+        // SAFETY: each entry's SID lives in the buffer.
+        Ok(entries
+            .iter()
+            .map(|entry| unsafe { Sid::copy(entry.Sid) })
+            .collect())
+    }
+
     fn startup() -> STARTUPINFOW {
         use std::os::windows::io::AsRawHandle as _;
         STARTUPINFOW {
@@ -299,6 +326,19 @@ mod win {
             Sid: everyone.as_psid(),
             Attributes: 0,
         }];
+        // This token's own restricting SIDs: a child restricted the same way still works.
+        let own_restricting = restricting_sids(own)?;
+        eprintln!(
+            "winbox: own restricting SIDs {:?}",
+            own_restricting.iter().map(Sid::text).collect::<Vec<_>>()
+        );
+        let inherited: Vec<SID_AND_ATTRIBUTES> = own_restricting
+            .iter()
+            .map(|sid| SID_AND_ATTRIBUTES {
+                Sid: sid.as_psid(),
+                Attributes: 0,
+            })
+            .collect();
         let disable_ptr = if entries.is_empty() {
             null()
         } else {
@@ -307,6 +347,8 @@ mod win {
         // Which combination this token accepts depends on how it was itself restricted.
         let mut made = Err(io::Error::other("no attempt"));
         for (flags, restricting) in [
+            (WRITE_RESTRICTED, &inherited[..]),
+            (0, &inherited[..]),
             (0, &[][..]),
             (WRITE_RESTRICTED, &[][..]),
             (WRITE_RESTRICTED, &restrict[..]),

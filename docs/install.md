@@ -3,7 +3,7 @@
 ## Linux
 
 On Linux the supervisor's work never runs as root (SECURITY.md). The supervisor runs as root and
-runs every command and file operation as a separate, unprivileged workload user (policy.md,
+runs every command, file operation and watch as a separate, unprivileged workload user (policy.md,
 Workload user). A supervisor running as root refuses to start without `--workload-user`. One
 that is not root runs its work as itself, which is already a separate user.
 

@@ -362,15 +362,9 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
         }
         CommandKind::WatchStart => {
             let WithAccess { params, access } = parse::<WithAccess<WatchStartParams>>(params)?;
-            if let Some(workload) = node.identity.workload() {
-                return Err(Error::sandbox_unavailable(format!(
-                    "this node runs its work as {:?}, and watching as that user is not \
-                     supported yet",
-                    workload.name()
-                )));
-            }
             let confinement = node.confine(access).await?;
-            node.watch.start(params, confinement).await?;
+            let workload = node.identity.workload().cloned();
+            node.watch.start(params, confinement, workload).await?;
             to_value(Empty {})
         }
         CommandKind::TcpOpen => {

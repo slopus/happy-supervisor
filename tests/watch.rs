@@ -164,7 +164,7 @@ async fn reports_created_modified_renamed_and_removed() {
     let (_tmp, root) = tempdir();
     let (mut peer, manager) = Peer::new();
     manager
-        .start(params("w-1", &root, true), Confinement::Raw)
+        .start(params("w-1", &root, true), Confinement::Raw, None)
         .await
         .unwrap();
     peer.wait_live(&root).await;
@@ -212,7 +212,7 @@ async fn a_non_recursive_watch_reports_only_direct_children() {
     std::fs::create_dir(root.join("sub")).unwrap();
     let (mut peer, manager) = Peer::new();
     manager
-        .start(params("w-1", &root, false), Confinement::Raw)
+        .start(params("w-1", &root, false), Confinement::Raw, None)
         .await
         .unwrap();
     peer.wait_live(&root).await;
@@ -235,7 +235,7 @@ async fn many_changes_arrive_in_events_of_at_most_256() {
     let (_tmp, root) = tempdir();
     let (mut peer, manager) = Peer::new();
     manager
-        .start(params("w-1", &root, true), Confinement::Raw)
+        .start(params("w-1", &root, true), Confinement::Raw, None)
         .await
         .unwrap();
     peer.wait_live(&root).await;
@@ -275,7 +275,11 @@ async fn a_sandboxed_watch_hides_the_state_directory() {
     let resolved = ResolvedPolicy::resolve(&policy, &state).unwrap();
     let (mut peer, manager) = Peer::new();
     manager
-        .start(params("w-1", &root, true), Confinement::Sandboxed(resolved))
+        .start(
+            params("w-1", &root, true),
+            Confinement::Sandboxed(resolved),
+            None,
+        )
         .await
         .unwrap();
     peer.wait_live(&root).await;
@@ -307,7 +311,8 @@ async fn a_sandboxed_watch_needs_a_readable_root() {
         manager
             .start(
                 params("w-1", &secret, true),
-                Confinement::Sandboxed(resolved)
+                Confinement::Sandboxed(resolved),
+                None
             )
             .await,
         Err(Error::new(
@@ -327,7 +332,7 @@ async fn removing_the_root_ends_the_watch() {
     std::fs::write(watched.join("inner/f"), b"").unwrap();
     let (mut peer, manager) = Peer::new();
     manager
-        .start(params("w-1", &watched, true), Confinement::Raw)
+        .start(params("w-1", &watched, true), Confinement::Raw, None)
         .await
         .unwrap();
     peer.wait_live(&watched).await;
@@ -355,7 +360,7 @@ async fn removing_the_root_ends_the_watch() {
     // The ID is free again.
     std::fs::create_dir(&watched).unwrap();
     manager
-        .start(params("w-1", &watched, true), Confinement::Raw)
+        .start(params("w-1", &watched, true), Confinement::Raw, None)
         .await
         .unwrap();
     assert_eq!(manager.ids(), [id("w-1")]);
@@ -367,7 +372,11 @@ async fn ids_are_unique_and_a_node_holds_64_watches() {
     let (_peer, manager) = Peer::new();
     for i in 0..64 {
         manager
-            .start(params(&format!("w-{i:02}"), &root, false), Confinement::Raw)
+            .start(
+                params(&format!("w-{i:02}"), &root, false),
+                Confinement::Raw,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -377,7 +386,7 @@ async fn ids_are_unique_and_a_node_holds_64_watches() {
 
     assert_eq!(
         manager
-            .start(params("w-00", &root, false), Confinement::Raw)
+            .start(params("w-00", &root, false), Confinement::Raw, None)
             .await,
         Err(Error::new(
             ErrorKind::AlreadyExists,
@@ -386,14 +395,14 @@ async fn ids_are_unique_and_a_node_holds_64_watches() {
     );
     assert_eq!(
         manager
-            .start(params("w-64", &root, false), Confinement::Raw)
+            .start(params("w-64", &root, false), Confinement::Raw, None)
             .await,
         Err(Error::too_large("this node already has 64 watches"))
     );
 
     manager.stop(&id("w-10")).unwrap();
     manager
-        .start(params("w-64", &root, false), Confinement::Raw)
+        .start(params("w-64", &root, false), Confinement::Raw, None)
         .await
         .unwrap();
     assert_eq!(manager.ids().len(), 64);
@@ -407,7 +416,7 @@ async fn start_needs_an_existing_path_and_stop_a_known_watch() {
     let missing = root.join("missing");
     assert_eq!(
         manager
-            .start(params("w-1", &missing, true), Confinement::Raw)
+            .start(params("w-1", &missing, true), Confinement::Raw, None)
             .await,
         Err(Error::not_found(format!(
             "{}: No such file or directory (os error 2)",

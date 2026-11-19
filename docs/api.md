@@ -917,7 +917,9 @@ On Linux each watch holds one inotify instance and, when recursive, one inotify 
 directory. The OS caps both per user (`fs.inotify.max_user_instances`, by default 128, and
 `fs.inotify.max_user_watches`). A start that hits a cap replies `io`.
 
-A node with a workload user does not support watches yet and replies `sandbox_unavailable`.
+With a workload user, each watch is a helper process running as that user (policy.md, Workload
+user), which can watch only what that user can read, and the caps count against that user. If
+the helper exits, the node sends `overflow` and the watch ends.
 
 ### `watch.stop`
 

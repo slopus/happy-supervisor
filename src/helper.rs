@@ -79,7 +79,8 @@ pub fn encode_job(job: &Job) -> Vec<u8> {
     encode_frame(job)
 }
 
-fn encode_frame<T: Serialize>(value: &T) -> Vec<u8> {
+/// A length-prefixed CBOR frame, as every helper reads and writes.
+pub(crate) fn encode_frame<T: Serialize>(value: &T) -> Vec<u8> {
     let cbor = to_cbor(value);
     let mut frame = Vec::with_capacity(4 + cbor.len());
     frame.extend_from_slice(&(cbor.len() as u32).to_be_bytes());
@@ -98,7 +99,8 @@ pub fn encode_fs_job(request: &FsRequest) -> Vec<u8> {
     encode_frame(request)
 }
 
-fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+/// Reads one [`encode_frame`] frame.
+pub(crate) fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     let mut len = [0u8; 4];
     reader.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -110,6 +112,31 @@ fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<
     let mut cbor = vec![0u8; len];
     reader.read_exact(&mut cbor)?;
     from_cbor(&cbor).map_err(|err| Error::invalid_params(format!("bad job: {err}")))
+}
+
+/// Reads one [`encode_frame`] frame from a helper's output, or `None` at its end.
+#[cfg(unix)]
+pub(crate) async fn read_frame_async<T: serde::de::DeserializeOwned>(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<Option<T>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut len = [0u8; 4];
+    match reader.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_JOB_BYTES {
+        return Err(Error::too_large(format!(
+            "a helper frame is {len} bytes, at most {MAX_JOB_BYTES} are allowed"
+        )));
+    }
+    let mut cbor = vec![0u8; len];
+    reader.read_exact(&mut cbor).await?;
+    from_cbor(&cbor)
+        .map(Some)
+        .map_err(|err| Error::invalid_params(format!("bad helper frame: {err}")))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -208,11 +235,10 @@ pub fn main() -> ! {
 
 #[cfg(unix)]
 fn unix_main() -> ! {
-    if std::env::args_os()
-        .nth(2)
-        .is_some_and(|arg| arg == UNCONFINED_FS_ARG)
-    {
-        unconfined_fs()
+    match std::env::args_os().nth(2) {
+        Some(arg) if arg == UNCONFINED_FS_ARG => unconfined_fs(),
+        Some(arg) if arg == crate::watch::HELPER_WATCH_ARG => crate::watch::helper_main(),
+        _ => {}
     }
     let Job { policy, op } = match read_stdin_job() {
         Ok(job) => job,

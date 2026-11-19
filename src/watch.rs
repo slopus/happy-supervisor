@@ -1,11 +1,13 @@
 //! Watching for changes (`watch.*`). Owned by the files track; the scaffold froze the
 //! signatures.
 //!
-//! Each watch is a notify watcher (inotify, FSEvents or ReadDirectoryChangesW) feeding a bounded
-//! channel, and one task that turns its events into batched `watch.event`s. The task owns a
-//! [`WatchState`]: the scope it reports (canonical root, the path as the control plane wrote it,
-//! the sandbox filter) and the batch being collected. Watches run in the supervisor itself, not
-//! in the sandbox helper (docs/architecture.md, Watching).
+//! Each watch has two halves. The OS half is a notify watcher (inotify, FSEvents or
+//! ReadDirectoryChangesW) whose handler turns each event into what was [`Seen`]: changed paths,
+//! the entries of a new directory, an overflow, or the root going away ([`Observer`]). The
+//! reporting half is one task that owns a [`WatchState`]: the scope it reports (canonical root,
+//! the path as the control plane wrote it, the sandbox filter) and the batch being collected.
+//! The OS half runs in the supervisor, or, with a workload user, in a helper process as that user
+//! (docs/architecture.md, Watching).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,10 +17,12 @@ use std::time::Duration;
 
 use notify::event::{EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::identity::Workload;
 use crate::link::Outbox;
 use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
@@ -35,6 +39,10 @@ const MAX_SCANNED_ENTRIES: usize = 10_000;
 /// reports `overflow`.
 const QUEUED_EVENTS: usize = 4096;
 
+/// After [`crate::helper::HELPER_ARG`]: run one watch's OS half as this process's user
+/// ([`helper_main`]).
+pub const HELPER_WATCH_ARG: &str = "watch";
+
 type Registry = Arc<Mutex<HashMap<WatchId, Running>>>;
 
 /// Every watch of this node. Watches outlive connections. A sandboxed watch reports only
@@ -47,12 +55,24 @@ pub struct WatchManager {
     serial: AtomicU64,
 }
 
-/// A registered watch. Dropping it stops the OS watch and the task.
+/// A registered watch. Dropping it stops the OS half and the task.
 struct Running {
     /// Tells this watch from a later one that reuses its ID.
     serial: u64,
-    _watcher: RecommendedWatcher,
+    _source: Source,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Where the OS half runs. Held for its drop, which stops it.
+enum Source {
+    Watcher {
+        _watcher: RecommendedWatcher,
+    },
+    /// The helper, killed on drop, with its stdin, whose end tells it to exit.
+    #[cfg(unix)]
+    Helper {
+        _child: tokio::process::Child,
+    },
 }
 
 impl Drop for Running {
@@ -71,7 +91,14 @@ impl WatchManager {
         }
     }
 
-    pub async fn start(&self, params: WatchStartParams, confinement: Confinement) -> Result<()> {
+    /// Starts a watch. With `workload`, its OS half runs in a helper as that user, so the OS
+    /// checks what it may watch and list as that user.
+    pub async fn start(
+        &self,
+        params: WatchStartParams,
+        confinement: Confinement,
+        workload: Option<Arc<Workload>>,
+    ) -> Result<()> {
         let _starting = self.starting.lock().await;
         {
             let watches = lock(&self.watches);
@@ -93,31 +120,42 @@ impl WatchManager {
             path,
             recursive,
         } = params;
-        let (sender, events) = mpsc::channel(QUEUED_EVENTS);
+        let (sender, seen) = mpsc::channel(QUEUED_EVENTS);
         let lost = Arc::new(AtomicBool::new(false));
-        let handler_lost = lost.clone();
-        let handler = move |event| {
-            if sender.try_send(event).is_err() {
-                handler_lost.store(true, Ordering::Relaxed);
+        let (scope, source) = match workload {
+            None => {
+                let lost = lost.clone();
+                let report = move |batch: Vec<Seen>| {
+                    if !batch.is_empty() && sender.try_send(batch).is_err() {
+                        lost.store(true, Ordering::Relaxed);
+                    }
+                };
+                // A recursive watch walks the whole tree, so it starts on a blocking thread.
+                tokio::task::spawn_blocking(move || open(&path, recursive, confinement, report))
+                    .await
+                    .map_err(|err| {
+                        Error::new(ErrorKind::Io, format!("watch.start failed: {err}"))
+                    })??
             }
+            #[cfg(unix)]
+            Some(workload) => {
+                open_in_helper(&path, recursive, confinement, &workload, sender).await?
+            }
+            #[cfg(windows)]
+            Some(workload) => match *workload {},
         };
-        // A recursive watch walks the whole tree, so it runs on a blocking thread.
-        let (scope, watcher) =
-            tokio::task::spawn_blocking(move || open(&path, recursive, confinement, handler))
-                .await
-                .map_err(|err| Error::new(ErrorKind::Io, format!("watch.start failed: {err}")))??;
 
         let state = WatchState::new(watch_id.clone(), scope, self.outbox.clone());
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         // The task unregisters itself when its root goes away, so it is spawned under the lock
         // and cannot look before it is registered.
         let mut watches = lock(&self.watches);
-        let task = tokio::spawn(run(state, events, lost, self.watches.clone(), serial));
+        let task = tokio::spawn(run(state, seen, lost, self.watches.clone(), serial));
         watches.insert(
             watch_id,
             Running {
                 serial,
-                _watcher: watcher,
+                _source: source,
                 task,
             },
         );
@@ -147,34 +185,66 @@ fn lock(watches: &Registry) -> MutexGuard<'_, HashMap<WatchId, Running>> {
     watches.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Resolves the root, checks it against the policy, and starts the OS watch.
+/// Resolves the root, checks it against the policy, and starts the OS watch in this process.
 fn open(
     path: &AbsPath,
     recursive: bool,
     confinement: Confinement,
-    handler: impl notify::EventHandler,
-) -> Result<(Scope, RecommendedWatcher)> {
-    let at = |err: std::io::Error| {
+    report: impl FnMut(Vec<Seen>) + Send + 'static,
+) -> Result<(Scope, Source)> {
+    let root = canonical_root(path)?;
+    let filter = filter(path, &root, confinement)?;
+    let watcher = start_os(path, root.clone(), recursive, report)?;
+    Ok((
+        scope(path, root, filter),
+        Source::Watcher { _watcher: watcher },
+    ))
+}
+
+fn canonical_root(path: &AbsPath) -> Result<PathBuf> {
+    crate::policy::canonicalize(path.as_path()).map_err(|err| {
         let err = Error::from(err);
         Error::new(err.kind, format!("{}: {}", path.as_str(), err.message))
-    };
-    let root = crate::policy::canonicalize(path.as_path()).map_err(at)?;
-    let filter = match confinement {
-        Confinement::Raw => None,
-        Confinement::Sandboxed(policy) => {
-            if !policy.can_read(&root) {
-                return Err(Error::new(
-                    ErrorKind::PermissionDenied,
-                    format!("{}: not readable by the policy", path.as_str()),
-                ));
-            }
-            Some(policy)
-        }
-    };
-    let identity = identity(&root).ok_or_else(|| Error::not_found(path.as_str()))?;
+    })
+}
 
+/// A sandboxed watch's filter: its policy, which must let it read the root.
+fn filter(path: &AbsPath, root: &Path, confinement: Confinement) -> Result<Option<ResolvedPolicy>> {
+    match confinement {
+        Confinement::Raw => Ok(None),
+        Confinement::Sandboxed(policy) if policy.can_read(root) => Ok(Some(policy)),
+        Confinement::Sandboxed(_) => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{}: not readable by the policy", path.as_str()),
+        )),
+    }
+}
+
+fn scope(path: &AbsPath, root: PathBuf, filter: Option<ResolvedPolicy>) -> Scope {
+    Scope {
+        shown: path.as_path().components().collect(),
+        root,
+        filter,
+    }
+}
+
+/// Starts the OS watch on the canonical `root`, reporting what it sees to `report` from
+/// notify's thread.
+fn start_os(
+    path: &AbsPath,
+    root: PathBuf,
+    recursive: bool,
+    mut report: impl FnMut(Vec<Seen>) + Send + 'static,
+) -> Result<RecommendedWatcher> {
+    let identity = identity(&root).ok_or_else(|| Error::not_found(path.as_str()))?;
+    let observer = Observer {
+        root: root.clone(),
+        identity,
+        recursive,
+    };
     // Following symlinks would watch, and report, paths outside the canonical root.
     let config = notify::Config::default().with_follow_symlinks(false);
+    let handler = move |event| report(observer.observe(event));
     let mut watcher = RecommendedWatcher::new(handler, config).map_err(watch_error)?;
     let mode = if recursive {
         RecursiveMode::Recursive
@@ -182,15 +252,131 @@ fn open(
         RecursiveMode::NonRecursive
     };
     watcher.watch(&root, mode).map_err(watch_error)?;
+    Ok(watcher)
+}
 
-    let scope = Scope {
-        shown: path.as_path().components().collect(),
-        root,
-        identity,
+/// What a watch helper is asked to do, on its stdin.
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+struct HelperWatch {
+    path: AbsPath,
+    recursive: bool,
+}
+
+/// The helper's first frame: the canonical root it watches, or why it could not.
+#[cfg(unix)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum HelperStarted {
+    Ok(#[serde(with = "path_bytes")] PathBuf),
+    Err(Error),
+}
+
+/// Starts the OS half in a helper running as `workload`, which reports each event's [`Seen`]
+/// as a frame on its stdout until its stdin closes. The policy is checked here, on the root the
+/// helper resolved as that user.
+#[cfg(unix)]
+async fn open_in_helper(
+    path: &AbsPath,
+    recursive: bool,
+    confinement: Confinement,
+    workload: &Workload,
+    sender: mpsc::Sender<Vec<Seen>>,
+) -> Result<(Scope, Source)> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut command = std::process::Command::new(crate::helper::exe()?);
+    command.args([crate::helper::HELPER_ARG, HELPER_WATCH_ARG]);
+    crate::identity::run_as(&mut command, Some(workload), None)?;
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let job = HelperWatch {
+        path: path.clone(),
         recursive,
-        filter,
     };
-    Ok((scope, watcher))
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    // A helper that dies early closes its stdin, and then sends no first frame.
+    let _ = stdin.write_all(&crate::helper::encode_frame(&job)).await;
+    let gone = || Error::new(ErrorKind::Io, "the watch helper exited before it started");
+    let root = match crate::helper::read_frame_async(&mut stdout).await {
+        Ok(Some(HelperStarted::Ok(root))) => root,
+        Ok(Some(HelperStarted::Err(err))) => return Err(err),
+        Ok(None) => return Err(gone()),
+        Err(err) => return Err(err),
+    };
+    let filter = filter(path, &root, confinement)?;
+    tokio::spawn(async move {
+        loop {
+            let batch = match crate::helper::read_frame_async(&mut stdout).await {
+                Ok(Some(batch)) => batch,
+                // Stopped: the helper was killed and its task is gone.
+                Ok(None) | Err(_) if sender.is_closed() => return,
+                Ok(None) | Err(_) => vec![Seen::Failed],
+            };
+            let failed = batch.iter().any(|seen| matches!(seen, Seen::Failed));
+            if sender.send(batch).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+    // The helper exits when its stdin closes, so the child keeps it.
+    child.stdin = Some(stdin);
+    Ok((scope(path, root, filter), Source::Helper { _child: child }))
+}
+
+/// `happy-supervisor __sandbox watch`: the OS half of one watch, as the workload user the
+/// parent made this process. Reads a [`HelperWatch`], replies [`HelperStarted`], then writes
+/// one frame of [`Seen`] per OS event until stdin closes.
+#[cfg(unix)]
+pub fn helper_main() -> ! {
+    use std::io::{Read as _, Write as _};
+
+    let mut stdin = std::io::stdin().lock();
+    let job: HelperWatch = match crate::helper::read_frame(&mut stdin) {
+        Ok(job) => job,
+        Err(err) => {
+            eprintln!("happy-supervisor __sandbox watch: {err}");
+            std::process::exit(crate::helper::EXIT_BAD_JOB)
+        }
+    };
+    let write = |frame: Vec<u8>| {
+        let mut stdout = std::io::stdout().lock();
+        if stdout
+            .write_all(&frame)
+            .and_then(|()| stdout.flush())
+            .is_err()
+        {
+            // The supervisor is gone.
+            std::process::exit(0);
+        }
+    };
+    let report = move |batch: Vec<Seen>| {
+        if !batch.is_empty() {
+            write(crate::helper::encode_frame(&batch));
+        }
+    };
+    let started = canonical_root(&job.path).and_then(|root| {
+        start_os(&job.path, root.clone(), job.recursive, report).map(|watcher| (root, watcher))
+    });
+    let _watcher = match started {
+        Ok((root, watcher)) => {
+            write(crate::helper::encode_frame(&HelperStarted::Ok(root)));
+            watcher
+        }
+        Err(err) => {
+            write(crate::helper::encode_frame(&HelperStarted::Err(err)));
+            std::process::exit(0)
+        }
+    };
+    // Watch until the supervisor closes stdin or exits.
+    let _ = stdin.read_to_end(&mut Vec::new());
+    std::process::exit(0)
 }
 
 fn watch_error(err: notify::Error) -> Error {
@@ -228,30 +414,33 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
 
 async fn run(
     mut state: WatchState,
-    mut events: mpsc::Receiver<notify::Result<notify::Event>>,
+    mut seen: mpsc::Receiver<Vec<Seen>>,
     lost: Arc<AtomicBool>,
     watches: Registry,
     serial: u64,
 ) {
-    loop {
-        let event = match state.deadline() {
+    'watching: loop {
+        let batch = match state.deadline() {
             Some(deadline) => tokio::select! {
-                event = events.recv() => event,
+                batch = seen.recv() => batch,
                 () = tokio::time::sleep_until(deadline) => {
                     state.flush();
                     continue;
                 }
             },
-            None => events.recv().await,
+            None => seen.recv().await,
         };
-        let Some(event) = event else {
+        let Some(batch) = batch else {
             return;
         };
         if lost.swap(false, Ordering::Relaxed) {
             state.overflow();
         }
-        if state.observe(event, Instant::now()) == Flow::Ended {
-            break;
+        let now = Instant::now();
+        for seen in batch {
+            if state.take(seen, now) == Flow::Ended {
+                break 'watching;
+            }
         }
     }
     let mut registry = lock(&watches);
@@ -267,14 +456,116 @@ async fn run(
     drop(running);
 }
 
+/// What the OS half saw, before the policy and batching.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum Seen {
+    Changed {
+        kind: ChangeKind,
+        #[cfg_attr(unix, serde(with = "path_bytes"))]
+        path: PathBuf,
+    },
+    /// Changes were lost.
+    Overflow,
+    /// The root was removed, or replaced by another file.
+    RootGone,
+    /// The watch helper exited or wrote garbage. The watch is over.
+    Failed,
+}
+
+/// A path as its bytes, so a name that is not UTF-8 crosses from the helper intact.
+#[cfg(unix)]
+mod path_bytes {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    use crate::protocol::Bytes;
+
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(path.as_os_str().as_bytes())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        let bytes = Bytes::deserialize(deserializer)?;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(
+            bytes.into_vec(),
+        )))
+    }
+}
+
+/// The OS half's view of one watch: what an event means, which needs the filesystem as the
+/// watching user sees it.
+struct Observer {
+    /// The canonical watched path. The OS reports changes under it.
+    root: PathBuf,
+    identity: (u64, u64),
+    recursive: bool,
+}
+
+impl Observer {
+    fn observe(&self, event: notify::Result<notify::Event>) -> Vec<Seen> {
+        let Ok(event) = event else {
+            return vec![Seen::Overflow];
+        };
+        if event.need_rescan() {
+            return vec![Seen::Overflow];
+        }
+        let mut seen = Vec::new();
+        let mut root_touched = false;
+        for (kind, path) in changes(&event) {
+            root_touched |= self.root.starts_with(&path);
+            let new_dir = kind == ChangeKind::Created && self.recursive && path != self.root;
+            seen.push(Seen::Changed {
+                kind,
+                path: path.clone(),
+            });
+            if new_dir {
+                self.scan(&path, &mut seen);
+            }
+        }
+        if root_touched && identity(&self.root) != Some(self.identity) {
+            seen.push(Seen::RootGone);
+        }
+        seen
+    }
+
+    /// Reports what a new directory already holds. Entries made before the OS watched the
+    /// directory (inotify adds a watch only after seeing it created), or moved in with it, raise
+    /// no event of their own. Symlinks are reported, not followed.
+    fn scan(&self, dir: &Path, seen: &mut Vec<Seen>) {
+        let mut stack = vec![dir.to_path_buf()];
+        let mut scanned = 0;
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                scanned += 1;
+                if scanned > MAX_SCANNED_ENTRIES {
+                    seen.push(Seen::Overflow);
+                    return;
+                }
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(path.clone());
+                }
+                seen.push(Seen::Changed {
+                    kind: ChangeKind::Created,
+                    path,
+                });
+            }
+        }
+    }
+}
+
 /// What a watch reports, and how its paths are shown.
 struct Scope {
-    /// The canonical watched path. The OS reports changes under it.
+    /// The canonical watched path.
     root: PathBuf,
     /// The watched path as `watch.start` gave it. Changes are reported under it.
     shown: PathBuf,
-    identity: (u64, u64),
-    recursive: bool,
     /// A sandboxed watch reports only what its policy can read.
     filter: Option<ResolvedPolicy>,
 }
@@ -299,16 +590,13 @@ impl Scope {
             path: shown.to_string_lossy().into_owned(),
         })
     }
-
-    fn root_is_gone(&self) -> bool {
-        identity(&self.root) != Some(self.identity)
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Flow {
     Watching,
-    /// The root was removed. The final event is queued and the watch is over.
+    /// The root was removed, or the helper failed. The final event is queued and the watch is
+    /// over.
     Ended,
 }
 
@@ -339,61 +627,29 @@ impl WatchState {
         self.pending.as_ref().map(|batch| batch.deadline)
     }
 
-    fn observe(&mut self, event: notify::Result<notify::Event>, now: Instant) -> Flow {
-        let Ok(event) = event else {
-            self.overflow();
-            return Flow::Watching;
-        };
-        if event.need_rescan() {
-            self.overflow();
-            return Flow::Watching;
-        }
-        let mut root_touched = false;
-        for (kind, path) in changes(&event) {
-            root_touched |= self.scope.root.starts_with(&path);
-            if let Some(change) = self.scope.change(kind, &path) {
-                self.push(change, now);
-            }
-            if kind == ChangeKind::Created && self.scope.recursive && path != self.scope.root {
-                self.scan(&path, now);
-            }
-        }
-        if root_touched && self.scope.root_is_gone() {
-            let root = self.scope.root.clone();
-            if let Some(change) = self.scope.change(ChangeKind::Removed, &root) {
-                self.push(change, now);
-            }
-            self.flush();
-            return Flow::Ended;
-        }
-        Flow::Watching
-    }
-
-    /// Reports what a new directory already holds. Entries made before the OS watched the
-    /// directory (inotify adds a watch only after seeing it created), or moved in with it, raise
-    /// no event of their own. Symlinks are reported, not followed.
-    fn scan(&mut self, dir: &Path, now: Instant) {
-        let mut stack = vec![dir.to_path_buf()];
-        let mut scanned = 0;
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                scanned += 1;
-                if scanned > MAX_SCANNED_ENTRIES {
-                    self.overflow();
-                    return;
-                }
-                let path = entry.path();
-                if let Some(change) = self.scope.change(ChangeKind::Created, &path) {
+    fn take(&mut self, seen: Seen, now: Instant) -> Flow {
+        match seen {
+            Seen::Changed { kind, path } => {
+                if let Some(change) = self.scope.change(kind, &path) {
                     self.push(change, now);
                 }
-                if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    stack.push(path);
+            }
+            Seen::Overflow => self.overflow(),
+            Seen::RootGone => {
+                let root = self.scope.root.clone();
+                if let Some(change) = self.scope.change(ChangeKind::Removed, &root) {
+                    self.push(change, now);
                 }
+                self.flush();
+                return Flow::Ended;
+            }
+            Seen::Failed => {
+                tracing::warn!("watch {}: its helper exited; ending it", self.watch_id);
+                self.overflow();
+                return Flow::Ended;
             }
         }
+        Flow::Watching
     }
 
     fn push(&mut self, change: Change, now: Instant) {
@@ -526,8 +782,21 @@ mod tests {
     struct Fixture {
         _tmp: tempfile::TempDir,
         root: PathBuf,
+        observer: Observer,
         state: WatchState,
         session: Session,
+    }
+
+    impl Fixture {
+        /// Both halves of a watch on one OS event, as `run` does.
+        fn observe(&mut self, event: notify::Result<notify::Event>, now: Instant) -> Flow {
+            for seen in self.observer.observe(event) {
+                if self.state.take(seen, now) == Flow::Ended {
+                    return Flow::Ended;
+                }
+            }
+            Flow::Watching
+        }
     }
 
     fn fixture(filter: impl FnOnce(&Path) -> Option<ResolvedPolicy>) -> Fixture {
@@ -535,17 +804,21 @@ mod tests {
         let root = std::fs::canonicalize(tmp.path()).unwrap().join("repo");
         std::fs::create_dir(&root).unwrap();
         let (session, outbox) = session();
+        let observer = Observer {
+            root: root.clone(),
+            identity: identity(&root).unwrap(),
+            recursive: true,
+        };
         let scope = Scope {
             root: root.clone(),
             shown: PathBuf::from("/shown/repo"),
-            identity: identity(&root).unwrap(),
-            recursive: true,
             filter: filter(&root),
         };
         let state = WatchState::new(WatchId::try_from("w-1").unwrap(), scope, outbox);
         Fixture {
             _tmp: tmp,
             root,
+            observer,
             state,
             session,
         }
@@ -570,15 +843,14 @@ mod tests {
         let a = f.root.join("src/a.rs");
         let written = EventKind::Modify(ModifyKind::Data(DataChange::Any));
 
-        assert_eq!(f.state.observe(created(&a), t0), Flow::Watching);
-        f.state.observe(event(written, &[&a]), t0);
-        f.state.observe(event(written, &[&a]), t0);
+        assert_eq!(f.observe(created(&a), t0), Flow::Watching);
+        f.observe(event(written, &[&a]), t0);
+        f.observe(event(written, &[&a]), t0);
         let closed = EventKind::Access(notify::event::AccessKind::Close(
             notify::event::AccessMode::Write,
         ));
-        f.state.observe(event(closed, &[&a]), t0);
-        f.state
-            .observe(event(EventKind::Remove(RemoveKind::File), &[&a]), t0);
+        f.observe(event(closed, &[&a]), t0);
+        f.observe(event(EventKind::Remove(RemoveKind::File), &[&a]), t0);
         assert_eq!(f.state.deadline(), Some(t0 + Duration::from_millis(100)));
         assert_eq!(events(&mut f.session), [] as [Value; 0]);
 
@@ -599,7 +871,7 @@ mod tests {
         let mut f = fixture(|_| None);
         let t0 = Instant::now();
         for i in 0..300 {
-            f.state.observe(created(&f.root.join(format!("f{i}"))), t0);
+            f.observe(created(&f.root.join(format!("f{i}"))), t0);
         }
         let sent = events(&mut f.session);
         assert_eq!(sent.len(), 1);
@@ -608,7 +880,7 @@ mod tests {
         assert_eq!(changes[255]["path"], "/shown/repo/f255");
 
         let later = t0 + Duration::from_millis(30);
-        f.state.observe(created(&f.root.join("late")), later);
+        f.observe(created(&f.root.join("late")), later);
         // The batch started with change 257, at t0.
         assert_eq!(f.state.deadline(), Some(t0 + Duration::from_millis(100)));
         f.state.flush();
@@ -624,14 +896,12 @@ mod tests {
         let t0 = Instant::now();
         let (old, new) = (f.root.join("old"), f.root.join("new"));
         let name = |mode| EventKind::Modify(ModifyKind::Name(mode));
-        f.state.observe(event(name(RenameMode::From), &[&old]), t0);
-        f.state.observe(event(name(RenameMode::To), &[&new]), t0);
-        f.state
-            .observe(event(name(RenameMode::Both), &[&old, &new]), t0);
+        f.observe(event(name(RenameMode::From), &[&old]), t0);
+        f.observe(event(name(RenameMode::To), &[&new]), t0);
+        f.observe(event(name(RenameMode::Both), &[&old, &new]), t0);
         // FSEvents: one side exists afterwards, the other does not.
         std::fs::write(&new, b"").unwrap();
-        f.state
-            .observe(event(name(RenameMode::Any), &[&old, &new]), t0);
+        f.observe(event(name(RenameMode::Any), &[&old, &new]), t0);
         f.state.flush();
         assert_eq!(
             events(&mut f.session),
@@ -649,8 +919,7 @@ mod tests {
         let dir = f.root.join("new");
         std::fs::create_dir_all(dir.join("deeper")).unwrap();
         std::fs::write(dir.join("deeper/f"), b"").unwrap();
-        f.state
-            .observe(event(EventKind::Create(CreateKind::Folder), &[&dir]), t0);
+        f.observe(event(EventKind::Create(CreateKind::Folder), &[&dir]), t0);
         f.state.flush();
         assert_eq!(
             events(&mut f.session),
@@ -661,9 +930,8 @@ mod tests {
             ] })]
         );
 
-        f.state.scope.recursive = false;
-        f.state
-            .observe(event(EventKind::Create(CreateKind::Folder), &[&dir]), t0);
+        f.observer.recursive = false;
+        f.observe(event(EventKind::Create(CreateKind::Folder), &[&dir]), t0);
         f.state.flush();
         assert_eq!(
             events(&mut f.session),
@@ -681,7 +949,7 @@ mod tests {
         for i in 0..=MAX_SCANNED_ENTRIES {
             std::fs::write(dir.join(i.to_string()), b"").unwrap();
         }
-        f.state.observe(
+        f.observe(
             event(EventKind::Create(CreateKind::Folder), &[&dir]),
             Instant::now(),
         );
@@ -695,17 +963,16 @@ mod tests {
     fn a_rescan_or_an_error_drops_the_batch_for_overflow() {
         let mut f = fixture(|_| None);
         let t0 = Instant::now();
-        f.state.observe(created(&f.root.join("a")), t0);
+        f.observe(created(&f.root.join("a")), t0);
         let rescan = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        f.state.observe(Ok(rescan), t0);
+        f.observe(Ok(rescan), t0);
         assert_eq!(f.state.deadline(), None);
         assert_eq!(
             events(&mut f.session),
             [json!({ "watchId": "w-1", "overflow": true })]
         );
 
-        f.state
-            .observe(Err(notify::Error::generic("inotify broke")), t0);
+        f.observe(Err(notify::Error::generic("inotify broke")), t0);
         assert_eq!(
             events(&mut f.session),
             [json!({ "watchId": "w-1", "overflow": true })]
@@ -721,11 +988,10 @@ mod tests {
             Some(ResolvedPolicy::resolve(&policy, &state).unwrap())
         });
         let t0 = Instant::now();
-        f.state.observe(created(&f.root.join(".state")), t0);
-        f.state
-            .observe(created(&f.root.join(".state/credentials.json")), t0);
-        f.state.observe(created(&f.root.join("visible")), t0);
-        f.state.observe(created(Path::new("/elsewhere/x")), t0);
+        f.observe(created(&f.root.join(".state")), t0);
+        f.observe(created(&f.root.join(".state/credentials.json")), t0);
+        f.observe(created(&f.root.join("visible")), t0);
+        f.observe(created(Path::new("/elsewhere/x")), t0);
         f.state.flush();
         assert_eq!(
             events(&mut f.session),
@@ -739,17 +1005,14 @@ mod tests {
     fn removing_the_root_sends_a_final_removed_change_and_ends() {
         let mut f = fixture(|_| None);
         let t0 = Instant::now();
-        f.state.observe(created(&f.root.join("a")), t0);
+        f.observe(created(&f.root.join("a")), t0);
         // Another event on the root while it exists changes nothing.
         let touched = EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::Any));
-        assert_eq!(
-            f.state.observe(event(touched, &[&f.root]), t0),
-            Flow::Watching
-        );
+        assert_eq!(f.observe(event(touched, &[&f.root]), t0), Flow::Watching);
 
         std::fs::remove_dir_all(&f.root).unwrap();
         let removed = event(EventKind::Remove(RemoveKind::Folder), &[&f.root]);
-        assert_eq!(f.state.observe(removed, t0), Flow::Ended);
+        assert_eq!(f.observe(removed, t0), Flow::Ended);
         assert_eq!(
             events(&mut f.session),
             [json!({ "watchId": "w-1", "changes": [
@@ -767,7 +1030,7 @@ mod tests {
         std::fs::rename(&f.root, f.root.with_file_name("moved")).unwrap();
         std::fs::create_dir(&f.root).unwrap();
         let renamed = EventKind::Modify(ModifyKind::Name(RenameMode::From));
-        assert_eq!(f.state.observe(event(renamed, &[&f.root]), t0), Flow::Ended);
+        assert_eq!(f.observe(event(renamed, &[&f.root]), t0), Flow::Ended);
         assert_eq!(
             events(&mut f.session),
             [json!({ "watchId": "w-1", "changes": [

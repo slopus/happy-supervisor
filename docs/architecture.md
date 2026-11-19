@@ -102,18 +102,27 @@ the command's environment in `ps`.
 
 ## Watching
 
-Watches run in the supervisor, not in the sandbox helper. A watch lives as long as the control
-plane wants, and an OS sandbox would cost a long-lived helper process per watch. Watching shows
+Watches are not confined by an OS sandbox. A watch lives as long as the control plane wants,
+and an OS sandbox would cost a long-lived sandboxed process per watch. Watching shows
 only names and kinds of changes, never contents, so filtering them is enough: a sandboxed watch
 keeps the `ResolvedPolicy` its `access` resolved to, the same canonical grants a helper would
 get, and reports a change only when `can_read` allows its path. notify watches the canonical
 root and does not follow symlinks, so every path the OS reports is canonical and `can_read`
 applies to it directly. The state directory is never readable, so it is never reported.
 
-Each watch is a notify watcher feeding a bounded channel, and one task that owns its
-`WatchState`: the scope (canonical root, the path as given, the filter) and the batch being
-collected until its deadline. The task sends through `Outbox`, which turns a full droppable
-queue into `overflow`. A full channel also becomes `overflow`.
+Each watch has an OS half and a reporting half. The OS half is a notify watcher whose handler
+runs an `Observer`: it turns each event into `Seen` items (changed paths, the entries of a new
+directory, an overflow, the root going away), which needs the filesystem as the watching user
+sees it. The items go through a bounded channel to one task that owns the watch's `WatchState`:
+the scope (canonical root, the path as given, the filter) and the batch being collected until
+its deadline. The task sends through `Outbox`, which turns a full droppable queue into
+`overflow`. A full channel also becomes `overflow`.
+
+With a workload user, the OS half runs in `<exe> __sandbox watch`, started as that user like a
+raw file helper, for as long as the watch lives. It reads the path from stdin, replies with the
+canonical root or an error, then writes one frame of `Seen` per OS event to stdout, and exits
+when its stdin closes. The supervisor checks the policy against that root and applies the
+filter to what it reports, so the helper needs no policy.
 
 ## The link
 

@@ -242,11 +242,14 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
   never runs as root (install.md). A Linux supervisor that is not root runs work as itself.
 * A command enters its `cwd` as that user. A raw file operation runs in the sandbox helper, as
   that user and without a policy. A `tty` command's terminal belongs to that user.
+* A watch's OS watch runs in a helper process as that user, so it can watch only what that user
+  can read, and new directories are listed as that user. The supervisor applies a sandboxed
+  watch's policy to what the helper reports, as without a workload user.
 * The supervisor itself stays root. Its private state directory stays `0700`, and the state
   directory becomes `0711` so the user can reach `public/ca-bundle.pem`. On Linux, bubblewrap
   runs as the user, so unprivileged user namespaces must be allowed for it. An isolated
   command's sandbox reaches its proxy sockets through descriptors the node passes it, not by
   path, so no other process of the user can reach them.
-* Not supported yet, and refused rather than run as root: watches (`sandbox_unavailable`),
-  `log.kind: "file"`, which the supervisor would write (`invalid_params`), and a workload user
-  on Windows, where the node does not start with one.
+* Not supported yet, and refused rather than run as root: `log.kind: "file"`, which the
+  supervisor would write (`invalid_params`), and a workload user on Windows, where the node does
+  not start with one.

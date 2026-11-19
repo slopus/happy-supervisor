@@ -8,8 +8,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use happy_supervisor::protocol::{
-    AbsPath, Access, Bytes, Event, ExecOutput, ExitStatus, FsWriteParams, NodeInfo, WithAccess,
-    WriteMode,
+    AbsPath, Access, Bytes, Event, ExecOutput, ExitStatus, FsWriteParams, NodeInfo, WatchEvent,
+    WatchEventBody, WithAccess, WriteMode,
 };
 use happy_supervisor::{Controller, ErrorKind};
 use serde_json::{Value as Json, json};
@@ -236,7 +236,8 @@ async fn commands_and_file_operations_run_as_the_workload_user() {
     );
     let mut cases = vec![("sandboxed", sandboxed(host()))];
     if cfg!(target_os = "linux") {
-        // bubblewrap, as the workload user, binds the proxy sockets by descriptor.
+        // bubblewrap runs as the workload user; its helper reaches the proxy sockets by
+        // descriptor.
         cases.push(("isolated", sandboxed(isolated())));
     }
     for (exec_id, access) in cases {
@@ -305,20 +306,39 @@ async fn commands_and_file_operations_run_as_the_workload_user() {
     assert_eq!(err.kind, ErrorKind::PermissionDenied, "{}", err.message);
     assert!(!private.join("planted").exists());
 
-    let watch = node
+    // Watches run as the workload user too: it cannot watch what it cannot read.
+    let watch = |watch_id: &str, path: &Path| {
+        happy_supervisor::wire::to_value(&json!({ "watchId": watch_id,
+            "path": path.to_str().unwrap(), "recursive": true, "access": raw() }))
+    };
+    let err = node
         .ctl
-        .call(
-            "watch.start",
-            happy_supervisor::wire::to_value(&json!({ "watchId": "w", "path": "/tmp",
-                "recursive": false, "access": raw() })),
-        )
+        .call("watch.start", watch("private", &private))
         .await
         .unwrap_err();
-    assert_eq!(watch.kind, ErrorKind::SandboxUnavailable);
-    assert_eq!(
-        watch.message,
-        format!(
-            "this node runs its work as {USER:?}, and watching as that user is not supported yet"
-        )
-    );
+    assert_eq!(err.kind, ErrorKind::PermissionDenied, "{}", err.message);
+    let shared = node.shared();
+    let mut events = node.ctl.events();
+    node.ctl
+        .call("watch.start", watch("shared", &shared))
+        .await
+        .unwrap();
+    let made = format!("mkdir {0}/dir && touch {0}/dir/file", shared.display());
+    let (exit, _) = node.sh("make", &made, raw(), false).await;
+    assert_eq!(exit, ExitStatus::Exited { code: 0 });
+    let expected = [shared.join("dir"), shared.join("dir/file")].map(|p| p.display().to_string());
+    let mut seen = Vec::new();
+    while !expected.iter().all(|path| seen.contains(path)) {
+        match tokio::time::timeout(WAIT, events.next()).await.unwrap() {
+            Some(Event::WatchEvent(WatchEvent {
+                watch_id,
+                body: WatchEventBody::Changes { changes },
+            })) if watch_id.as_str() == "shared" => {
+                seen.extend(changes.into_iter().map(|change| change.path));
+            }
+            Some(_) => {}
+            None => panic!("the events ended"),
+        }
+    }
+    assert!(seen.iter().all(|path| expected.contains(path)), "{seen:?}");
 }

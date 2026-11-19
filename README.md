@@ -21,7 +21,7 @@ happy-supervisor install-sandbox        # Windows, once, as an administrator
 and the endpoint to connect to. `run` connects and serves the control plane until the
 credential is revoked (exit code 3). `serve` listens instead of dialing, for tests and local
 programs that drive the node with `happy_supervisor::Controller`. With `--workload-user`, a
-supervisor running as root runs every command and file operation as that user
+supervisor running as root runs every command, file operation and watch as that user
 ([docs/policy.md](docs/policy.md), Workload user). On Linux a supervisor running as root
 refuses to start without one; [docs/install.md](docs/install.md) sets it up. `info` prints this
 machine's NodeInfo as JSON. On Windows, `install-sandbox` creates the sandbox's accounts, groups

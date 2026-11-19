@@ -116,6 +116,39 @@ exits with the supervisor's code (128 plus the signal when a signal ended it). S
 --init` is not needed, and does no harm: the supervisor is then not PID 1 and leaves the reaping
 to Docker's init.
 
+When the control plane revokes the node, `run` exits with code 3 (api.md, Connection), and every
+later start only gets a `401` and exits 3 again until the machine joins again. The systemd unit
+above stops there (`RestartPreventExitStatus=3`), but a container restart policy cannot exempt an
+exit code: Docker's `always`, `unless-stopped` and `on-failure`, and Kubernetes' `restartPolicy`,
+start a revoked node forever, each start logging a `401`. Restart only failures, and make the
+entry point exit 0 for code 3, for example with this script as `entrypoint.sh`:
+
+```sh
+#!/bin/sh
+# Runs the supervisor. Exits 0 instead of 3 once the control plane revoked the node, so a restart
+# policy that restarts only failures leaves it stopped.
+happy-supervisor run "$@" &
+pid=$!
+trap 'kill -TERM "$pid" 2>/dev/null' TERM INT
+wait "$pid"
+code=$?
+# A trapped signal ends the wait early, with 128 plus the signal; wait again for the real code.
+while kill -0 "$pid" 2>/dev/null; do
+  wait "$pid"
+  code=$?
+done
+[ "$code" -eq 3 ] && exit 0
+exit "$code"
+```
+
+```
+docker run --init --restart on-failure ... /entrypoint.sh --state-dir /state --workload-user happy-workload
+```
+
+The shell is not an init, so `--init` puts Docker's in front of it to reap orphans. A Kubernetes
+Pod does the same with `restartPolicy: OnFailure`; a Deployment always restarts its containers,
+so scale it to zero for a revoked node.
+
 ## macOS
 
 Run the supervisor as the user whose files its commands should see, for example from a

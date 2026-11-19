@@ -54,6 +54,10 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Create the Windows sandbox's accounts and firewall filters. Run once, as an
+    /// administrator, as the account that runs the supervisor.
+    #[cfg(windows)]
+    InstallSandbox(sandbox::windows::InstallArgs),
     /// Print this node's NodeInfo as JSON.
     Info {
         #[arg(long)]
@@ -76,6 +80,10 @@ fn main() -> ExitCode {
         return happy_supervisor::connect::main(std::env::args().skip(2));
     }
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Command::InstallSandbox(args) = cli.command {
+        return sandbox::windows::install_main(args);
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
@@ -134,6 +142,8 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
             serve::serve_until(state, listen, token, listening, client::shutdown_signal()).await?;
             Ok(ExitCode::SUCCESS)
         }
+        #[cfg(windows)]
+        Command::InstallSandbox(_) => unreachable!("handled before the runtime starts"),
         Command::Info { state_dir } => {
             let state = StateDir::open(state_dir)?;
             let info = tokio::task::spawn_blocking(move || {

@@ -8,6 +8,7 @@
 mod log;
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -21,13 +22,16 @@ use crate::link::Outbox;
 use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::process::{self, Tree};
 use crate::protocol::{
-    AbsPath, Argv, Bytes, ExecId, ExecLogParams, ExecLogResult, ExecStartParams, ExecStartResult,
-    ExecState, ExecSummary, ExecWriteParams, ExitStatus, KillSignal, LogSpec,
+    AbsPath, Argv, Bytes, ExecId, ExecLogParams, ExecLogResult, ExecResizeParams, ExecStartParams,
+    ExecStartResult, ExecState, ExecSummary, ExecWriteParams, ExitStatus, KillSignal, LogSpec,
     MAX_EXEC_LOG_READ_BYTES, MAX_EXEC_WRITE_BYTES, MAX_OUTPUT_CHUNK_BYTES, MEMORY_LOG_BUDGET_BYTES,
-    RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction,
+    RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction, TtySize,
 };
 use crate::proxy::egress::CommandProxy;
 use crate::sandbox::{NetPlan, NetnsControl, Placeholders};
+
+/// What `exec.write` with `eof` sends to a terminal: Ctrl-D, its default end-of-file character.
+const EOF_CHARACTER: u8 = 0x04;
 
 /// After a process exits, how long its output may stay silent before the exit is reported
 /// without waiting for the pipes to close. Processes it left behind can hold them open forever.
@@ -76,6 +80,8 @@ enum Phase {
 struct Running {
     tree: Tree,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// The terminal's master side, with `tty`: input goes here instead of `stdin`.
+    terminal: Option<Arc<File>>,
     output: Arc<Mutex<Output>>,
     memory_reserved: u64,
     timer: Option<tokio::task::AbortHandle>,
@@ -132,10 +138,29 @@ struct Output {
     failed_appends: u64,
 }
 
+/// The command's stdio: pipes, with stdin open for `exec.write` or empty, or a terminal.
+#[derive(Clone, Copy, Debug)]
+enum Io {
+    Pipes { stdin: bool },
+    Tty(#[cfg_attr(windows, expect(dead_code, reason = "Windows rejects tty"))] TtySize),
+}
+
+impl Io {
+    #[cfg(unix)]
+    fn terminal(self) -> Option<TtySize> {
+        match self {
+            Io::Tty(size) => Some(size),
+            Io::Pipes { .. } => None,
+        }
+    }
+}
+
 /// A spawned child before it is registered.
 struct Spawned {
     child: Child,
     tree: Tree,
+    /// The master side of its terminal, with `tty`.
+    terminal: Option<File>,
 }
 
 impl ExecManager {
@@ -211,14 +236,22 @@ impl ExecManager {
                 data.as_slice().len()
             )));
         }
-        let stdin = self
+        let (stdin, terminal) = self
             .inner
             .entry_phase(&exec_id, |phase| match phase {
-                Phase::Running(running) => Some(running.stdin.clone()),
+                Phase::Running(running) => Some((running.stdin.clone(), running.terminal.clone())),
                 _ => None,
             })?
             .ok_or_else(|| Error::invalid_params(format!("{exec_id} is not running")))?;
         tokio::task::spawn_blocking(move || {
+            if let Some(terminal) = terminal {
+                let mut terminal = &*terminal;
+                terminal.write_all(data.as_slice())?;
+                if eof {
+                    terminal.write_all(&[EOF_CHARACTER])?;
+                }
+                return Ok(());
+            }
             let mut stdin = lock(&stdin);
             let Some(pipe) = stdin.as_mut() else {
                 return Err(Error::invalid_params(format!(
@@ -233,6 +266,23 @@ impl ExecManager {
         })
         .await
         .map_err(|err| Error::new(ErrorKind::Io, format!("exec.write failed: {err}")))?
+    }
+
+    /// Sets the size of a `tty` process's terminal.
+    pub fn resize(&self, params: ExecResizeParams) -> Result<()> {
+        let ExecResizeParams { exec_id, size } = params;
+        let terminal = self
+            .inner
+            .entry_phase(&exec_id, |phase| match phase {
+                Phase::Running(running) => Ok(running.terminal.clone()),
+                _ => Err(Error::invalid_params(format!("{exec_id} is not running"))),
+            })??
+            .ok_or_else(|| Error::invalid_params(format!("{exec_id} has no terminal")))?;
+        #[cfg(unix)]
+        process::pty::resize(&terminal, size)?;
+        #[cfg(not(unix))]
+        let _ = (terminal, size);
+        Ok(())
     }
 
     /// Signals the command's process group or Job Object and returns at once.
@@ -435,15 +485,32 @@ impl Inner {
             timeout,
             log,
             proxy: _,
+            tty,
         } = params;
+        let io = match tty {
+            Some(size) => Io::Tty(size),
+            None => Io::Pipes { stdin },
+        };
+        #[cfg(windows)]
+        if let Io::Tty(_) = io {
+            return Err(Error::invalid_params("tty is not supported on Windows yet"));
+        }
         if let Some(proxy) = &proxy {
             env.extend(proxy.env(&crate::helper::exe()?));
         }
         let program = resolve_program(argv.program(), &env)?;
         let log = open_log(&log, confinement)?;
-        let (Spawned { mut child, tree }, placeholders, tunnel) = match confinement {
+        let (
+            Spawned {
+                mut child,
+                tree,
+                terminal,
+            },
+            placeholders,
+            tunnel,
+        ) = match confinement {
             Confinement::Raw => (
-                spawn_raw(&program, &argv, &cwd, &env, stdin)?,
+                spawn_raw(&program, &argv, &cwd, &env, io)?,
                 None,
                 Some(TunnelRoute::Loopback),
             ),
@@ -456,7 +523,7 @@ impl Inner {
                     _ => None,
                 };
                 let (spawned, (placeholders, netns)) =
-                    spawn_sandboxed(policy, net, &program, &argv, &cwd, env, stdin)?;
+                    spawn_sandboxed(policy, net, &program, &argv, &cwd, env, io)?;
                 let tunnel = policy.network().local_bind().then(|| match netns {
                     Some(netns) => TunnelRoute::Netns(Arc::new(netns)),
                     None => TunnelRoute::Loopback,
@@ -472,12 +539,16 @@ impl Inner {
             failed_appends: 0,
         }));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let pipes = [
-            (Stream::Stdout, child.stdout.take().map(boxed)),
-            (Stream::Stderr, child.stderr.take().map(boxed)),
-        ];
+        // A terminal is one stream; its reader gets a handle of its own.
+        let terminal_reader = terminal.as_ref().map(File::try_clone).transpose()?;
+        let pipes: Vec<(Stream, Box<dyn Read + Send>)> = match terminal_reader {
+            Some(reader) => vec![(Stream::Stdout, boxed(reader))],
+            None => vec![
+                (Stream::Stdout, boxed(child.stdout.take().expect("piped"))),
+                (Stream::Stderr, boxed(child.stderr.take().expect("piped"))),
+            ],
+        };
         for (stream, pipe) in pipes {
-            let pipe = pipe.expect("stdout and stderr are piped");
             let reader = Reader {
                 outbox: self.outbox.clone(),
                 exec_id: exec_id.clone(),
@@ -531,6 +602,7 @@ impl Inner {
         entry.phase = Phase::Running(Running {
             tree,
             stdin,
+            terminal: terminal.map(Arc::new),
             output,
             memory_reserved,
             timer,
@@ -604,6 +676,9 @@ impl Reader {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A terminal's master reads EIO once every slave descriptor is closed.
+                #[cfg(unix)]
+                Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
                 Err(err) => {
                     tracing::warn!("reading {} {:?} failed: {err}", self.exec_id, self.stream);
                     break;
@@ -810,7 +885,7 @@ fn spawn_raw(
     argv: &Argv,
     cwd: &AbsPath,
     env: &BTreeMap<String, String>,
-    stdin: bool,
+    io: Io,
 ) -> Result<Spawned> {
     if !cwd.as_path().is_dir() {
         return Err(Error::not_found(format!(
@@ -826,22 +901,43 @@ fn spawn_raw(
         .current_dir(cwd.as_path())
         .env_clear()
         .envs(env)
-        .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
+        .stdin(match io {
+            Io::Pipes { stdin: true } => Stdio::piped(),
+            Io::Pipes { stdin: false } | Io::Tty(_) => Stdio::null(),
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     process::isolate(&mut command);
     #[cfg(unix)]
     process::default_interrupt(&mut command);
+    #[cfg(unix)]
+    let pty = io.terminal().map(process::pty::Pty::open).transpose()?;
+    #[cfg(unix)]
+    if let Some(pty) = &pty {
+        pty.attach(&mut command, false)?;
+    }
     let child = command.spawn().map_err(|err| {
         let message = format!("cannot run {}: {err}", program.display());
         Error::new(Error::from(err).kind, message)
     })?;
-    adopt(child)
+    drop(command);
+    let spawned = adopt(child)?;
+    #[cfg(unix)]
+    return Ok(Spawned {
+        terminal: pty.map(|pty| pty.master),
+        ..spawned
+    });
+    #[cfg(not(unix))]
+    Ok(spawned)
 }
 
 fn adopt(mut child: Child) -> Result<Spawned> {
     match Tree::adopt(&child) {
-        Ok(tree) => Ok(Spawned { child, tree }),
+        Ok(tree) => Ok(Spawned {
+            child,
+            tree,
+            terminal: None,
+        }),
         Err(err) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -859,7 +955,7 @@ fn spawn_sandboxed(
     argv: &Argv,
     cwd: &AbsPath,
     env: BTreeMap<String, String>,
-    stdin: bool,
+    io: Io,
 ) -> Result<(Spawned, Held)> {
     use crate::helper::{Job, JobOp};
 
@@ -880,12 +976,14 @@ fn spawn_sandboxed(
         exe: &exe,
     };
     let prepared = crate::sandbox::prepare(&plan, &job)?;
-    let spawned = spawn_helper(prepared.command, &crate::helper::encode_job(&job), stdin)?;
+    let spawned = spawn_helper(prepared.command, &crate::helper::encode_job(&job), io)?;
     Ok((spawned, (prepared.placeholders, prepared.netns)))
 }
 
+/// With `tty`, the terminal is the helper's stdout and stderr and its controlling terminal; the
+/// helper makes it the command's stdin too, once it has read the job.
 #[cfg(unix)]
-fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawned> {
+fn spawn_helper(mut command: Command, frame: &[u8], io: Io) -> Result<Spawned> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
@@ -900,14 +998,20 @@ fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawn
     unsafe {
         command.pre_exec(move || crate::helper::install_status_fd(status_fd));
     }
+    let pty = io.terminal().map(process::pty::Pty::open).transpose()?;
+    if let Some(pty) = &pty {
+        pty.attach(&mut command, true)?;
+    }
     let child = command.spawn();
-    drop(status_writer);
-    let Spawned { mut child, tree } = adopt(child?)?;
+    drop((status_writer, command));
+    let Spawned {
+        mut child, tree, ..
+    } = adopt(child?)?;
 
     let mut pipe = child.stdin.take().expect("stdin is piped");
     // A helper that dies early closes its stdin; the status pipe then says why.
     let _ = pipe.write_all(frame);
-    if stdin {
+    if let Io::Pipes { stdin: true } = io {
         child.stdin = Some(pipe);
     } else {
         drop(pipe);
@@ -918,13 +1022,17 @@ fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawn
         let _ = child.wait();
         return Err(err);
     }
-    Ok(Spawned { child, tree })
+    Ok(Spawned {
+        child,
+        tree,
+        terminal: pty.map(|pty| pty.master),
+    })
 }
 
 /// Windows passes the status pipe's write end by duplicating it into the suspended helper and
 /// telling it the handle in a preamble on stdin (`helper::STATUS_MAGIC`).
 #[cfg(windows)]
-fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawned> {
+fn spawn_helper(mut command: Command, frame: &[u8], io: Io) -> Result<Spawned> {
     let (mut status, status_writer) = std::io::pipe()?;
     command
         .stdin(Stdio::piped())
@@ -940,14 +1048,16 @@ fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawn
             return Err(err.into());
         }
     };
-    let Spawned { mut child, tree } = adopt(child)?;
+    let Spawned {
+        mut child, tree, ..
+    } = adopt(child)?;
 
     let mut pipe = child.stdin.take().expect("stdin is piped");
     // A helper that dies early closes its stdin; the status pipe then says why.
     let _ = pipe
         .write_all(&preamble)
         .and_then(|()| pipe.write_all(frame));
-    if stdin {
+    if let Io::Pipes { stdin: true } = io {
         child.stdin = Some(pipe);
     } else {
         drop(pipe);
@@ -958,7 +1068,11 @@ fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawn
         let _ = child.wait();
         return Err(err);
     }
-    Ok(Spawned { child, tree })
+    Ok(Spawned {
+        child,
+        tree,
+        terminal: None,
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1065,12 +1179,15 @@ mod tests {
         std::fs::write(&status, crate::wire::to_cbor(&reported)).unwrap();
         let mut fails = Command::new("/bin/sh");
         fails.args(["-c", r#"cat "$0" >&3; exit 127"#]).arg(&status);
-        let err = spawn_helper(fails, b"frame", false).err().unwrap();
+        let err = spawn_helper(fails, b"frame", Io::Pipes { stdin: false })
+            .err()
+            .unwrap();
         assert_eq!(err, Error::not_found("no such program"));
 
         let mut execs = Command::new("/bin/sh");
         execs.args(["-c", "exec 3>&-; dd bs=5 count=1 >/dev/null 2>&1; exec cat"]);
-        let Spawned { mut child, .. } = spawn_helper(execs, b"frame", true).unwrap();
+        let Spawned { mut child, .. } =
+            spawn_helper(execs, b"frame", Io::Pipes { stdin: true }).unwrap();
         child
             .stdin
             .take()

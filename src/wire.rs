@@ -216,6 +216,10 @@ pub const REGISTRY: &[(u64, &str, Role)] = &[
     (155, "dropped", Role::Key),
     (156, "fs.rename", Role::Kind),
     (157, "from", Role::Key),
+    (158, "tty", Role::Key),
+    (159, "rows", Role::Key),
+    (160, "cols", Role::Key),
+    (161, "exec.resize", Role::Kind),
 ];
 
 struct Names {

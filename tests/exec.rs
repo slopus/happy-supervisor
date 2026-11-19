@@ -9,8 +9,8 @@ use happy_supervisor::exec::ExecManager;
 use happy_supervisor::link::{Incoming, ManualClock, NodeIdentity, Role, Session};
 use happy_supervisor::policy::{Confinement, HostRules, Network, ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{
-    ByteRange, Event, ExecExit, ExecId, ExecLogParams, ExecStartParams, ExecState, ExecSummary,
-    ExecWriteParams, ExitStatus, KillSignal, NodeInfo, Stream,
+    ByteRange, Event, ExecExit, ExecId, ExecLogParams, ExecResizeParams, ExecStartParams,
+    ExecState, ExecSummary, ExecWriteParams, ExitStatus, KillSignal, NodeInfo, Stream, TtySize,
 };
 use happy_supervisor::{Error, ErrorKind};
 use serde_json::{Value, json};
@@ -404,6 +404,87 @@ async fn interrupt_reaches_a_trap_raw_and_sandboxed() {
             "ready\ninterrupted\n"
         );
     }
+}
+
+/// Runs `wait` until `exec_id`'s streamed stdout contains `text`.
+async fn until_stdout(node: &mut Node, exec_id: &str, text: &str) {
+    for _ in 0..500 {
+        node.pump();
+        if node.streamed(exec_id, Stream::Stdout).contains(text) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "{exec_id} never printed {text:?}: {:?}",
+        node.streamed(exec_id, Stream::Stdout)
+    );
+}
+
+/// With `tty` the command has a terminal: its size, resizes, echoed input, Ctrl-D and Ctrl-C,
+/// raw and sandboxed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tty_command_has_a_terminal_raw_and_sandboxed() {
+    happy_supervisor::helper::set_exe(env!("CARGO_BIN_EXE_happy-supervisor").into());
+    let sandbox = happy_supervisor::sandbox::probe();
+    let mut node = Node::new();
+    let state = tempfile::tempdir().unwrap();
+    let policy = allow_list(
+        sandbox.baseline_read.clone(),
+        Vec::<String>::new(),
+        false,
+        false,
+    );
+    let mut runs = vec![("raw", Confinement::Raw)];
+    if sandbox.require_available().is_ok() {
+        let resolved = ResolvedPolicy::resolve(&policy, state.path()).unwrap();
+        runs.push(("sbx", Confinement::Sandboxed(resolved)));
+    }
+    for (name, confinement) in runs {
+        let exec_id = format!("tty-{name}");
+        let script = "/bin/stty size; [ -t 0 ] && [ -t 1 ] && echo terminal; read line; \
+                      /bin/stty size; echo \"got $line\"; cat; echo after-eof; \
+                      trap 'echo interrupted; exit 5' INT; while :; do sleep 0.05; done";
+        let mut params = sh(&exec_id, script);
+        params["tty"] = json!({ "rows": 24, "cols": 80 });
+        node.start_with(params, confinement).await.unwrap();
+        until_stdout(&mut node, &exec_id, "terminal\r\n").await;
+        node.exec
+            .resize(ExecResizeParams {
+                exec_id: id(&exec_id),
+                size: TtySize {
+                    rows: 50,
+                    cols: 132,
+                },
+            })
+            .unwrap();
+        node.write(&exec_id, b"hello\n", false).await.unwrap();
+        until_stdout(&mut node, &exec_id, "got hello\r\n").await;
+        node.write(&exec_id, b"", true).await.unwrap();
+        until_stdout(&mut node, &exec_id, "after-eof\r\n").await;
+        node.write(&exec_id, b"\x03", false).await.unwrap();
+        assert_eq!(
+            node.exit(&exec_id).await.exit,
+            ExitStatus::Exited { code: 5 },
+            "{exec_id}"
+        );
+        let stdout = node.streamed(&exec_id, Stream::Stdout);
+        assert!(
+            stdout.starts_with("24 80\r\nterminal\r\nhello\r\n50 132\r\ngot hello\r\n"),
+            "{exec_id}: {stdout:?}"
+        );
+        assert!(stdout.ends_with("interrupted\r\n"), "{exec_id}: {stdout:?}");
+        assert_eq!(node.streamed(&exec_id, Stream::Stderr), "");
+    }
+    let err = node
+        .exec
+        .resize(ExecResizeParams {
+            exec_id: id("tty-raw"),
+            size: TtySize { rows: 1, cols: 1 },
+        })
+        .unwrap_err();
+    assert_eq!(err.message, "tty-raw is not running");
 }
 
 #[tokio::test]

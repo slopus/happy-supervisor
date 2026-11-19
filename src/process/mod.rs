@@ -2,6 +2,8 @@
 //! or timeout reaches everything the command started. Owned by the exec track.
 
 #[cfg(unix)]
+pub(crate) mod pty;
+#[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;

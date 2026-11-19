@@ -297,6 +297,10 @@ a4 0c 67 "build-1" 0d 66 "stdout" 09 50 <16 bytes> 0e 00
 | 155 | `dropped` | key |
 | 156 | `fs.rename` | kind |
 | 157 | `from` | key |
+| 158 | `tty` | key |
+| 159 | `rows` | key |
+| 160 | `cols` | key |
+| 161 | `exec.resize` | kind |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -617,6 +621,12 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
     the control plane reads with `exec.log`. `exec.exit` still arrives when it ends.
 * `proxy` is optional: `{ "token", "hosts" }`. HTTP(S) requests the process makes to those hosts
   go through the control plane, which can add credentials. See [proxy.md](proxy.md).
+* `tty` is optional: `{ "rows": 24, "cols": 80 }`, each 1 to 65535. The process gets a
+  pseudo-terminal of that size as its stdin, stdout and stderr and as its controlling
+  terminal, so shells do job control and Ctrl-C written to it interrupts the foreground job.
+  Everything it prints arrives as `stdout`, with the terminal's line endings. `exec.write`
+  writes to the terminal whatever `stdin` says, and `exec.resize` changes its size. `TERM`
+  comes from `env` like any other variable. Unix only: on Windows `tty` is `invalid_params`.
 * `log` is optional and defaults to `{ "kind": "memory" }`. Every process's combined output
   (stdout and stderr, in arrival order) is recorded in its log from the start, whether or not
   it ever times out, so `exec.log` works for every process. See Output logs.
@@ -643,7 +653,13 @@ Params `{ "execId": "…", "data": h'…', "eof": false }`. Writes to stdin. `eo
 closes stdin after the data. `data` may be empty. Writing to a process started with
 `stdin: false`, after `eof`, or that is not running, is `invalid_params`. At most 1 MiB of data
 per call (more is `too_large`). The reply comes once the process has taken the data into its
-stdin pipe.
+stdin pipe. With `tty`, the data goes to the terminal, and `eof: true` writes the terminal's
+end-of-file character (Ctrl-D) after it instead of closing anything.
+
+### `exec.resize`
+
+Params `{ "execId": "…", "rows": 50, "cols": 132 }`. Sets the terminal's size; the process gets
+`SIGWINCH`. Result `{}`. A process without `tty`, or not running, is `invalid_params`.
 
 ### `exec.kill`
 

@@ -35,7 +35,7 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | `Outbox`: the cloneable handle exec, watch and the driver use to send events, commands and replies into the session | `link` | scaffold |
 | `enroll::join`, `client::run` (WebSocket, reconnect loop, driving the `Session`), `client::serve_until` (the same driver over accepted sockets, each taking over from the last), `testing::ControlPlane` | `enroll`, `client`, `testing` | transport track |
 | `serve::serve_until` (`serve --listen`: the TCP or Unix listener, token check, upgrade; serve.md), `ControlPlaneLink` (a control-plane `Session` over the node's latest accepted or dialed socket: pings, dead connections, commands, events; api.md, Control-plane library), `Controller` (that link over a WebSocket it dials, redialing) | `serve`, `server`, `controller` | scaffold |
-| `ExecManager` (processes, timeouts, output logs, `exec.log`) | `exec`, `process/{unix,windows}` | exec track |
+| `ExecManager` (processes, timeouts, output logs, `exec.log`, terminals) | `exec`, `process/{unix,windows,pty}` | exec track |
 | `fs::perform(&FsRequest) -> Result<FsResponse>`, `fs::handle(FsRequest, Confinement)` | `fs` | files track |
 | `WatchManager` | `watch` | files track |
 | `Streams`: the node's one stream table for proxy streams and tunnels. A stream is a `Kind` (`Http` with its command, or `Tcp`), an `Outbound` side (window, uncredited bytes, ended) and an `Inbound` side (awaiting a proxy response head, open, ended); one lock, one 1024-stream limit, one 32 MiB budget of uncredited bytes. `Upstream` (implemented by `Outbox`) is where its `proxy.*` and `tcp.*` messages go | `streams` | proxy track |

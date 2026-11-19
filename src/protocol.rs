@@ -304,6 +304,7 @@ pub enum CommandKind {
     NodeUpdate,
     ExecStart,
     ExecWrite,
+    ExecResize,
     ExecKill,
     ExecList,
     ExecLog,
@@ -320,11 +321,12 @@ pub enum CommandKind {
 }
 
 impl CommandKind {
-    pub const ALL: [CommandKind; 17] = [
+    pub const ALL: [CommandKind; 18] = [
         CommandKind::NodeInfo,
         CommandKind::NodeUpdate,
         CommandKind::ExecStart,
         CommandKind::ExecWrite,
+        CommandKind::ExecResize,
         CommandKind::ExecKill,
         CommandKind::ExecList,
         CommandKind::ExecLog,
@@ -346,6 +348,7 @@ impl CommandKind {
             CommandKind::NodeUpdate => "node.update",
             CommandKind::ExecStart => "exec.start",
             CommandKind::ExecWrite => "exec.write",
+            CommandKind::ExecResize => "exec.resize",
             CommandKind::ExecKill => "exec.kill",
             CommandKind::ExecList => "exec.list",
             CommandKind::ExecLog => "exec.log",
@@ -666,6 +669,47 @@ pub struct ExecStartParams {
     pub log: LogSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxySpec>,
+    /// A terminal of this size instead of pipes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<TtySize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "TtySizeWire")]
+pub struct TtySize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Deserialize)]
+struct TtySizeWire {
+    rows: u16,
+    cols: u16,
+}
+
+impl TryFrom<TtySizeWire> for TtySize {
+    type Error = String;
+
+    fn try_from(wire: TtySizeWire) -> std::result::Result<TtySize, String> {
+        if wire.rows == 0 || wire.cols == 0 {
+            return Err(format!(
+                "a terminal of {} rows and {} columns: both must be at least 1",
+                wire.rows, wire.cols
+            ));
+        }
+        Ok(TtySize {
+            rows: wire.rows,
+            cols: wire.cols,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecResizeParams {
+    pub exec_id: ExecId,
+    #[serde(flatten)]
+    pub size: TtySize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2437,6 +2481,23 @@ mod tests {
         assert_eq!(kill.signal, KillSignal::Terminate);
         let interrupt: ExecKillParams = round_trip(json!({ "execId": "e", "signal": "interrupt" }));
         assert_eq!(interrupt.signal, KillSignal::Interrupt);
+        let resize: ExecResizeParams =
+            round_trip(json!({ "execId": "e", "rows": 50, "cols": 132 }));
+        assert_eq!(
+            resize.size,
+            TtySize {
+                rows: 50,
+                cols: 132
+            }
+        );
+        let tty: ExecStartParams = round_trip(json!({ "execId": "t", "argv": ["/bin/sh"],
+            "cwd": "/", "env": {}, "stdin": false, "log": { "kind": "memory" },
+            "tty": { "rows": 24, "cols": 80 } }));
+        assert_eq!(tty.tty, Some(TtySize { rows: 24, cols: 80 }));
+        assert_eq!(
+            rejects::<ExecResizeParams>(json!({ "execId": "e", "rows": 0, "cols": 80 })),
+            "a terminal of 0 rows and 80 columns: both must be at least 1"
+        );
 
         let list: ExecListResult = round_trip(json!({ "execs": [
             { "execId": "a", "state": "running", "logBytes": 1200 },

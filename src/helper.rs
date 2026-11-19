@@ -252,6 +252,14 @@ fn exec(argv: &Argv, cwd: &AbsPath, env: &BTreeMap<String, String>) -> Error {
     // After confining: on Linux the helper's other half, which keeps SIGINT ignored, has forked.
     // SAFETY: restoring the default action has no memory effects.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+    // With `tty` the parent made the terminal this process's stdout and stderr, and kept stdin
+    // for the job; the command gets the terminal as stdin too.
+    // SAFETY: isatty and dup2 act on descriptor numbers only.
+    unsafe {
+        if libc::isatty(1) == 1 && libc::dup2(1, 0) < 0 {
+            return Error::from(std::io::Error::last_os_error());
+        }
+    }
     let err = std::process::Command::new(argv.program())
         .args(argv.args())
         .current_dir(cwd.as_path())

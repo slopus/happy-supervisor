@@ -14,10 +14,10 @@ use crate::link::Outbox;
 use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::protocol::{
     Access, CommandKind, Empty, ExecId, ExecKillParams, ExecListResult, ExecLogParams,
-    ExecStartParams, ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams,
-    FsRemoveParams, FsRenameParams, FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, ProxySpec,
-    SandboxInfo, TcpMessage, TcpOpenParams, Value, WatchId, WatchStartParams, WatchStopParams,
-    WithAccess,
+    ExecResizeParams, ExecStartParams, ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams,
+    FsReadParams, FsRemoveParams, FsRenameParams, FsWriteParams, NodeInfo, NodeUpdate,
+    ProxyMessage, ProxySpec, SandboxInfo, TcpMessage, TcpOpenParams, Value, WatchId,
+    WatchStartParams, WatchStopParams, WithAccess,
 };
 use crate::proxy::egress::{self, CommandProxy, CommandProxyConfig, ListenOn};
 use crate::proxy::{NodeCa, ProxyManager};
@@ -293,6 +293,10 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
             to_value(ExecListResult {
                 execs: node.exec.list(),
             })
+        }
+        CommandKind::ExecResize => {
+            node.exec.resize(parse::<ExecResizeParams>(params)?)?;
+            to_value(Empty {})
         }
         CommandKind::ExecLog => to_value(node.exec.log(parse::<ExecLogParams>(params)?).await?),
         CommandKind::FsStat => {

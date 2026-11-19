@@ -47,7 +47,8 @@ pub enum ListenOn {
     /// `127.0.0.1` at the first free ports of this range, HTTP first. On Windows the sandbox's
     /// firewall filters permit only the range the install recorded.
     LoopbackRange(RangeInclusive<u16>),
-    /// `http.sock` and `socks.sock` in this existing directory. Unix only.
+    /// `http.sock` and `socks.sock` in this directory, created if missing and removed with
+    /// them once empty. Unix only.
     UnixDir(PathBuf),
 }
 
@@ -304,6 +305,7 @@ impl Listener {
             }
             #[cfg(unix)]
             ListenOn::UnixDir(dir) => {
+                std::fs::create_dir_all(dir)?;
                 let path = dir.join(name);
                 let unix = tokio::net::UnixListener::bind(&path)?;
                 Ok((Listener::Unix(unix), Endpoint::Unix(path)))
@@ -464,6 +466,9 @@ impl Drop for CommandProxy {
 fn remove_socket(endpoint: &Endpoint) {
     if let Endpoint::Unix(path) = endpoint {
         let _ = std::fs::remove_file(path);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 

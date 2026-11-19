@@ -768,7 +768,6 @@ impl Outbox {
         }
     }
 
-    /// Queues `overflow: true`, for a watch whose OS queue overflowed.
     /// Queues a `net.denied` in its process's lane. The command proxy rate-limits them.
     pub fn net_denied(&self, event: NetDenied) {
         let lane = Lane::Exec(event.exec_id.to_string());
@@ -776,6 +775,7 @@ impl Outbox {
         self.lock().enqueue(lane, body, Class::Retained, None);
     }
 
+    /// Queues `overflow: true`, for a watch whose OS queue overflowed.
     pub fn watch_overflow(&self, watch_id: WatchId) {
         let mut s = self.lock();
         if !s.overflowed.contains(&watch_id) {

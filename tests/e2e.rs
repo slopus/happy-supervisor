@@ -7,7 +7,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use happy_supervisor::protocol::{
-    Bytes, Event, ExecExit, ExitStatus, ProxyBody, ProxyEnd, ProxyMessage, ProxyResponse, Stream,
+    Bytes, DenyReason, Event, ExecExit, ExitStatus, ProxyBody, ProxyEnd, ProxyMessage,
+    ProxyResponse, Stream, Via,
 };
 use happy_supervisor::testing::{ControlPlane, Options, Traffic};
 use happy_supervisor::testkit::{cbor, json};
@@ -436,6 +437,58 @@ async fn the_proxy_sends_listed_hosts_through_the_control_plane() {
             "{exec_id}: {stdout}"
         );
     }
+}
+
+/// An isolated command reaches the network only through its proxies: a host outside `egress` is
+/// refused with a `net.denied`, and a credential host goes to the control plane.
+#[tokio::test]
+async fn an_isolated_command_goes_out_only_through_its_proxies() {
+    let mut node = Node::start().await;
+    let work = tempfile::tempdir().unwrap();
+    let mut access = node.sandboxed(&[work.path()], &[]);
+    access["policy"]["network"] = json!({ "mode": "isolated",
+        "egress": { "default": "deny", "allow": ["api.example.test"], "deny": [] },
+        "ports": [443], "localBind": false, "unixSockets": false });
+    let script = "curl -sS -o /dev/null -w '%{http_code}\\n' --max-time 20 http://blocked.example.test/; \
+                  curl -sS --max-time 20 https://api.example.test/hello";
+    let mut start = sh("iso", script, work.path(), access);
+    start["proxy"] = json!({ "token": "pt_iso", "hosts": ["api.example.test"] });
+    node.ok("exec.start", start).await;
+
+    let denied = node.event(|e| matches!(e, Event::NetDenied(_))).await;
+    let Event::NetDenied(denied) = denied else {
+        unreachable!()
+    };
+    assert_eq!(denied.exec_id.as_str(), "iso");
+    assert_eq!(
+        (denied.host.as_str(), denied.port, denied.via, denied.reason),
+        ("blocked.example.test", 80, Via::Http, DenyReason::Egress)
+    );
+    let request = node
+        .event(|e| matches!(e, Event::Proxy(ProxyMessage::Request(_))))
+        .await;
+    let Event::Proxy(ProxyMessage::Request(request)) = request else {
+        unreachable!()
+    };
+    assert_eq!(request.exec_id.as_str(), "iso");
+    assert_eq!(request.token.as_str(), "pt_iso");
+    assert_eq!(request.path, "/hello");
+    let stream_id = request.stream_id;
+    node.cp.send_proxy(ProxyMessage::Response(ProxyResponse {
+        stream_id,
+        status: 200,
+        headers: vec![("content-length".to_string(), Bytes::new(b"3".to_vec()))],
+    }));
+    node.cp.send_proxy(ProxyMessage::Body(ProxyBody {
+        stream_id,
+        data: Bytes::new(b"hi\n".to_vec()),
+    }));
+    node.cp
+        .send_proxy(ProxyMessage::End(ProxyEnd { stream_id }));
+
+    let (exit, stdout, stderr) = node.exit("iso").await;
+    assert_eq!(exit.exit, ExitStatus::Exited { code: 0 }, "{stderr}");
+    assert_eq!(stdout, "403\nhi\n");
 }
 
 /// Output keeps flowing while the connection drops twice, once with acks stalled so the node

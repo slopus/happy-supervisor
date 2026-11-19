@@ -1,4 +1,4 @@
-# happy-supervisor credential proxy
+# happy-supervisor command proxies
 
 A command can send its HTTP traffic for chosen hosts **through the control plane**. The node
 catches those requests, even over HTTPS, and hands them to the control plane over the link. The
@@ -28,23 +28,73 @@ configuration: which upstream, which credential, what to allow.
 
 Raw and sandboxed commands can both use a proxy.
 
+## One proxy per command
+
+Every exec whose policy has `network.mode: "isolated"` (policy.md, Network), and every exec with a
+`proxy`, gets its own **command proxy**: one HTTP proxy and one SOCKS5 proxy, run by the node
+outside any sandbox, alive until the command exits. A raw or host-mode exec with no `proxy` gets
+none.
+
+For each outbound request the command proxy decides, in order:
+
+1. **Credential route.** The host matches `proxy.hosts` and the request came through the HTTP
+   proxy: it goes to the control plane over the link (How requests travel). In isolated mode the
+   host must also pass `egress`, or the request is refused; `ports` does not apply, since the
+   control plane decides where the request goes. Through SOCKS5 a credential host is refused,
+   since the node can only rewrite HTTP.
+2. **Egress check**, isolated mode only. The host must pass `network.egress` and the port must be
+   in `network.ports`.
+3. **Resolve and connect.** The proxy resolves the name itself. In isolated mode it drops every
+   address that is loopback, private (RFC 1918, ULA), link-local, CGNAT (100.64/10), Azure's 168.63.129.16, multicast,
+   unspecified or one of the node's own, unless `egress.allow` names that literal IP. It tries
+   the remaining addresses in order and uses the first that accepts.
+4. **Tunnel.** HTTP `CONNECT` and SOCKS5 `CONNECT` splice bytes; absolute-form `http://` requests
+   are forwarded with hop-by-hop headers removed. Only the credential route terminates TLS.
+
+A refusal is HTTP `403` with a one-line reason, or SOCKS5 reply `0x02`. SOCKS5 offers no
+authentication (`0x00`), `CONNECT` only (`UDP ASSOCIATE` and `BIND` get `0x07`), and address types
+domain, IPv4 and IPv6. The HTTP proxy takes `CONNECT` and absolute-form `http://` requests; other
+forms get `400`.
+
+Every refusal sends a `net.denied` event (api.md), at most 20 a second per exec; the rest are
+counted in the next event's `dropped`:
+
+```json
+{ "kind": "net.denied", "body": { "execId": "e_1", "host": "evil.example", "port": 443, "via": "http", "reason": "egress" } }
+```
+
+`reason` is `egress`, `port`, `address` (every resolved address was filtered), `resolve` (no
+address) or `credential` (a credential host through SOCKS5). `via` is `http` or `socks5`. In host
+mode a name that does not resolve is not a policy decision: the client gets HTTP `502` or SOCKS5
+reply `0x04`, and no event is sent.
+
 ## What the command gets
 
-The node starts one proxy for the command, an HTTP proxy on a loopback port that only that
-command knows the password to. It **sets** these variables in the command's environment,
-replacing any the control plane passed:
+| Platform | The proxy listens on | The command reaches it at |
+|---|---|---|
+| Linux, isolated | `http.sock` and `socks.sock` in `private/net/<n>/` of the state directory, bind-mounted into the sandbox | `127.0.0.1:3128` (HTTP) and `127.0.0.1:1080` (SOCKS5) in the sandbox's own network namespace, where the sandbox helper bridges each to its socket |
+| Otherwise | `127.0.0.1:<ephemeral>` each | the same addresses |
+
+A Unix socket's path holds at most 107 bytes. If the state directory is too deep for that, an
+isolated exec on Linux fails with `sandbox_unavailable`.
+
+The node **sets** these variables, replacing any the control plane passed:
 
 | Variable | Value |
 |---|---|
-| `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` | `http://happy:<secret>@127.0.0.1:<port>` |
-| `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO` | the node's CA bundle path |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` | `http://<http-addr>`, or `http://happy:<secret>@<http-addr>` with a credential route on a TCP port |
+| `ALL_PROXY`, `all_proxy` | `socks5h://<socks-addr>`, isolated mode only |
+| `NO_PROXY`, `no_proxy` | `localhost,127.0.0.1,::1` |
+| `GIT_SSH_COMMAND` | `ssh -o ProxyCommand='<supervisor> __connect %h %p'`, isolated mode only |
+| `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO` | the node's CA bundle path, with a credential route |
 
-`<secret>` is 32 random bytes, base64url, fresh for each command. A connection to the proxy
-without it gets `407`. The proxy stops when the command exits.
+`<secret>` is 32 random bytes, base64url, fresh for each command. A connection to the HTTP proxy
+without it gets `407`. Any local process can reach a TCP port, so a credential route there needs
+the secret; on a Unix socket only the sandbox reaches the proxy, and there is none. Without a
+credential route the proxy grants nothing a local process could not do itself.
 
-Programs that ignore proxy variables bypass the proxy. Their traffic goes out directly, like any
-outbound connection (policy.md, Outbound network). The proxy catches traffic. It is not a
-network boundary.
+Programs that ignore the proxy variables have no network in isolated mode, and bypass the proxy
+in host mode, where it catches traffic but is not a network boundary.
 
 ### The node's CA
 
@@ -65,8 +115,8 @@ The proxy handles three kinds of client requests:
 
 | Client sends | Host in `hosts` | Host not in `hosts` |
 |---|---|---|
-| `CONNECT host:port` (HTTPS) | The node answers `200`, then terminates TLS itself with a certificate for `host` signed by its CA (ALPN `http/1.1`). Each HTTP/1.1 request inside is forwarded through the control plane with `scheme: "https"`. | An opaque TCP tunnel straight to `host:port`. |
-| `GET http://host/…` (plain HTTP) | Forwarded through the control plane with `scheme: "http"`. | Forwarded directly by the node. |
+| `CONNECT host:port` (HTTPS) | The node answers `200`, then terminates TLS itself with a certificate for `host` signed by its CA (ALPN `http/1.1`). Each HTTP/1.1 request inside is forwarded through the control plane with `scheme: "https"`. | An opaque TCP tunnel to `host:port`, after the checks above. |
+| `GET http://host/…` (plain HTTP) | Forwarded through the control plane with `scheme: "http"`. | Forwarded by the node, after the checks above. |
 | A WebSocket or other `Upgrade` request | `501`. Not supported in this version. | Tunnelled directly. |
 
 The node never connects to a listed host itself. The control plane can send a request anywhere,

@@ -18,7 +18,7 @@ use std::time::Duration;
 use self::log::{FileLog, Log, MemoryLog};
 use crate::error::{Error, ErrorKind, Result};
 use crate::link::Outbox;
-use crate::policy::{Confinement, ResolvedPolicy};
+use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::process::{self, Tree};
 use crate::protocol::{
     AbsPath, Argv, Bytes, ExecId, ExecLogParams, ExecLogResult, ExecStartParams, ExecStartResult,
@@ -27,7 +27,7 @@ use crate::protocol::{
     RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction,
 };
 use crate::proxy::egress::CommandProxy;
-use crate::sandbox::{NetnsControl, Placeholders};
+use crate::sandbox::{NetPlan, NetnsControl, Placeholders};
 
 /// After a process exits, how long its output may stay silent before the exit is reported
 /// without waiting for the pipes to close. Processes it left behind can hold them open forever.
@@ -437,7 +437,7 @@ impl Inner {
             proxy: _,
         } = params;
         if let Some(proxy) = &proxy {
-            env.extend(proxy.env(&std::env::current_exe()?));
+            env.extend(proxy.env(&crate::helper::exe()?));
         }
         let program = resolve_program(argv.program(), &env)?;
         let log = open_log(&log, confinement)?;
@@ -448,8 +448,15 @@ impl Inner {
                 Some(TunnelRoute::Loopback),
             ),
             Confinement::Sandboxed(policy) => {
+                let net = match (policy.network(), &proxy) {
+                    (Network::Isolated { .. }, Some(proxy)) => Some(NetPlan {
+                        http: proxy.http.clone(),
+                        socks: proxy.socks.clone(),
+                    }),
+                    _ => None,
+                };
                 let (spawned, (placeholders, netns)) =
-                    spawn_sandboxed(policy, &program, &argv, &cwd, env, stdin)?;
+                    spawn_sandboxed(policy, net, &program, &argv, &cwd, env, stdin)?;
                 let tunnel = policy.network().local_bind().then(|| match netns {
                     Some(netns) => TunnelRoute::Netns(Arc::new(netns)),
                     None => TunnelRoute::Loopback,
@@ -846,6 +853,7 @@ fn adopt(mut child: Child) -> Result<Spawned> {
 #[cfg(unix)]
 fn spawn_sandboxed(
     policy: &ResolvedPolicy,
+    net: Option<NetPlan>,
     program: &Path,
     argv: &Argv,
     cwd: &AbsPath,
@@ -867,7 +875,7 @@ fn spawn_sandboxed(
     let exe = crate::helper::exe()?;
     let plan = crate::sandbox::Plan {
         policy,
-        net: None,
+        net,
         exe: &exe,
     };
     let prepared = crate::sandbox::prepare(&plan, &job)?;
@@ -915,6 +923,7 @@ fn spawn_helper(mut command: Command, frame: &[u8], stdin: bool) -> Result<Spawn
 #[cfg(windows)]
 fn spawn_sandboxed(
     _policy: &ResolvedPolicy,
+    _net: Option<NetPlan>,
     _program: &Path,
     _argv: &Argv,
     _cwd: &AbsPath,

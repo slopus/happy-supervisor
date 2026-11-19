@@ -1,6 +1,8 @@
 //! The message boundary: parses each command's body, resolves `access` once, and calls the
 //! module that owns the command. Stream messages from the control plane go to the proxy.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -9,18 +11,21 @@ use crate::exec::ExecManager;
 use crate::exec::TunnelRoute;
 use crate::fs::{self, FsRequest};
 use crate::link::Outbox;
-use crate::policy::{Confinement, ResolvedPolicy};
+use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::protocol::{
-    Access, CommandKind, Empty, ExecKillParams, ExecListResult, ExecLogParams, ExecStartParams,
-    ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams, FsRemoveParams,
-    FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, SandboxInfo, TcpMessage, TcpOpenParams,
-    Value, WatchId, WatchStartParams, WatchStopParams, WithAccess,
+    Access, CommandKind, Empty, ExecId, ExecKillParams, ExecListResult, ExecLogParams,
+    ExecStartParams, ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams,
+    FsRemoveParams, FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, ProxySpec, SandboxInfo,
+    TcpMessage, TcpOpenParams, Value, WatchId, WatchStartParams, WatchStopParams, WithAccess,
 };
-use crate::proxy::egress::{self, CommandProxyConfig, ListenOn};
+use crate::proxy::egress::{self, CommandProxy, CommandProxyConfig, ListenOn};
 use crate::proxy::{NodeCa, ProxyManager};
 use crate::state::StateDir;
 use crate::tunnel::TunnelManager;
 use crate::watch::WatchManager;
+
+/// The longest path a Unix socket address holds on Linux, without its terminating NUL.
+const MAX_SOCKET_PATH: usize = 107;
 
 /// Everything one supervisor serves. Lives across connections and sessions.
 pub struct Node {
@@ -33,6 +38,8 @@ pub struct Node {
     watch: WatchManager,
     proxy: ProxyManager,
     tunnels: TunnelManager,
+    /// Names the next directory under `private/net` for an isolated exec's proxy sockets.
+    net_dirs: AtomicU64,
 }
 
 impl Node {
@@ -48,6 +55,7 @@ impl Node {
         if let Err(err) = crate::sandbox::Placeholders::sweep(&records) {
             tracing::warn!("removing a previous run's placeholders failed: {err}");
         }
+        let _ = std::fs::remove_dir_all(state.private_dir().join("net"));
         let sandbox = crate::sandbox::probe();
         Ok(Node::new(
             state,
@@ -76,6 +84,7 @@ impl Node {
             watch: WatchManager::new(outbox),
             tunnels: TunnelManager::new(&proxy),
             proxy,
+            net_dirs: AtomicU64::new(0),
         }
     }
 
@@ -127,6 +136,57 @@ impl Node {
                 Ok(Confinement::Sandboxed(resolved))
             }
         }
+    }
+
+    /// Starts an exec's command proxy, when its policy isolates its network or it has a
+    /// credential route (proxy.md). A credential route's CA bundle becomes readable.
+    async fn command_proxy(
+        &self,
+        exec_id: &ExecId,
+        credential: Option<ProxySpec>,
+        confinement: &mut Confinement,
+    ) -> Result<Option<CommandProxy>> {
+        let egress = match &*confinement {
+            Confinement::Sandboxed(policy) => match policy.network() {
+                Network::Isolated { egress, ports, .. } => Some((egress.clone(), ports.clone())),
+                Network::Host { .. } => None,
+            },
+            Confinement::Raw => None,
+        };
+        if egress.is_none() && credential.is_none() {
+            return Ok(None);
+        }
+        let config = CommandProxyConfig {
+            exec_id: exec_id.clone(),
+            listen: self.proxy_listen(egress.is_some())?,
+            egress,
+            credential,
+        };
+        let proxy = egress::start(config, &self.proxy).await?;
+        if let (Confinement::Sandboxed(policy), Some(bundle)) = (confinement, proxy.ca_bundle()) {
+            policy.allow_read_file(bundle);
+        }
+        Ok(Some(proxy))
+    }
+
+    /// An isolated Linux sandbox has its own loopback, so it reaches its proxies through Unix
+    /// sockets the helper bridges. A socket's path must fit the 108 bytes of a socket address,
+    /// so their directory is a counter.
+    fn proxy_listen(&self, isolated: bool) -> Result<ListenOn> {
+        if !(cfg!(target_os = "linux") && isolated) {
+            return Ok(ListenOn::Loopback);
+        }
+        let n = self.net_dirs.fetch_add(1, Ordering::Relaxed);
+        let dir = self.state.private_dir().join("net").join(n.to_string());
+        let longest = dir.join("socks.sock").as_os_str().len();
+        if longest > MAX_SOCKET_PATH {
+            return Err(Error::sandbox_unavailable(format!(
+                "the state directory's path is too long for the proxy sockets of isolated \
+                 networking: {} is {longest} bytes, over {MAX_SOCKET_PATH}",
+                dir.join("socks.sock").display()
+            )));
+        }
+        Ok(ListenOn::UnixDir(dir))
     }
 
     async fn update(&self, update: NodeUpdate) -> Result<()> {
@@ -201,24 +261,9 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
         CommandKind::ExecStart => {
             let WithAccess { mut params, access } = parse::<WithAccess<ExecStartParams>>(params)?;
             let mut confinement = node.confine(access).await?;
-            let proxy = match params.proxy.take() {
-                Some(spec) => {
-                    let config = CommandProxyConfig {
-                        exec_id: params.exec_id.clone(),
-                        egress: None,
-                        credential: Some(spec),
-                        listen: ListenOn::Loopback,
-                    };
-                    let proxy = egress::start(config, &node.proxy).await?;
-                    if let (Confinement::Sandboxed(policy), Some(bundle)) =
-                        (&mut confinement, proxy.ca_bundle())
-                    {
-                        policy.allow_read_file(bundle);
-                    }
-                    Some(proxy)
-                }
-                None => None,
-            };
+            let proxy = node
+                .command_proxy(&params.exec_id, params.proxy.take(), &mut confinement)
+                .await?;
             to_value(node.exec.start(params, confinement, proxy).await?)
         }
         CommandKind::ExecWrite => {

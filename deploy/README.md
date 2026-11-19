@@ -126,3 +126,6 @@ triggers and `release.yml` do.
   unit's `[Service]` and restart it. A command killed for `memoryBytes` exits with
   `{ "kind": "memoryLimit" }`. `join` no longer takes `--token`: it reads `HAPPY_JOIN_TOKEN` or
   `--token-file` (`-` for stdin), so the token never shows in `ps`.
+* **0.2.0-linux.3.** The first published release: the code of 0.2.0-linux.2 (never published),
+  now built, tested and released by `release.yml` for all five platforms, so it is the first
+  with macOS and Windows binaries and `install.ps1`. It is also a GitHub Release.

@@ -1,12 +1,13 @@
-//! The Windows sandbox (policy.md): a pool of dedicated local accounts, file ACEs that name the
-//! leased account's own group, a restricted token, persistent WFP filters keyed on network
-//! groups, and a Job Object. Ported in part from Codex's `windows-sandbox-rs` (Apache-2.0; see
-//! NOTICE); each derived file says what it took.
+//! The Windows sandbox (policy.md): pools of dedicated local accounts, one per network profile,
+//! file ACEs that name the leased account's own group, a restricted token, persistent WFP
+//! filters keyed on the network groups the account belongs to, and a Job Object. Ported in part
+//! from Codex's `windows-sandbox-rs` (Apache-2.0; see NOTICE); each derived file says what it
+//! took.
 //!
 //! An operation runs as three processes:
 //!
 //! 1. The broker, `<exe> __sandbox`, as the supervisor's own account, in the exec's Job Object.
-//!    It reads the [`Job`], leases an account, adds the ACEs the policy needs for that account's
+//!    It reads the [`Job`], leases an account of the policy's network profile, adds the ACEs the policy needs for that account's
 //!    group, and starts the runner with CreateProcessWithLogonW, which std cannot do. When the
 //!    runner exits, it revokes the ACEs.
 //! 2. The runner, `<exe> __sandbox runner`, as the leased account, in the broker's own Job
@@ -51,7 +52,7 @@ const GAPS: &[&str] = &[
     "in isolated mode the sandbox can connect to every loopback port in the proxy port range, which includes other commands' proxies",
     "in isolated mode with localBind the sandbox can connect to every loopback port, including the host's own local services, since its own listeners cannot be told apart from them",
     "in isolated mode names still resolve: the DNS Client service queries the network for the sandbox, so a lookup can carry data out",
-    "a command that makes a sandbox network group deny-only in a restricted token of its own escapes the network filters",
+    "a process elsewhere on the machine whose restricted token restricts to none of Everyone, RESTRICTED and WRITE RESTRICTED falls under the isolated network filters and loses the network",
     "processes started through system services (WMI, Task Scheduler) leave the Job Object",
     "the sandbox can read the supervisor binary, which it runs as",
     "the sandbox shares the supervisor's window station and desktop",

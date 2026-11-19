@@ -17,8 +17,8 @@ use happy_supervisor::policy::{
     Confinement, Default, HostRules, Network, Policy, ResolvedPolicy, RuleSet,
 };
 use happy_supervisor::protocol::{
-    AbsPath, Argv, Bytes, FsReadParams, FsReadResult, FsWriteParams, Mechanism, SandboxStatus,
-    WriteMode,
+    AbsPath, Argv, Bytes, FsReadParams, FsReadResult, FsRenameParams, FsWriteParams, Mechanism,
+    SandboxStatus, WriteMode,
 };
 use happy_supervisor::sandbox::{self, Endpoint, NetPlan};
 use windows_sys::Win32::Foundation::{
@@ -821,10 +821,47 @@ fn file_operations_run_as_the_sandbox() {
             denied(fs::handle(write("out/new.txt"), confinement(&tree, &[], &["out"])).await),
             Ok(())
         );
+        let rename = |from: &str, to: &str| {
+            FsRequest::Rename(FsRenameParams {
+                from: abs(&tree.path(from)),
+                to: abs(&tree.path(to)),
+            })
+        };
         assert_eq!(
-            std::fs::read_to_string(tree.path("out/new.txt")).unwrap(),
+            denied(
+                fs::handle(
+                    rename("out/new.txt", "out/locked/moved.txt"),
+                    confinement(&tree, &[], &["out"])
+                )
+                .await
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            denied(
+                fs::handle(
+                    rename("out/locked", "out/renamed"),
+                    confinement(&tree, &[], &["out"])
+                )
+                .await
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            denied(
+                fs::handle(
+                    rename("data/file.txt", "out/stolen.txt"),
+                    confinement(&tree, &["data"], &["out"])
+                )
+                .await
+            ),
+            Err(ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.path("out/renamed/moved.txt")).unwrap(),
             "written"
         );
+        assert!(tree.path("data/file.txt").exists());
     });
 }
 

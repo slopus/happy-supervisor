@@ -292,6 +292,9 @@ a4 0c 67 "build-1" 0d 66 "stdout" 09 50 <16 bytes> 0e 00
 | 150 | `network` | key |
 | 151 | `egress` | key |
 | 152 | `ports` | key |
+| 153 | `net.denied` | kind |
+| 154 | `via` | key |
+| 155 | `dropped` | key |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -692,6 +695,19 @@ left behind may hold them open. Output those leftovers write later is neither se
 Sent once, when a `timeout` elapses, before anything else the action causes. For `kill`, the
 `exec.exit` with `timedOut` follows. For `background`, no further `exec.output` is sent for this
 process. `logBytes` is the output produced so far.
+
+### `net.denied` (event)
+
+```json
+{ "execId": "e_1", "host": "evil.example", "port": 443, "via": "http", "reason": "egress" }
+```
+
+The process's command proxy refused a connection (proxy.md, Egress proxy). `via` is `http` or
+`socks5`. `reason` is `egress` (the host failed `network.egress`), `port` (not in
+`network.ports`), `address` (every resolved address was filtered), `resolve` (no address), or
+`credential` (a credential host asked through SOCKS5, which cannot carry the credential route).
+At most 20 a second per process. `dropped` (int) is present on the next event after some were
+rate-limited, and counts them. Sent in the process's lane, `exec:<execId>`.
 
 ### `exec.log`
 

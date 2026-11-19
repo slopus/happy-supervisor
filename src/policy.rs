@@ -435,7 +435,7 @@ impl ResolvedPolicy {
     /// command with a credential proxy (proxy.md). A missing file, or one inside the state
     /// directory, is not allowed.
     pub fn allow_read_file(&mut self, path: &Path) {
-        let Ok(canonical) = std::fs::canonicalize(path) else {
+        let Ok(canonical) = canonicalize(path) else {
             return;
         };
         if canonical.starts_with(&self.state_dir) || !canonical.is_file() {
@@ -499,13 +499,14 @@ impl ResolvedPolicy {
     }
 }
 
-/// The canonical form of `path`, or of its deepest existing ancestor followed by the rest.
-fn resolve_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
+/// The canonical form of `path`, or of its deepest existing ancestor followed by the rest: how
+/// policy entries are resolved, and how a path is checked against them.
+pub fn resolve_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = canonicalize(path) {
         return canonical;
     }
     for ancestor in path.ancestors().skip(1) {
-        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+        if let Ok(canonical) = canonicalize(ancestor) {
             let rest = path
                 .strip_prefix(ancestor)
                 .expect("an ancestor is a prefix");
@@ -513,6 +514,24 @@ fn resolve_path(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// `std::fs::canonicalize`, without the `\\?\` prefix Windows adds to a plain drive path: the
+/// resolved paths reach messages and the environment, where people write `C:\...`.
+pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    let plain_drive = |rest: &&str| {
+        let drive = rest.as_bytes();
+        drive.len() >= 3 && drive[0].is_ascii_alphabetic() && &drive[1..3] == b":\\"
+    };
+    let stripped = canonical
+        .to_str()
+        .and_then(|s| s.strip_prefix(r"\\?\"))
+        .filter(plain_drive);
+    match stripped {
+        Some(rest) if cfg!(windows) => Ok(PathBuf::from(rest)),
+        _ => Ok(canonical),
+    }
 }
 
 /// The device nodes the v1 backends grant every sandbox.
@@ -671,6 +690,25 @@ mod tests {
             rejection("C:/a//b"),
             r#"policy path "C:/a//b" has an empty component"#
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolved_windows_paths_have_no_verbatim_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let missing = format!(r"{dir}\missing\deeper");
+        let p = policy(
+            rules(Default::Deny, &[dir, &missing], &[]),
+            rules(Default::Deny, &[], &[]),
+        );
+        let resolved = ResolvedPolicy::resolve(&p, &tmp.path().join("state")).unwrap();
+        for layer in resolved.layers() {
+            let text = layer.path.to_str().unwrap().to_string();
+            assert!(!text.starts_with(r"\\?\"), "{text}");
+            assert_eq!(text.as_bytes()[1..3], *b":\\", "{text}");
+        }
+        assert!(resolved.can_read(&resolve_path(&tmp.path().join("x"))));
     }
 
     #[test]

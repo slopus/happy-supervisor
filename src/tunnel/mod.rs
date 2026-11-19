@@ -11,11 +11,13 @@ use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::exec::TunnelRoute;
 use crate::protocol::{
     LoopbackHost, MAX_STREAMS, MAX_TCP_DATA_BYTES, StreamId, TCP_CONNECT_TIMEOUT_MS, TcpMessage,
     TcpOpenParams,
 };
 use crate::proxy::ProxyManager;
+use crate::sandbox::NetnsControl;
 use crate::streams::{Piece, Refused, Streams, Tunnel};
 
 /// Every tunnel of this node. Cheap to clone.
@@ -40,8 +42,9 @@ impl TunnelManager {
         }
     }
 
-    /// Connects to the loopback port and opens the stream. `Ok` once connected.
-    pub async fn open(&self, params: TcpOpenParams) -> Result<()> {
+    /// Connects to the loopback port, through `route`, and opens the stream. `Ok` once
+    /// connected.
+    pub async fn open(&self, params: TcpOpenParams, route: TunnelRoute) -> Result<()> {
         let id = params.stream_id;
         // Registered before the first await: `tcp.data` sent right behind `tcp.open` is
         // handled after this future first runs, and must find the stream.
@@ -49,7 +52,11 @@ impl TunnelManager {
             Refused::InUse => Error::new(ErrorKind::AlreadyExists, format!("stream {id} is open")),
             Refused::Busy => Error::too_large(format!("{MAX_STREAMS} streams are open")),
         })?;
-        let socket = match connect(params.host, params.port).await {
+        let connected = match route {
+            TunnelRoute::Loopback => connect(params.host, params.port).await,
+            TunnelRoute::Netns(netns) => connect_in(netns, params.port).await,
+        };
+        let socket = match connected {
             Ok(socket) => socket,
             Err(err) => {
                 self.streams.discard(id);
@@ -77,6 +84,31 @@ impl TunnelManager {
     pub fn session_lost(&self) {
         self.streams.session_lost();
     }
+}
+
+/// Connects to `127.0.0.1:port` in a sandbox's network namespace, through its helper.
+async fn connect_in(netns: Arc<NetnsControl>, port: u16) -> Result<TcpStream> {
+    let target = format!("127.0.0.1:{port} in the process's network");
+    let connected = tokio::task::spawn_blocking(move || netns.connect(port))
+        .await
+        .map_err(|err| Error::new(ErrorKind::Io, format!("connecting failed: {err}")))?;
+    let socket = connected
+        .and_then(|socket| {
+            socket.set_nonblocking(true)?;
+            TcpStream::from_std(socket)
+        })
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::ConnectionRefused => Error::new(
+                ErrorKind::ConnectionRefused,
+                format!("{target} refused the connection"),
+            ),
+            _ => {
+                let message = format!("{target}: {err}");
+                Error::new(Error::from(err).kind, message)
+            }
+        })?;
+    let _ = socket.set_nodelay(true);
+    Ok(socket)
 }
 
 async fn connect(host: LoopbackHost, port: u16) -> Result<TcpStream> {
@@ -234,11 +266,15 @@ mod tests {
             .map(|_| tunnels.streams.open_tcp(StreamId::generate()).unwrap())
             .collect();
         let err = tunnels
-            .open(TcpOpenParams {
-                stream_id: StreamId::generate(),
-                host: LoopbackHost::V4,
-                port: 1,
-            })
+            .open(
+                TcpOpenParams {
+                    stream_id: StreamId::generate(),
+                    host: LoopbackHost::V4,
+                    port: 1,
+                    exec_id: None,
+                },
+                TunnelRoute::Loopback,
+            )
             .await
             .unwrap_err();
         assert_eq!(

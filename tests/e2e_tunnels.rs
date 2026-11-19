@@ -357,6 +357,49 @@ async fn a_closed_port_is_connection_refused() {
     assert_eq!(err.kind, ErrorKind::InvalidParams);
 }
 
+#[tokio::test]
+async fn an_exec_id_routes_to_that_process_if_it_may_bind() {
+    let mut node = Node::start().await;
+    let port = node.server("srv", "echo").await;
+    let id = StreamId::generate();
+    let mut body = open_body(id, port);
+    body["execId"] = json!("srv");
+    assert_eq!(node.ok("tcp.open", body).await, json!({}));
+
+    let mut body = open_body(StreamId::generate(), port);
+    body["execId"] = json!("nope");
+    let err = node.call("tcp.open", body).await.unwrap_err();
+    assert_eq!(
+        (err.kind, err.message.as_str()),
+        (ErrorKind::NotFound, "nope is not running")
+    );
+
+    let no_bind = json!({ "mode": "sandboxed", "policy": {
+        "filesystem": {
+            "read": { "default": "deny", "allow": ["/"], "deny": [] },
+            "write": { "default": "deny", "allow": [], "deny": [] }
+        },
+        "network": { "mode": "host", "localBind": false, "unixSockets": false } } });
+    node.ok(
+        "exec.start",
+        json!({ "execId": "confined", "argv": ["/bin/sleep", "30"], "cwd": "/", "env": {},
+                "access": no_bind }),
+    )
+    .await;
+    let mut body = open_body(StreamId::generate(), port);
+    body["execId"] = json!("confined");
+    let err = node.call("tcp.open", body).await.unwrap_err();
+    assert_eq!(
+        (err.kind, err.message.as_str()),
+        (
+            ErrorKind::PermissionDenied,
+            "confined's policy does not allow localBind"
+        )
+    );
+    node.kill("confined").await;
+    node.kill("srv").await;
+}
+
 /// A local server that stops reading holds the node to one window of the control plane's
 /// bytes: the node credits only what it wrote, and the session carries on.
 #[tokio::test]

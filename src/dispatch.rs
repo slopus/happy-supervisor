@@ -6,14 +6,15 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::exec::ExecManager;
+use crate::exec::TunnelRoute;
 use crate::fs::{self, FsRequest};
 use crate::link::Outbox;
 use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
     Access, CommandKind, Empty, ExecKillParams, ExecListResult, ExecLogParams, ExecStartParams,
     ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams, FsRemoveParams,
-    FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, SandboxInfo, TcpMessage, Value, WatchId,
-    WatchStartParams, WatchStopParams, WithAccess,
+    FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, SandboxInfo, TcpMessage, TcpOpenParams,
+    Value, WatchId, WatchStartParams, WatchStopParams, WithAccess,
 };
 use crate::proxy::{NodeCa, ProxyManager};
 use crate::state::StateDir;
@@ -256,7 +257,12 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
             to_value(Empty {})
         }
         CommandKind::TcpOpen => {
-            node.tunnels.open(parse(params)?).await?;
+            let params: TcpOpenParams = parse(params)?;
+            let route = match &params.exec_id {
+                Some(exec_id) => node.exec.tunnel_route(exec_id)?,
+                None => TunnelRoute::Loopback,
+            };
+            node.tunnels.open(params, route).await?;
             to_value(Empty {})
         }
         CommandKind::WatchStop => {

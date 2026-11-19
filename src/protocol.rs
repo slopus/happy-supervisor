@@ -246,6 +246,8 @@ pub enum Event {
     ExecTimedOut(ExecTimedOut),
     #[serde(rename = "watch.event")]
     WatchEvent(WatchEvent),
+    #[serde(rename = "net.denied")]
+    NetDenied(NetDenied),
     /// A `proxy.*` stream message (proxy.md), which carries its own `kind`.
     #[serde(untagged)]
     Proxy(ProxyMessage),
@@ -255,12 +257,13 @@ pub enum Event {
 }
 
 impl Event {
-    pub const KINDS: [&str; 5] = [
+    pub const KINDS: [&str; 6] = [
         "node.ready",
         "exec.output",
         "exec.exit",
         "exec.timedOut",
         "watch.event",
+        "net.denied",
     ];
 
     /// Parses a received message as an event. `None` for a kind that is not an event.
@@ -867,6 +870,37 @@ pub struct ExecTimedOut {
     pub log_bytes: u64,
 }
 
+/// A command proxy refused one of the process's connections (proxy.md, Egress proxy).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetDenied {
+    pub exec_id: ExecId,
+    pub host: String,
+    pub port: u16,
+    pub via: Via,
+    pub reason: DenyReason,
+    /// Refusals not reported since the last event, over the rate limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    Http,
+    Socks5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DenyReason {
+    Egress,
+    Port,
+    Address,
+    Resolve,
+    Credential,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecLogParams {
@@ -1185,6 +1219,9 @@ pub struct TcpOpenParams {
     pub stream_id: StreamId,
     pub host: LoopbackHost,
     pub port: u16,
+    /// Connect to the loopback as this running process sees it (tunnels.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_id: Option<ExecId>,
 }
 
 #[derive(Deserialize)]
@@ -1193,6 +1230,8 @@ struct TcpOpenWire {
     stream_id: StreamId,
     host: LoopbackHost,
     port: u16,
+    #[serde(default)]
+    exec_id: Option<ExecId>,
 }
 
 impl TryFrom<TcpOpenWire> for TcpOpenParams {
@@ -1206,6 +1245,7 @@ impl TryFrom<TcpOpenWire> for TcpOpenParams {
             stream_id: wire.stream_id,
             host: wire.host,
             port: wire.port,
+            exec_id: wire.exec_id,
         })
     }
 }
@@ -2178,6 +2218,14 @@ mod tests {
         let open: TcpOpenParams =
             round_trip(json!({ "streamId": u(ID_A), "host": "localhost", "port": 3000 }));
         assert_eq!(open.host.addresses().len(), 2);
+        assert_eq!(open.exec_id, None);
+        let routed: TcpOpenParams = round_trip(
+            json!({ "streamId": u(ID_A), "host": "127.0.0.1", "port": 3000, "execId": "dev-server" }),
+        );
+        assert_eq!(
+            routed.exec_id,
+            Some(ExecId::try_from("dev-server").unwrap())
+        );
         assert_eq!(
             parse::<TcpOpenParams>(json!({ "streamId": u(ID_A), "host": "::1", "port": 1 })).host,
             LoopbackHost::V6
@@ -2398,6 +2446,33 @@ mod tests {
                 log_bytes: 183022
             })
         );
+
+        let denied: Event = round_trip(
+            json!({ "kind": "net.denied", "body": { "execId": "e_1", "host": "evil.example", "port": 443, "via": "http", "reason": "egress" } }),
+        );
+        assert_eq!(
+            denied,
+            Event::NetDenied(NetDenied {
+                exec_id: ExecId::try_from("e_1").unwrap(),
+                host: "evil.example".to_string(),
+                port: 443,
+                via: Via::Http,
+                reason: DenyReason::Egress,
+                dropped: None,
+            })
+        );
+        let counted: Event = round_trip(
+            json!({ "kind": "net.denied", "body": { "execId": "e_1", "host": "10.0.0.1", "port": 22, "via": "socks5", "reason": "address", "dropped": 7 } }),
+        );
+        assert!(matches!(
+            counted,
+            Event::NetDenied(NetDenied {
+                via: Via::Socks5,
+                reason: DenyReason::Address,
+                dropped: Some(7),
+                ..
+            })
+        ));
 
         let log: ExecLogParams =
             round_trip(json!({ "execId": "build-1", "offset": 0, "length": 65536 }));

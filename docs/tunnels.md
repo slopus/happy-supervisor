@@ -16,7 +16,7 @@ limit counts both.
 `tcp.open` is a **command** from the control plane:
 
 ```json
-{ "streamId": "0193…", "host": "127.0.0.1", "port": 3000 }
+{ "streamId": "0193…", "host": "127.0.0.1", "port": 3000, "execId": "dev-server" }
 ```
 
 * `streamId` is a UUIDv7 the control plane chooses. It names the stream from then on. An ID in use
@@ -25,6 +25,15 @@ limit counts both.
   reachable. A tunnel is not a general network exit from the node. `localhost` tries `::1`,
   then `127.0.0.1`.
 * `port` is 1 to 65535.
+* `execId` is optional. Without it the node connects to its own loopback. With it the node
+  connects to `127.0.0.1:<port>` **as that process sees it**. The process must be running
+  (`not_found` otherwise), and a sandboxed one's policy must have `localBind: true`
+  (`permission_denied` otherwise). A raw process qualifies.
+  * Linux, isolated network (policy.md): the process has its own network namespace. The sandbox
+    helper (pid 1 of the sandbox) holds a control socket to the node. The node asks it to
+    connect, and the helper passes the connected socket back with `SCM_RIGHTS`. The node never
+    enters the namespace.
+  * Everywhere else the process shares the node's loopback, so this is the same as no `execId`.
 
 The node connects, and replies `{}` once the TCP connection is established, with a 10 s connect
 timeout. A refused connection replies `connection_refused`, and a timeout replies `timed_out`.

@@ -81,9 +81,11 @@ async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsRespo
     if let FsRequest::Stat(params) = &request {
         let path = params.path.as_path().to_path_buf();
         let policy = policy.clone();
-        let readable = tokio::task::spawn_blocking(move || policy.can_read(&canonical(&path)))
-            .await
-            .map_err(|err| Error::new(ErrorKind::Io, format!("policy check failed: {err}")))?;
+        let readable = tokio::task::spawn_blocking(move || {
+            policy.can_read(&crate::policy::resolve_path(&path))
+        })
+        .await
+        .map_err(|err| Error::new(ErrorKind::Io, format!("policy check failed: {err}")))?;
         if !readable {
             return Err(Error::new(
                 ErrorKind::PermissionDenied,
@@ -127,25 +129,6 @@ async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsRespo
         ));
     }
     crate::helper::parse_fs_reply(&output.stdout)
-}
-
-/// `path` with every existing ancestor resolved, so a policy check sees where it really is.
-/// The missing tail, if any, is kept as written.
-fn canonical(path: &Path) -> PathBuf {
-    let mut tail = Vec::new();
-    let mut head = path;
-    loop {
-        if let Ok(resolved) = std::fs::canonicalize(head) {
-            return tail.iter().rev().fold(resolved, |acc, name| acc.join(name));
-        }
-        match (head.parent(), head.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_os_string());
-                head = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
 }
 
 /// An io error with the path it happened on in its message.

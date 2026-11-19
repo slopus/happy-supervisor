@@ -158,7 +158,7 @@ fn open(
         let err = Error::from(err);
         Error::new(err.kind, format!("{}: {}", path.as_str(), err.message))
     };
-    let root = std::fs::canonicalize(path.as_path()).map_err(at)?;
+    let root = crate::policy::canonicalize(path.as_path()).map_err(at)?;
     let filter = match confinement {
         Confinement::Raw => None,
         Confinement::Sandboxed(policy) => {

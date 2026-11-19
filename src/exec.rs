@@ -27,6 +27,7 @@ use crate::protocol::{
     RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction,
 };
 use crate::proxy::ProxyLease;
+use crate::sandbox::{NetnsControl, Placeholders};
 
 /// After a process exits, how long its output may stay silent before the exit is reported
 /// without waiting for the pipes to close. Processes it left behind can hold them open forever.
@@ -84,15 +85,24 @@ struct Running {
     reaping: bool,
     /// The command's credential proxy. Dropped with this phase, so the proxy stops at the exit.
     _proxy: Option<ProxyLease>,
-    /// The sandbox's placeholders and network namespace, kept until the exit like the proxy.
-    _sandbox: Option<Held>,
+    /// The sandbox's placeholders, kept until the exit like the proxy.
+    _placeholders: Option<Placeholders>,
+    /// How `tcp.open` reaches the process's ports. `None`: its policy forbids binding them.
+    tunnel: Option<TunnelRoute>,
 }
 
 /// What [`crate::sandbox::prepare`] returned besides the command.
-type Held = (
-    crate::sandbox::Placeholders,
-    Option<crate::sandbox::NetnsControl>,
-);
+type Held = (Placeholders, Option<NetnsControl>);
+
+/// How `tcp.open` with a process's `execId` reaches `127.0.0.1` as the process sees it
+/// (tunnels.md).
+#[derive(Clone, Debug)]
+pub enum TunnelRoute {
+    /// The process shares the node's loopback.
+    Loopback,
+    /// The process has its own network namespace.
+    Netns(Arc<NetnsControl>),
+}
 
 impl Phase {
     fn ended(&self) -> Option<u64> {
@@ -174,6 +184,23 @@ impl ExecManager {
         started
             .await
             .map_err(|err| Error::new(ErrorKind::Io, format!("exec.start failed: {err}")))?
+    }
+
+    /// How `tcp.open` reaches the ports of `exec_id`: `not_found` unless it is running,
+    /// `permission_denied` when its policy does not let it bind ports.
+    pub fn tunnel_route(&self, exec_id: &ExecId) -> Result<TunnelRoute> {
+        let not_running = || Error::not_found(format!("{exec_id} is not running"));
+        match self.inner.entry_phase(exec_id, |phase| match phase {
+            Phase::Running(running) => Some(running.tunnel.clone()),
+            _ => None,
+        }) {
+            Ok(Some(Some(route))) => Ok(route),
+            Ok(Some(None)) => Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{exec_id}'s policy does not allow localBind"),
+            )),
+            Ok(None) | Err(_) => Err(not_running()),
+        }
     }
 
     pub async fn write(&self, params: ExecWriteParams) -> Result<()> {
@@ -414,14 +441,20 @@ impl Inner {
         }
         let program = resolve_program(argv.program(), &env)?;
         let log = open_log(&log, confinement)?;
-        let mut held = None;
-        let Spawned { mut child, tree } = match confinement {
-            Confinement::Raw => spawn_raw(&program, &argv, &cwd, &env, stdin)?,
+        let (Spawned { mut child, tree }, placeholders, tunnel) = match confinement {
+            Confinement::Raw => (
+                spawn_raw(&program, &argv, &cwd, &env, stdin)?,
+                None,
+                Some(TunnelRoute::Loopback),
+            ),
             Confinement::Sandboxed(policy) => {
-                let (spawned, sandbox) =
+                let (spawned, (placeholders, netns)) =
                     spawn_sandboxed(policy, &program, &argv, &cwd, env, stdin)?;
-                held = Some(sandbox);
-                spawned
+                let tunnel = policy.network().local_bind().then(|| match netns {
+                    Some(netns) => TunnelRoute::Netns(Arc::new(netns)),
+                    None => TunnelRoute::Loopback,
+                });
+                (spawned, Some(placeholders), tunnel)
             }
         };
 
@@ -497,7 +530,8 @@ impl Inner {
             timed_out: false,
             reaping: false,
             _proxy: proxy,
-            _sandbox: held,
+            _placeholders: placeholders,
+            tunnel,
         });
         Ok(pid)
     }
@@ -751,14 +785,7 @@ fn open_log(spec: &LogSpec, confinement: &Confinement) -> Result<Log> {
 }
 
 fn check_log_writable(policy: &ResolvedPolicy, path: &Path) -> Result<()> {
-    let canonical = match std::fs::canonicalize(path) {
-        Ok(canonical) => canonical,
-        Err(_) => {
-            let parent = path.parent().unwrap_or(path);
-            let name = path.file_name().unwrap_or_default();
-            std::fs::canonicalize(parent)?.join(name)
-        }
-    };
+    let canonical = crate::policy::resolve_path(path);
     if policy.can_write(&canonical) {
         return Ok(());
     }

@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use happy_supervisor::ErrorKind;
+use happy_supervisor::exec::TunnelRoute;
 use happy_supervisor::protocol::{
     Bytes, LoopbackHost, ProxyMessage, StreamId, TcpCredit, TcpData, TcpEnd, TcpMessage,
     TcpOpenParams, TcpReset,
@@ -57,7 +58,7 @@ impl Harness {
     async fn open(&self, port: u16) -> StreamId {
         let id = StreamId::generate();
         self.tunnels
-            .open(params(id, LoopbackHost::V4, port))
+            .open(params(id, LoopbackHost::V4, port), TunnelRoute::Loopback)
             .await
             .unwrap();
         id
@@ -110,6 +111,7 @@ fn params(id: StreamId, host: LoopbackHost, port: u16) -> TcpOpenParams {
         stream_id: id,
         host,
         port,
+        exec_id: None,
     }
 }
 
@@ -174,7 +176,7 @@ async fn data_sent_right_behind_the_open_is_buffered_until_connected() {
     let (port, server) = echo_after_eof(b"").await;
     let id = StreamId::generate();
     let tunnels = h.tunnels.clone();
-    let open = tunnels.open(params(id, LoopbackHost::V4, port));
+    let open = tunnels.open(params(id, LoopbackHost::V4, port), TunnelRoute::Loopback);
     tokio::pin!(open);
     let opened = futures_util::poll!(&mut open);
     h.data(id, b"early");
@@ -191,7 +193,10 @@ async fn localhost_reaches_an_ipv4_only_server() {
     let (port, server) = echo_after_eof(b"v4").await;
     let id = StreamId::generate();
     h.tunnels
-        .open(params(id, LoopbackHost::Localhost, port))
+        .open(
+            params(id, LoopbackHost::Localhost, port),
+            TunnelRoute::Loopback,
+        )
         .await
         .unwrap();
     h.end(id);
@@ -209,7 +214,7 @@ async fn a_closed_port_is_connection_refused_and_leaves_no_stream() {
     let id = StreamId::generate();
     let err = h
         .tunnels
-        .open(params(id, LoopbackHost::V4, port))
+        .open(params(id, LoopbackHost::V4, port), TunnelRoute::Loopback)
         .await
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::ConnectionRefused);
@@ -219,7 +224,7 @@ async fn a_closed_port_is_connection_refused_and_leaves_no_stream() {
     );
     let (port, _server) = accept_one().await;
     h.tunnels
-        .open(params(id, LoopbackHost::V4, port))
+        .open(params(id, LoopbackHost::V4, port), TunnelRoute::Loopback)
         .await
         .expect("the failed open left nothing behind");
 }
@@ -231,7 +236,7 @@ async fn an_id_in_use_is_already_exists() {
     let id = h.open(port).await;
     let err = h
         .tunnels
-        .open(params(id, LoopbackHost::V4, port))
+        .open(params(id, LoopbackHost::V4, port), TunnelRoute::Loopback)
         .await
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::AlreadyExists);

@@ -557,6 +557,7 @@ impl Inner {
                     argv: Argv::try_from(resolved)?,
                     cwd: cwd.clone(),
                     env,
+                    limits,
                 };
                 let (spawned, (placeholders, netns)) =
                     spawn_sandboxed(policy, net, op, io, workload, &limits)?;
@@ -1092,8 +1093,8 @@ fn spawn_helper(
 
 /// Windows passes the status pipe's write end by duplicating it into the suspended helper and
 /// telling it the handle in a preamble on stdin (`helper::STATUS_MAGIC`).
-/// The broker is in the job with `limits`, one more process allowed for itself, and copies them to
-/// the job of the runner, which it starts outside its own (sandbox/windows/broker.rs).
+/// `limits` are not the broker's: they travel in the job, and the broker puts them on the job of
+/// the runner, which runs the command (sandbox/windows/broker.rs).
 #[cfg(windows)]
 fn spawn_helper(
     mut command: Command,
@@ -1120,13 +1121,10 @@ fn spawn_helper(
             return Err(err.into());
         }
     };
-    let outer = Limits {
-        processes: limits.processes.map(|n| n.saturating_add(1)),
-        ..*limits
-    };
+    let _ = limits;
     let Spawned {
         mut child, tree, ..
-    } = adopt(child, &outer)?;
+    } = adopt(child, &Limits::default())?;
 
     let mut pipe = child.stdin.take().expect("stdin is piped");
     // A helper that dies early closes its stdin; the status pipe then says why.

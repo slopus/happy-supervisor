@@ -34,7 +34,7 @@ pub(super) fn main() -> ! {
     // SAFETY: the broker duplicated this handle into us and nothing else owns it.
     let status = (job.status != 0).then(|| unsafe { File::from_raw_handle(job.status as HANDLE) });
     match &job.op {
-        JobOp::Exec { argv, cwd, env } => match spawn(&job.token, argv, cwd, env) {
+        JobOp::Exec { argv, cwd, env, .. } => match spawn(&job.token, argv, cwd, env) {
             Ok(process) => {
                 drop(status);
                 std::process::exit(wait(&process) as i32)

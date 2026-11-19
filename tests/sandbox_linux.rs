@@ -146,6 +146,7 @@ fn start(
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>(),
+            limits: happy_supervisor::protocol::Limits::default(),
         },
     };
     let plan = Plan {

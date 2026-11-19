@@ -522,6 +522,7 @@ fn run_true(bwrap: &Bwrap) -> Result<()> {
             argv: crate::protocol::Argv::try_from(vec![program.to_string()])?,
             cwd: crate::protocol::AbsPath::try_from("/")?,
             env: BTreeMap::new(),
+            limits: crate::protocol::Limits::default(),
         },
     };
     let exe = helper::exe()?;

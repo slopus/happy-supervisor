@@ -14,5 +14,5 @@ pub(crate) use unix::{
 };
 #[cfg(windows)]
 pub(crate) use windows::{
-    Tree, exit_status, isolate, limit_support, own_job_limits, status_preamble, wait_exit,
+    Tree, exit_status, isolate, job_limits, limit_support, status_preamble, wait_exit,
 };

@@ -653,8 +653,8 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
     for wall-clock time.
 
   Raw and sandboxed commands both take limits. A sandboxed command's tree includes the sandbox's
-  own processes (bubblewrap and the helper on Linux), except that on Windows the broker is not
-  counted in `processes`.
+  own processes: bubblewrap and the helper on Linux, and on Windows the runner, which counts
+  toward `memoryBytes` but not `processes`.
 
 Result:
 

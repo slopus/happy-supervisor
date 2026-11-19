@@ -89,6 +89,7 @@ fn run_true() -> std::result::Result<(), String> {
             argv: Argv::try_from(vec!["/usr/bin/true".to_string()]).map_err(text)?,
             cwd: AbsPath::try_from("/").map_err(text)?,
             env: BTreeMap::new(),
+            limits: crate::protocol::Limits::default(),
         },
     };
     let exe = crate::helper::exe().map_err(text)?;

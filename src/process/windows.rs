@@ -13,7 +13,7 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_TIME,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, INFINITE, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
@@ -124,27 +124,6 @@ pub(crate) fn job_limits(limits: &Limits) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATIO
     }
     info.BasicLimitInformation.LimitFlags = flags;
     info
-}
-
-/// The limits of the Job Object this process is in: the Windows sandbox's broker copies its exec's
-/// limits to the job of the runner, which it cannot start inside its own.
-pub(crate) fn own_job_limits() -> io::Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    // SAFETY: a null job is the caller's; `info` is the structure the class names, of the size
-    // passed.
-    let ok = unsafe {
-        QueryInformationJobObject(
-            std::ptr::null_mut(),
-            JobObjectExtendedLimitInformation,
-            (&raw mut info).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(info)
 }
 
 /// Resumes the threads of process `pid`. A process created suspended has exactly one, its

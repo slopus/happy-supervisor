@@ -175,7 +175,8 @@ normally it kills every running group.
 `exec.start` `limits` are applied where the tree is made: `setrlimit(RLIMIT_CPU)` in the same
 `pre_exec` on Unix (`process::limit`), and the Job Object's limits on Windows
 (`process::job_limits`). A sandboxed Windows command runs in the runner's job, not the broker's,
-so the broker copies its own job's limits to the runner's job. `process::limit_support` is what
+so its limits travel in the helper job (`JobOp::Exec`) and the broker sets them on the runner's
+job, with one more process for the runner. `process::limit_support` is what
 NodeInfo reports, and `exec` refuses any limit it lacks before starting anything.
 
 ## State directory

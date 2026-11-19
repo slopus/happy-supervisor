@@ -159,6 +159,7 @@ fn run(policy: &P, state: &Path, proxies: Proxies, argv: &[&str]) -> Outcome {
             argv: Argv::try_from(argv.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
             cwd: AbsPath::try_from("/").unwrap(),
             env,
+            limits: happy_supervisor::protocol::Limits::default(),
         },
     };
     let exe = PathBuf::from(EXE);

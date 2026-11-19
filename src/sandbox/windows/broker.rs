@@ -11,9 +11,8 @@ use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
@@ -29,6 +28,7 @@ use super::win::{check, owned, wide};
 use crate::error::{Error, ErrorKind, Result};
 use crate::helper::{EXIT_BAD_JOB, EXIT_EXEC_FAILED, Job, JobOp, STATUS_MAGIC};
 use crate::policy::{Network, ResolvedPolicy};
+use crate::protocol::Limits;
 use crate::wire::{from_cbor, to_cbor};
 
 /// What the broker hands the runner, framed like a job on the runner's stdin.
@@ -312,9 +312,12 @@ fn launch(
     drop(stdin_reader);
     // SAFETY: fresh handles from CreateProcessWithLogonW.
     let (process, thread) = unsafe { (owned(info.hProcess), owned(info.hThread)) };
-    let exec = matches!(job.op, JobOp::Exec { .. });
+    let limits = match &job.op {
+        JobOp::Exec { limits, .. } => *limits,
+        JobOp::Fs(_) => Limits::default(),
+    };
     let started = (|| -> io::Result<(OwnedHandle, u64)> {
-        let job = kill_on_close_job(exec)?;
+        let job = runner_job(&limits)?;
         // SAFETY: both handles are open.
         check(unsafe {
             AssignProcessToJobObject(
@@ -385,9 +388,9 @@ impl Runner {
     }
 }
 
-/// The runner's job. For an exec it gets the limits of the exec's own job, which the broker is
-/// in and the runner cannot be (`exec.start` `limits`).
-fn kill_on_close_job(exec: bool) -> io::Result<OwnedHandle> {
+/// The runner's job, with the exec's `limits` (`exec.start`). The runner is in it with the
+/// command's tree, so it may hold one more process.
+fn runner_job(limits: &Limits) -> io::Result<OwnedHandle> {
     // SAFETY: null attributes and name: an anonymous job.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
@@ -395,12 +398,10 @@ fn kill_on_close_job(exec: bool) -> io::Result<OwnedHandle> {
     }
     // SAFETY: a fresh handle.
     let job = unsafe { owned(job) };
-    let mut limits = if exec {
-        crate::process::own_job_limits()?
-    } else {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default()
-    };
-    limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let limits = crate::process::job_limits(&Limits {
+        processes: limits.processes.map(|n| n.saturating_add(1)),
+        ..*limits
+    });
     // SAFETY: `limits` is the structure the class names, of the size passed.
     check(unsafe {
         SetInformationJobObject(

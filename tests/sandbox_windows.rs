@@ -232,6 +232,7 @@ fn start(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -
             argv: Argv::try_from(argv.to_vec()).unwrap(),
             cwd: AbsPath::try_from(root.as_str()).unwrap(),
             env,
+            limits: happy_supervisor::protocol::Limits::default(),
         },
     };
     let exe = helper::exe().unwrap();

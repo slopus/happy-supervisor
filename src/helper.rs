@@ -27,7 +27,7 @@ use crate::wire::{from_cbor, to_cbor};
 use crate::error::{Error, ErrorKind, Result};
 use crate::fs::{FsRequest, FsResponse};
 use crate::policy::ResolvedPolicy;
-use crate::protocol::{AbsPath, Argv};
+use crate::protocol::{AbsPath, Argv, Limits};
 
 /// Bigger than any valid job: a 16 MiB `fs.write` plus a full policy.
 pub const MAX_JOB_BYTES: usize = 32 << 20;
@@ -66,10 +66,14 @@ pub struct Job {
 #[serde(rename_all = "camelCase")]
 pub enum JobOp {
     /// `env` is the whole environment. `cwd` is entered after confinement, so the OS checks it.
+    /// `limits` are for the Windows broker, which puts them on the runner's Job Object; on Unix
+    /// the parent already set them as rlimits.
     Exec {
         argv: Argv,
         cwd: AbsPath,
         env: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Limits::is_none")]
+        limits: Limits,
     },
     Fs(FsRequest),
 }
@@ -248,7 +252,7 @@ fn unix_main() -> ! {
         }
     };
     match op {
-        JobOp::Exec { argv, cwd, env } => run_exec(&policy, &argv, &cwd, &env),
+        JobOp::Exec { argv, cwd, env, .. } => run_exec(&policy, &argv, &cwd, &env),
         JobOp::Fs(request) => run_fs(&policy, &request),
     }
 }
@@ -382,6 +386,7 @@ mod tests {
                 argv: Argv::try_from(vec!["/bin/echo".to_string(), "hi".to_string()]).unwrap(),
                 cwd: AbsPath::try_from(if cfg!(windows) { r"C:\" } else { "/" }).unwrap(),
                 env: BTreeMap::from([("PATH".to_string(), "/bin".to_string())]),
+                limits: Limits::default(),
             },
         }
     }

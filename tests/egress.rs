@@ -889,17 +889,21 @@ async fn unix_socket_listeners_serve_both_proxies_and_vanish_on_drop() {
 }
 
 #[tokio::test]
-async fn a_port_range_listener_takes_the_first_free_ports_and_fails_when_none_are_left() {
+async fn a_port_range_listener_takes_two_ports_in_the_range_and_fails_when_none_are_free() {
     let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let first = taken.local_addr().unwrap().port();
-    let range = first..=first + 2;
+    let last = first.saturating_add(200);
     let h = Harness::start(
         Some((rules(Default::Deny, &[], &[]), None)),
         &[],
-        ListenOn::LoopbackRange(range.clone()),
+        ListenOn::LoopbackRange(first..=last),
     )
     .await;
-    assert_eq!((h.http().port(), h.socks().port()), (first + 1, first + 2));
+    let (http, socks) = (h.http().port(), h.socks().port());
+    assert!(
+        first < http && http < socks && socks <= last,
+        "{first} < {http} < {socks} <= {last}"
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let (private, public) = (dir.path().join("private"), dir.path().join("public"));
@@ -912,14 +916,14 @@ async fn a_port_range_listener_takes_the_first_free_ports_and_fails_when_none_ar
         exec_id: ExecId::try_from("e_2").unwrap(),
         egress: Some((rules(Default::Deny, &[], &[]), None)),
         credential: None,
-        listen: ListenOn::LoopbackRange(range),
+        listen: ListenOn::LoopbackRange(first..=first),
     };
     let err = egress::start(config, &manager).await.err().unwrap();
     assert_eq!(
         (err.kind(), err.to_string()),
         (
             io::ErrorKind::AddrInUse,
-            format!("no free proxy port in {first}-{}", first + 2)
+            format!("no free proxy port in {first}-{first}")
         )
     );
 }

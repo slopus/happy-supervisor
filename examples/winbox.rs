@@ -94,6 +94,8 @@ mod win {
     const ALREADY_EXISTS: i32 = 0x800700b7_u32 as i32;
     const SE_GROUP_ENABLED: u32 = 0x4;
     const WRITE_RESTRICTED: u32 = 0x8;
+    const DISABLE_MAX_PRIVILEGE: u32 = 0x1;
+    const LUA_TOKEN: u32 = 0x4;
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain([0]).collect()
@@ -291,26 +293,52 @@ mod win {
             })
             .collect();
         let mut token: HANDLE = null_mut();
-        // A write-restricted token only yields write-restricted ones (ERROR_INVALID_PARAMETER
-        // otherwise), which keeps whatever this process could already do.
+        let everyone = Sid::parse("S-1-1-0")?;
+        let restrict = [SID_AND_ATTRIBUTES {
+            Sid: everyone.as_psid(),
+            Attributes: 0,
+        }];
+        let disable_ptr = if entries.is_empty() {
+            null()
+        } else {
+            entries.as_ptr()
+        };
+        // Which combination this token accepts depends on how it was itself restricted.
         let mut made = Err(io::Error::other("no attempt"));
-        for flags in [0, WRITE_RESTRICTED] {
+        for (flags, restricting) in [
+            (0, &[][..]),
+            (WRITE_RESTRICTED, &[][..]),
+            (WRITE_RESTRICTED, &restrict[..]),
+            (0, &restrict[..]),
+            (
+                DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+                &restrict[..],
+            ),
+        ] {
             // SAFETY: the SIDs outlive the call.
             made = check(unsafe {
                 CreateRestrictedToken(
                     own,
                     flags,
                     entries.len() as u32,
-                    entries.as_ptr(),
+                    disable_ptr,
                     0,
                     null(),
-                    0,
-                    null(),
+                    restricting.len() as u32,
+                    if restricting.is_empty() {
+                        null()
+                    } else {
+                        restricting.as_ptr()
+                    },
                     &mut token,
                 )
             });
+            eprintln!(
+                "winbox: CreateRestrictedToken flags {flags:#x}, {} restricting: {:?}",
+                restricting.len(),
+                made.as_ref().map_err(|err| err.to_string())
+            );
             if made.is_ok() {
-                eprintln!("winbox: restricted token flags {flags:#x}");
                 break;
             }
         }

@@ -44,7 +44,11 @@ fn contain(label: &str, caps: &str, argv: &[&str]) {
 }
 
 fn admin(label: &str, program: &str, args: &[&str]) {
-    let output = Command::new(program).args(args).output().unwrap();
+    let output = Command::new(program)
+        .args(args)
+        .env_remove("PSModulePath")
+        .output()
+        .unwrap();
     eprintln!("ADMIN {label}: {}", show(output));
 }
 
@@ -347,6 +351,44 @@ fn appcontainer_probe() {
             "Remove-LocalUser -Name hsbxplain; 'removed'",
         ],
     );
+
+    let users_block = Command::new(winbox())
+        .args(["wfp-hold", "block-user:S-1-5-32-545:80"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut users_block = users_block;
+    let mut ready = [0u8; 5];
+    let _ = users_block.stdout.as_mut().unwrap().read_exact(&mut ready);
+    for (label, disable) in [
+        ("nothing dropped", "none"),
+        ("BUILTIN\\Users deny-only", "Users"),
+    ] {
+        let output = Command::new(winbox())
+            .args([
+                "escape",
+                disable,
+                &curl,
+                "-sS",
+                "--max-time",
+                "10",
+                "-o",
+                "NUL",
+                "-w",
+                "%{http_code}",
+                "http://example.com",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        eprintln!(
+            "PROBE admin, WFP block keyed on BUILTIN\\Users, port 80, {label}: {}",
+            show(output)
+        );
+    }
+    drop(users_block.stdin.take());
+    let _ = users_block.wait();
 
     let in_range = (47800..=47999)
         .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())

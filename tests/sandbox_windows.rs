@@ -980,6 +980,7 @@ fn winbox() -> PathBuf {
 fn admin_powershell(script: &str) -> String {
     let output = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env_remove("PSModulePath")
         .output()
         .unwrap();
     format!(

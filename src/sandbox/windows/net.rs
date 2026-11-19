@@ -306,15 +306,12 @@ struct GroupMatch {
 impl GroupMatch {
     /// Tokens that hold `sid` in any state, or that fail the check otherwise: for blocks.
     fn member(sid: &str) -> io::Result<GroupMatch> {
-        GroupMatch::new(
-            &format!("O:LSD:(D;;CC;;;{sid})(A;;CC;;;WD)(A;;CC;;;RC)(A;;CC;;;{WRITE_RESTRICTED})"),
-            FWP_MATCH_NOT_EQUAL,
-        )
+        GroupMatch::new(&member_sddl(sid), FWP_MATCH_NOT_EQUAL)
     }
 
     /// Tokens in which `sid` is enabled: for permits.
     fn enabled(sid: &str) -> io::Result<GroupMatch> {
-        GroupMatch::new(&format!("O:LSD:(A;;CC;;;{sid})"), FWP_MATCH_EQUAL)
+        GroupMatch::new(&enabled_sddl(sid), FWP_MATCH_EQUAL)
     }
 
     fn new(sddl: &str, match_type: FWP_MATCH_TYPE) -> io::Result<GroupMatch> {
@@ -343,6 +340,14 @@ impl GroupMatch {
 
 /// The WRITE RESTRICTED SID, which write-restricted service tokens restrict to.
 const WRITE_RESTRICTED: &str = "S-1-5-33";
+
+fn member_sddl(sid: &str) -> String {
+    format!("O:LSD:(D;;CC;;;{sid})(A;;CC;;;WD)(A;;CC;;;RC)(A;;CC;;;{WRITE_RESTRICTED})")
+}
+
+fn enabled_sddl(sid: &str) -> String {
+    format!("O:LSD:(A;;CC;;;{sid})")
+}
 
 fn add_provider_and_sublayer(engine: &Engine) -> io::Result<()> {
     let name = wide("happy-supervisor sandbox");
@@ -508,6 +513,32 @@ fn uint16(value: u16) -> FWP_VALUE0 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocks_match_members_through_a_deny_ace_and_permits_only_enabled_groups() {
+        assert_eq!(
+            member_sddl("S-1-5-21-1-1001"),
+            "O:LSD:(D;;CC;;;S-1-5-21-1-1001)(A;;CC;;;WD)(A;;CC;;;RC)(A;;CC;;;S-1-5-33)"
+        );
+        assert_eq!(
+            enabled_sddl("S-1-5-21-1-1001"),
+            "O:LSD:(A;;CC;;;S-1-5-21-1-1001)"
+        );
+        let actions: Vec<(FWP_ACTION_TYPE, Who)> =
+            FILTERS.iter().map(|spec| (spec.action, spec.who)).collect();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|(action, _)| *action == BLOCK)
+                .count(),
+            6
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|(action, who)| *action == BLOCK || *who != Who::NoListen)
+        );
+    }
 
     #[test]
     fn filter_keys_and_names_are_unique() {

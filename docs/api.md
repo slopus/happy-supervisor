@@ -295,6 +295,8 @@ a4 0c 67 "build-1" 0d 66 "stdout" 09 50 <16 bytes> 0e 00
 | 153 | `net.denied` | kind |
 | 154 | `via` | key |
 | 155 | `dropped` | key |
+| 156 | `fs.rename` | kind |
+| 157 | `from` | key |
 
 The receiver ignores map keys it does not know, so either side can add fields. The one
 exception is `access` and its `policy`: an unknown key there is `invalid_params`, so a node never
@@ -836,6 +838,16 @@ Params `{ "path", "access", "recursive": false }`. `recursive` creates missing p
 Params `{ "path", "access", "recursive": false }`. Removes a file, a symlink (not its target)
 or an empty directory. `recursive: true` removes a directory tree. Symlinks inside the tree are
 removed, never followed. Result `{}`.
+
+### `fs.rename`
+
+Params `{ "from", "to", "access" }`. Moves `from` to `to` in one step, like `rename(2)`: a file,
+a symlink (not its target) or a directory. An existing `to` is replaced when it is a file and
+`from` is not a directory; a directory may replace only an empty directory (not on Windows).
+`to`'s parent must exist. Under a sandbox both paths need the policy's write set, checked on
+their parents with symlinks resolved and the last component as given. A move across
+filesystems fails with `io`, and so does one between two of a Linux sandbox's mounts, such as
+two separate write `allow` entries; copy and remove instead. Result `{}`.
 
 ## Watching
 

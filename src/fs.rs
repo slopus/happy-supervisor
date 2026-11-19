@@ -13,9 +13,9 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::helper::{Job, JobOp};
 use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
-    Bytes, DirEntry, Empty, FileKind, FsListResult, FsMkdirParams, FsPathParams, FsReadParams,
-    FsReadResult, FsRemoveParams, FsStat, FsWriteParams, MAX_FS_DATA_BYTES, MAX_LIST_ENTRIES,
-    Value, WriteMode,
+    AbsPath, Bytes, DirEntry, Empty, FileKind, FsListResult, FsMkdirParams, FsPathParams,
+    FsReadParams, FsReadResult, FsRemoveParams, FsRenameParams, FsStat, FsWriteParams,
+    MAX_FS_DATA_BYTES, MAX_LIST_ENTRIES, Value, WriteMode,
 };
 
 /// One file operation without its `access`. Travels to the sandbox helper inside a
@@ -29,6 +29,7 @@ pub enum FsRequest {
     Write(FsWriteParams),
     Mkdir(FsMkdirParams),
     Remove(FsRemoveParams),
+    Rename(FsRenameParams),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +38,7 @@ pub enum FsResponse {
     Stat(FsStat),
     List(FsListResult),
     Read(FsReadResult),
-    /// `{}`, the result of `fs.write`, `fs.mkdir` and `fs.remove`.
+    /// `{}`, the result of `fs.write`, `fs.mkdir`, `fs.remove` and `fs.rename`.
     Done,
 }
 
@@ -63,6 +64,7 @@ pub fn perform(request: &FsRequest) -> Result<FsResponse> {
         FsRequest::Write(params) => write(params).map(|()| FsResponse::Done),
         FsRequest::Mkdir(params) => mkdir(params).map(|()| FsResponse::Done),
         FsRequest::Remove(params) => remove(params).map(|()| FsResponse::Done),
+        FsRequest::Rename(params) => rename(params).map(|()| FsResponse::Done),
     }
 }
 
@@ -79,31 +81,46 @@ pub async fn handle(request: FsRequest, confinement: Confinement) -> Result<FsRe
 async fn sandboxed(request: FsRequest, policy: ResolvedPolicy) -> Result<FsResponse> {
     // The sandbox shows a path the policy hides as missing (bubblewrap) or lets metadata through
     // (Seatbelt), so the policy decides first and every platform answers permission_denied.
-    let (path, writes) = match &request {
-        FsRequest::Stat(params) | FsRequest::List(params) => (&params.path, false),
-        FsRequest::Read(params) => (&params.path, false),
-        FsRequest::Write(params) => (&params.path, true),
-        FsRequest::Mkdir(params) => (&params.path, true),
-        FsRequest::Remove(params) => (&params.path, true),
+    // A rename acts on its two paths' directory entries, so their last components are not
+    // followed; every other request acts on what its path resolves to.
+    let checks: Vec<(&AbsPath, bool, bool)> = match &request {
+        FsRequest::Stat(params) | FsRequest::List(params) => vec![(&params.path, false, true)],
+        FsRequest::Read(params) => vec![(&params.path, false, true)],
+        FsRequest::Write(params) => vec![(&params.path, true, true)],
+        FsRequest::Mkdir(params) => vec![(&params.path, true, true)],
+        FsRequest::Remove(params) => vec![(&params.path, true, true)],
+        FsRequest::Rename(params) => vec![(&params.from, true, false), (&params.to, true, false)],
     };
-    let (shown, target, check) = (
-        path.as_str().to_string(),
-        path.as_path().to_path_buf(),
-        policy.clone(),
-    );
+    let checks: Vec<(String, PathBuf, bool, bool)> = checks
+        .into_iter()
+        .map(|(path, writes, follow)| {
+            let shown = path.as_str().to_string();
+            (shown, path.as_path().to_path_buf(), writes, follow)
+        })
+        .collect();
+    let check = policy.clone();
     let denied = tokio::task::spawn_blocking(move || {
-        let target = crate::policy::resolve_path(&target);
-        if !check.can_read(&target) {
-            Some("readable")
-        } else if writes && !check.can_write(&target) {
-            Some("writable")
-        } else {
-            None
-        }
+        checks
+            .into_iter()
+            .find_map(|(shown, target, writes, follow)| {
+                let target = match (follow, target.parent(), target.file_name()) {
+                    (false, Some(parent), Some(name)) => {
+                        crate::policy::resolve_path(parent).join(name)
+                    }
+                    _ => crate::policy::resolve_path(&target),
+                };
+                if !check.can_read(&target) {
+                    Some((shown, "readable"))
+                } else if writes && !check.can_write(&target) {
+                    Some((shown, "writable"))
+                } else {
+                    None
+                }
+            })
     })
     .await
     .map_err(|err| Error::new(ErrorKind::Io, format!("policy check failed: {err}")))?;
-    if let Some(what) = denied {
+    if let Some((shown, what)) = denied {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             format!("{shown}: not {what} by the policy"),
@@ -383,6 +400,17 @@ fn remove(params: &FsRemoveParams) -> Result<()> {
     } else {
         remove_link_or_file(path, file_type).map_err(at(path))
     }
+}
+
+fn rename(params: &FsRenameParams) -> Result<()> {
+    let (from, to) = (params.from.as_path(), params.to.as_path());
+    std::fs::rename(from, to).map_err(|err| {
+        let err = Error::from(err);
+        Error::new(
+            err.kind,
+            format!("{} -> {}: {}", from.display(), to.display(), err.message),
+        )
+    })
 }
 
 #[cfg(windows)]

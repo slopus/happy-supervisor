@@ -313,13 +313,14 @@ pub enum CommandKind {
     FsWrite,
     FsMkdir,
     FsRemove,
+    FsRename,
     WatchStart,
     WatchStop,
     TcpOpen,
 }
 
 impl CommandKind {
-    pub const ALL: [CommandKind; 16] = [
+    pub const ALL: [CommandKind; 17] = [
         CommandKind::NodeInfo,
         CommandKind::NodeUpdate,
         CommandKind::ExecStart,
@@ -333,6 +334,7 @@ impl CommandKind {
         CommandKind::FsWrite,
         CommandKind::FsMkdir,
         CommandKind::FsRemove,
+        CommandKind::FsRename,
         CommandKind::WatchStart,
         CommandKind::WatchStop,
         CommandKind::TcpOpen,
@@ -353,6 +355,7 @@ impl CommandKind {
             CommandKind::FsWrite => "fs.write",
             CommandKind::FsMkdir => "fs.mkdir",
             CommandKind::FsRemove => "fs.remove",
+            CommandKind::FsRename => "fs.rename",
             CommandKind::WatchStart => "watch.start",
             CommandKind::WatchStop => "watch.stop",
             CommandKind::TcpOpen => "tcp.open",
@@ -1417,6 +1420,12 @@ pub struct FsRemoveParams {
     pub path: AbsPath,
     #[serde(default)]
     pub recursive: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsRenameParams {
+    pub from: AbsPath,
+    pub to: AbsPath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2550,6 +2559,12 @@ mod tests {
         let remove: WithAccess<FsRemoveParams> =
             round_trip(json!({ "path": "/x", "access": access, "recursive": true }));
         assert!(remove.params.recursive);
+        let rename: WithAccess<FsRenameParams> =
+            round_trip(json!({ "from": "/x/a.txt", "to": "/x/b.txt", "access": access }));
+        assert_eq!(
+            (rename.params.from.as_str(), rename.params.to.as_str()),
+            ("/x/a.txt", "/x/b.txt")
+        );
         let stat_params: WithAccess<FsPathParams> =
             round_trip(json!({ "path": "/x", "access": access }));
         assert_eq!(stat_params.params.path.as_str(), "/x");

@@ -214,6 +214,8 @@ pub const REGISTRY: &[(u64, &str, Role)] = &[
     (153, "net.denied", Role::Kind),
     (154, "via", Role::Key),
     (155, "dropped", Role::Key),
+    (156, "fs.rename", Role::Kind),
+    (157, "from", Role::Key),
 ];
 
 struct Names {

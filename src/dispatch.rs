@@ -15,8 +15,9 @@ use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::protocol::{
     Access, CommandKind, Empty, ExecId, ExecKillParams, ExecListResult, ExecLogParams,
     ExecStartParams, ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams, FsReadParams,
-    FsRemoveParams, FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, ProxySpec, SandboxInfo,
-    TcpMessage, TcpOpenParams, Value, WatchId, WatchStartParams, WatchStopParams, WithAccess,
+    FsRemoveParams, FsRenameParams, FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, ProxySpec,
+    SandboxInfo, TcpMessage, TcpOpenParams, Value, WatchId, WatchStartParams, WatchStopParams,
+    WithAccess,
 };
 use crate::proxy::egress::{self, CommandProxy, CommandProxyConfig, ListenOn};
 use crate::proxy::{NodeCa, ProxyManager};
@@ -305,6 +306,10 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
         CommandKind::FsRemove => {
             let WithAccess { params, access } = parse::<WithAccess<FsRemoveParams>>(params)?;
             node.fs(FsRequest::Remove(params), access).await
+        }
+        CommandKind::FsRename => {
+            let WithAccess { params, access } = parse::<WithAccess<FsRenameParams>>(params)?;
+            node.fs(FsRequest::Rename(params), access).await
         }
         CommandKind::WatchStart => {
             let WithAccess { params, access } = parse::<WithAccess<WatchStartParams>>(params)?;

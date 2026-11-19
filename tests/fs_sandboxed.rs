@@ -7,7 +7,7 @@ use happy_supervisor::fs::{self, FsRequest, FsResponse};
 use happy_supervisor::policy::{Confinement, ResolvedPolicy, allow_list};
 use happy_supervisor::protocol::{
     AbsPath, Bytes, DirEntry, FileKind, FsListResult, FsMkdirParams, FsPathParams, FsReadParams,
-    FsReadResult, FsRemoveParams, FsWriteParams, WriteMode,
+    FsReadResult, FsRemoveParams, FsRenameParams, FsWriteParams, WriteMode,
 };
 use happy_supervisor::{Error, ErrorKind, helper, sandbox};
 
@@ -240,4 +240,89 @@ async fn overwrite_with_only_the_file_granted_writes_in_place() {
         b"in place"
     );
     assert_eq!(names(&tree.path("granted/out")), ["result"]);
+}
+
+async fn rename(tree: &Tree, from: &str, to: &str, write: &[&str]) -> Result<FsResponse, Error> {
+    let request = FsRequest::Rename(FsRenameParams {
+        from: abs(&tree.path(from)),
+        to: abs(&tree.path(to)),
+    });
+    fs::handle(request, tree.confinement(write)).await
+}
+
+#[tokio::test]
+async fn sandboxed_renames_need_both_paths_writable() {
+    require_sandbox();
+    let tree = Tree::new();
+    std::fs::write(tree.path("granted/out/new"), b"new result").unwrap();
+    assert_eq!(
+        rename(
+            &tree,
+            "granted/out/new",
+            "granted/out/result",
+            &["granted/out"]
+        )
+        .await,
+        Ok(FsResponse::Done)
+    );
+    assert_eq!(
+        std::fs::read(tree.path("granted/out/result")).unwrap(),
+        b"new result"
+    );
+    assert!(!tree.path("granted/out/new").exists());
+
+    let out = tree.path("granted/out/result");
+    let readme = tree.path("granted/readme");
+    assert_eq!(
+        rename(
+            &tree,
+            "granted/out/result",
+            "granted/moved",
+            &["granted/out"]
+        )
+        .await,
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{}: not writable by the policy",
+                tree.path("granted/moved").display()
+            )
+        ))
+    );
+    assert_eq!(
+        rename(
+            &tree,
+            "granted/readme",
+            "granted/out/readme",
+            &["granted/out"]
+        )
+        .await,
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{}: not writable by the policy", readme.display())
+        ))
+    );
+    assert!(out.exists() && readme.exists());
+}
+
+#[tokio::test]
+async fn a_sandboxed_rename_moves_a_symlink_not_its_target() {
+    require_sandbox();
+    let tree = Tree::new();
+    std::os::unix::fs::symlink(tree.path("secret/key"), tree.path("granted/out/link")).unwrap();
+    assert_eq!(
+        rename(
+            &tree,
+            "granted/out/link",
+            "granted/out/moved",
+            &["granted/out"]
+        )
+        .await,
+        Ok(FsResponse::Done)
+    );
+    assert_eq!(
+        std::fs::read_link(tree.path("granted/out/moved")).unwrap(),
+        tree.path("secret/key")
+    );
+    assert_eq!(std::fs::read(tree.path("secret/key")).unwrap(), b"hunter2");
 }

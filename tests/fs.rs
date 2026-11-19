@@ -10,7 +10,7 @@ use happy_supervisor::fs::{self, FsRequest, FsResponse};
 use happy_supervisor::policy::Confinement;
 use happy_supervisor::protocol::{
     AbsPath, Bytes, DirEntry, FileKind, FsListResult, FsMkdirParams, FsPathParams, FsReadParams,
-    FsReadResult, FsRemoveParams, FsStat, FsWriteParams, WriteMode,
+    FsReadResult, FsRemoveParams, FsRenameParams, FsStat, FsWriteParams, WriteMode,
 };
 use happy_supervisor::{Error, ErrorKind};
 
@@ -526,5 +526,44 @@ async fn handle_runs_raw_requests() {
             data: Bytes::new(b"handle".to_vec()),
             size: 10,
         }))
+    );
+}
+
+fn rename(from: &Path, to: &Path) -> Result<FsResponse, Error> {
+    fs::perform(&FsRequest::Rename(FsRenameParams {
+        from: abs(from),
+        to: abs(to),
+    }))
+}
+
+#[test]
+fn rename_moves_and_replaces_a_file() {
+    let (_tmp, root) = tempdir();
+    std::fs::write(root.join("a"), b"new").unwrap();
+    std::fs::write(root.join("b"), b"old").unwrap();
+    std::fs::create_dir(root.join("dir")).unwrap();
+
+    assert_eq!(
+        rename(&root.join("a"), &root.join("b")),
+        Ok(FsResponse::Done)
+    );
+    assert_eq!(std::fs::read(root.join("b")).unwrap(), b"new");
+    assert!(!root.join("a").exists());
+    assert_eq!(
+        rename(&root.join("dir"), &root.join("moved")),
+        Ok(FsResponse::Done)
+    );
+    assert!(root.join("moved").is_dir());
+
+    let err = rename(&root.join("a"), &root.join("c")).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NotFound);
+    assert!(
+        err.message.starts_with(&format!(
+            "{} -> {}: ",
+            root.join("a").display(),
+            root.join("c").display()
+        )),
+        "{}",
+        err.message
     );
 }

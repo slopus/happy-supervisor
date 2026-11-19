@@ -35,7 +35,8 @@ it with less. The details live in [docs/policy.md](docs/policy.md),
    writes and for network egress, and the exceptions to each. There is no built-in
    allow-by-default and no built-in deny-by-default.
 10. The most specific entry wins; when `allow` and `deny` name the same path or host, deny wins.
-11. Writing implies reading. A policy that denies reading a path it allows writing is rejected.
+11. Writing implies reading. A policy whose explicit `read.deny` entry decides a path that its
+    write rules allow is rejected; a read default of deny is not a contradiction.
 12. The only fixed rules are: the supervisor's private state directory is always denied, and the
     sandbox gets its own devices and `/proc`.
 13. A deny entry that does not exist yet is still denied. The node may create an empty
@@ -52,7 +53,8 @@ it with less. The details live in [docs/policy.md](docs/policy.md),
     the policy's paths, and firewall filters for the network.
 17. Host requirements are acceptable: bubblewrap and unprivileged user namespaces on Linux, a
     one-time administrator install on Windows. A node without them reports the sandbox as
-    unavailable.
+    unavailable. Isolated networking on Linux also needs the state directory's path short enough
+    that its proxy sockets' paths fit in 107 bytes.
 
 ## Network
 
@@ -63,7 +65,8 @@ it with less. The details live in [docs/policy.md](docs/policy.md),
     No network at all is an egress policy with `default: deny` and nothing allowed.
 20. The proxies resolve names themselves, once, and refuse loopback, private, link-local, CGNAT,
     multicast and the node's own addresses unless the policy names that exact IP.
-21. Every refusal is reported to the control plane (`net.denied`).
+21. Every refusal by policy is reported to the control plane (`net.denied`). A name that does not
+    resolve in host mode is a network error, not a refusal.
 
 ## Credential proxy
 

@@ -38,5 +38,5 @@ jobs:
       - run: cargo build --all-targets --all-features
       - run: cargo test --all-features
       # Timing tests, alone so nothing else competes for the CPU, and in release as shipped.
-      - run: cargo test --release --all-features --test e2e -- --ignored
+      - run: cargo test --release --all-features --test e2e -- --ignored --nocapture
         if: runner.os != 'Windows'

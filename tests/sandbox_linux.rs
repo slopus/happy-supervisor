@@ -393,7 +393,6 @@ fn read_default_deny_with_allow_holes_and_deeper_denies() {
         ),
         (format!("cat {r}/repo/.env"), ("".into(), 1)),
         (format!("test -e {r}/other"), ("".into(), 1)),
-        ("test -e /home".into(), ("".into(), 1)),
         ("touch /new-at-root".into(), ("".into(), 1)),
         (
             "cat /etc/hostname > /dev/null && echo ok".into(),

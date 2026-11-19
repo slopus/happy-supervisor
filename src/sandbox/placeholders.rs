@@ -254,7 +254,7 @@ fn make(path: &Path, kind: PlaceholderKind) -> io::Result<()> {
         ),
     }
     let mut permissions = std::fs::symlink_metadata(path)?.permissions();
-    set_read_only(&mut permissions);
+    set_read_only(&mut permissions, kind);
     std::fs::set_permissions(path, permissions)
 }
 
@@ -266,16 +266,18 @@ fn remove_unchecked(path: &Path, kind: PlaceholderKind) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn set_read_only(permissions: &mut std::fs::Permissions) {
+fn set_read_only(permissions: &mut std::fs::Permissions, _kind: PlaceholderKind) {
     use std::os::unix::fs::PermissionsExt as _;
     permissions.set_mode(permissions.mode() & 0o555);
 }
 
-/// On Windows the read-only attribute means nothing on a directory, and the sandbox ACL denies
-/// the placeholder anyway.
+/// On Windows a read-only directory cannot be removed, and the sandbox ACL denies the placeholder
+/// anyway, so only files get the attribute.
 #[cfg(windows)]
-fn set_read_only(permissions: &mut std::fs::Permissions) {
-    permissions.set_readonly(true);
+fn set_read_only(permissions: &mut std::fs::Permissions, kind: PlaceholderKind) {
+    if kind == PlaceholderKind::File {
+        permissions.set_readonly(true);
+    }
 }
 
 /// Removes the placeholder at `path` if it is still the file `id`, still empty, and of `kind`.
@@ -304,13 +306,20 @@ fn remove_if_ours(path: &Path, kind: PlaceholderKind, id: FileId) {
     }
 }
 
+#[cfg(target_os = "linux")]
+const PIN_FLAGS: i32 = libc::O_PATH | libc::O_NOFOLLOW;
+// Placeholders are readable to their owner, so a plain read-only open works where O_PATH is
+// missing.
+#[cfg(all(unix, not(target_os = "linux")))]
+const PIN_FLAGS: i32 = libc::O_NOFOLLOW;
+
 /// Opens `path` itself, not what a symlink there points to, without reading or writing it.
 #[cfg(unix)]
 fn pin(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .custom_flags(PIN_FLAGS)
         .open(path)
 }
 
@@ -395,7 +404,8 @@ mod tests {
             .iter()
             .map(|p| {
                 let relative = p.path.strip_prefix(root).unwrap();
-                (relative.to_str().unwrap().to_string(), p.kind)
+                let parts: Vec<&str> = relative.iter().map(|c| c.to_str().unwrap()).collect();
+                (parts.join("/"), p.kind)
             })
             .collect()
     }
@@ -422,7 +432,14 @@ mod tests {
         let git = tree.root.join("repo/.git");
         assert!(git.is_dir());
         assert_eq!(std::fs::read_dir(&git).unwrap().count(), 0);
+        #[cfg(unix)]
         assert!(std::fs::metadata(&git).unwrap().permissions().readonly());
+        assert!(
+            std::fs::metadata(tree.root.join("repo/.env"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
         assert_eq!(std::fs::read(tree.root.join("repo/.env")).unwrap(), b"");
         assert!(!tree.root.join("readonly/.ssh").exists());
         assert_eq!(tree.records(), 2);

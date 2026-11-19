@@ -57,6 +57,7 @@ struct Grants {
     read_deny: Vec<PathBuf>,
     write: Vec<PathBuf>,
     write_deny: Vec<PathBuf>,
+    write_default: Default,
     net: Net,
     local_bind: bool,
     /// Written, and named by TEMP and TMP.
@@ -72,6 +73,7 @@ fn grants(read: &[&Path], write: &[&Path]) -> Grants {
         read_deny: Vec::new(),
         write: owned(write),
         write_deny: Vec::new(),
+        write_default: Default::Deny,
         net: Net::Host,
         local_bind: false,
         temp: None,
@@ -86,6 +88,11 @@ impl Grants {
 
     fn write_deny(mut self, path: &Path) -> Grants {
         self.write_deny.push(path.to_path_buf());
+        self
+    }
+
+    fn write_anywhere(mut self) -> Grants {
+        self.write_default = Default::Allow;
         self
     }
 
@@ -108,14 +115,14 @@ impl Grants {
     }
 
     fn policy(&self) -> Policy {
-        let rules = |allow: &[PathBuf], deny: &[PathBuf]| RuleSet {
-            default: Default::Deny,
+        let rules = |default, allow: &[PathBuf], deny: &[PathBuf]| RuleSet {
+            default,
             allow: allow.to_vec(),
             deny: deny.to_vec(),
         };
         Policy {
-            read: rules(&self.read, &self.read_deny),
-            write: rules(&self.write, &self.write_deny),
+            read: rules(Default::Deny, &self.read, &self.read_deny),
+            write: rules(self.write_default, &self.write, &self.write_deny),
             network: match self.net {
                 Net::Host => Network::Host {
                     local_bind: self.local_bind,
@@ -157,6 +164,13 @@ fn curl(args: &[&str]) -> Vec<String> {
         "15".to_string(),
     ];
     argv.extend(args.iter().map(|arg| arg.to_string()));
+    argv
+}
+
+/// Git for Windows' curl, built with OpenSSL.
+fn git_curl(args: &[&str]) -> Vec<String> {
+    let mut argv = curl(args);
+    argv[0] = r"C:\Program Files\Git\mingw64\bin\curl.exe".to_string();
     argv
 }
 
@@ -244,7 +258,7 @@ fn run(grants: &Grants, state: &Path, net: Option<NetPlan>, argv: &[String]) -> 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let denied = [
         "Access is denied",
-        "forbidden by its access permissions",
+        "in a way forbidden by its",
         "File Not Found",
     ]
     .iter()
@@ -325,7 +339,7 @@ fn the_probe_reports_an_installed_sandbox() {
     let info = sandbox::probe();
     assert_eq!(info.status, SandboxStatus::Available);
     assert_eq!(info.mechanism, Mechanism::Windows);
-    assert_eq!(info.gaps.len(), 10);
+    assert_eq!(info.gaps.len(), 11);
     assert_eq!(sandbox::windows::proxy_ports(), Some(47800..=47999));
 }
 
@@ -469,9 +483,21 @@ fn policy_combinations_and_their_outcomes() {
             ok("ok\n"),
         ),
         (
-            "host: the internet",
+            "host: TLS through Schannel, write-restricted",
             none(),
+            curl(&["-o", "NUL", "https://example.com"]),
+            Outcome::Exit(35),
+        ),
+        (
+            "host: TLS through Schannel under write.default allow",
+            none().write_anywhere(),
             curl(&["-o", "NUL", "-w", "%{http_code}", "https://example.com"]),
+            ok("200"),
+        ),
+        (
+            "host: TLS through OpenSSL, write-restricted",
+            none(),
+            git_curl(&["-o", "NUL", "-w", "%{http_code}", "https://example.com"]),
             ok("200"),
         ),
         (

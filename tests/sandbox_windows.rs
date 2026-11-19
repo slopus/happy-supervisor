@@ -1121,7 +1121,7 @@ fn token_escapes() {
     eprintln!(
         "{}",
         admin_powershell(&format!(
-            "Set-NetFirewallProfile -All -Enabled True; New-NetFirewallRule -Name hsbx-codex -DisplayName hsbx-codex -Direction Outbound -Action Block -Protocol TCP -RemotePort 80 -LocalUser 'D:{sddl}' | Out-Null; 'rule added'"
+            "Set-NetFirewallProfile -All -Enabled True; New-NetFirewallRule -Name hsbx-codex -DisplayName hsbx-codex -Direction Outbound -Action Block -Protocol TCP -RemotePort 80 -LocalUser 'O:LSD:{sddl}' | Out-Null; 'rule added'"
         ))
     );
     row(

@@ -1,5 +1,15 @@
 # Installing the supervisor
 
+The installers do all of this. With the join URL and token from the control plane:
+
+```
+curl -fsSL https://get.happy.engineering/install.sh | sudo HAPPY_JOIN_URL=<join url> HAPPY_JOIN_TOKEN=<token> sh
+$env:HAPPY_JOIN_URL='<join url>'; $env:HAPPY_JOIN_TOKEN='<token>'; irm https://get.happy.engineering/install.ps1 | iex
+```
+
+[deploy/README.md](../deploy/README.md) says what they do, without sudo too. The rest of this
+page is the same by hand.
+
 ## Linux
 
 On Linux the supervisor's work never runs as root (SECURITY.md). The supervisor runs as root and

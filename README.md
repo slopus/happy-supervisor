@@ -9,6 +9,13 @@ supervisor's rights, or sandboxed by a policy the operating system enforces (bub
 seccomp on Linux, Seatbelt on macOS, a restricted token on Windows). It runs on Linux, macOS and
 Windows, on x86_64 and aarch64.
 
+Install it with the join URL and token from the control plane ([docs/install.md](docs/install.md);
+releases are at `https://get.happy.engineering`, [deploy/README.md](deploy/README.md)):
+
+```
+curl -fsSL https://get.happy.engineering/install.sh | sudo HAPPY_JOIN_URL=<join url> HAPPY_JOIN_TOKEN=<token> sh
+```
+
 ```
 happy-supervisor join --url https://control.example.com/api/nodes/join --token <join token> [--name <name>] [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor run [--state-dir <dir>] [--workload-user <user>]

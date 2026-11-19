@@ -60,7 +60,7 @@ the rest of the collection, and each is cut off at 3 seconds.
 | `installationId` | string | A [cuid2](https://github.com/paralleldrive/cuid2), 24 lowercase characters, generated the first time the supervisor runs with a given state directory and stored there in `private/installation-id`. It never changes after that, across restarts, re-joins and upgrades. Deleting the state directory makes a new installation. |
 | `name` | string | The name given with `join --name`, stored with the credentials. Defaults to the hostname. |
 | `hostname` | string | The OS hostname at collection time. |
-| `supervisorVersion` | string | The crate version of the running binary. |
+| `supervisorVersion` | string | The running binary's release version (`0.2.0-linux.1`), or its crate version when it was not built as a release. |
 
 ### `os`
 

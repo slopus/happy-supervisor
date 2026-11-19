@@ -58,5 +58,9 @@ pub mod testkit;
 pub use controller::Controller;
 pub use error::{Error, ErrorKind, Result};
 
-/// The crate version, reported as `supervisorVersion` and in `hello`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version reported as `supervisorVersion` and in `hello`: the release version a release
+/// build sets in `HAPPY_SUPERVISOR_VERSION` (deploy/README.md), else the crate version.
+pub const VERSION: &str = match option_env!("HAPPY_SUPERVISOR_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};

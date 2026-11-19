@@ -1,0 +1,29 @@
+# Cloud Build trigger happy-supervisor-release: on a push to main of slopus/happy-supervisor that
+# changes deploy/VERSION, with approval, as service account happy-supervisor-build. Builds the
+# Linux release (deploy/Dockerfile) and stages it under the commit in _STAGING_BUCKET, where the
+# happy-supervisor-publish trigger picks it up, signs it and publishes it with --latest
+# (deploy/README.md, Releases). Nothing here can read the signing key.
+substitutions:
+  _STAGING_BUCKET: happy-supervisor-staging
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    env: [DOCKER_BUILDKIT=1]
+    args:
+      - -c
+      - >-
+        docker build -f deploy/Dockerfile --build-arg "VERSION=$$(cat deploy/VERSION)"
+        --target release -o type=local,dest=/workspace/out .
+  - id: stage
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - >-
+        gcloud storage cp --recursive /workspace/out/happy-supervisor/*
+        "gs://${_STAGING_BUCKET}/${COMMIT_SHA}/"
+timeout: 3600s
+options:
+  machineType: E2_HIGHCPU_32
+  logging: CLOUD_LOGGING_ONLY

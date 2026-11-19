@@ -1,0 +1,99 @@
+name: release
+# Builds happy-supervisor for every supported OS and architecture and uploads one flat artifact,
+# `happy-supervisor-<version>`: the five binaries, SHA256SUMS over exactly those five, the
+# installers and VERSION. No secrets: infra signs SHA256SUMS and publishes the artifact
+# (deploy/publish.sh <dir> [--latest]). Releases normally come from Cloud Build instead, Linux
+# only: push a change to deploy/VERSION to main and approve both builds (deploy/README.md).
+#   gh workflow run release.yml --ref main -f version=0.2.0
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (0-9, A-Z, a-z, '.', '+', '-')
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-x86_64, zig: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, name: linux-aarch64, zig: true }
+          - { os: macos-14, target: aarch64-apple-darwin, name: macos-aarch64 }
+          - { os: macos-14, target: x86_64-apple-darwin, name: macos-x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the version
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: '[[ "$VERSION" =~ ^[0-9A-Za-z.+-]+$ ]]'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - if: matrix.zig
+        run: |
+          pip3 install ziglang
+          cargo install --locked cargo-zigbuild
+      - name: Build
+        shell: bash
+        env:
+          HAPPY_SUPERVISOR_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${{ matrix.zig }}" == "true" ]]; then
+            cargo zigbuild --locked --release --bin happy-supervisor --target ${{ matrix.target }}
+          else
+            cargo build --locked --release --bin happy-supervisor --target ${{ matrix.target }}
+          fi
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/happy-supervisor${{ matrix.exe }} out/happy-supervisor-${{ matrix.name }}${{ matrix.exe }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  artifact:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: build-*
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          [ "$(ls happy-supervisor-* | wc -l)" = 5 ]
+          sha256sum happy-supervisor-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/happy-supervisor-*
+      - name: Installers
+        run: |
+          grep -q RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr deploy/install.sh
+          grep -q RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr deploy/install.ps1
+          cp deploy/install.sh deploy/install.ps1 dist/
+          printf '%s\n' "${{ inputs.version }}" > dist/VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: happy-supervisor-${{ inputs.version }}
+          path: dist/*
+          if-no-files-found: error

@@ -34,6 +34,12 @@ jobs:
           sudo apparmor_parser -r /etc/apparmor.d/bwrap
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent true
       - run: cargo fmt --check
+      # The installers and the publish script (deploy/README.md).
+      - name: deploy
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          shellcheck deploy/install.sh deploy/publish.sh
+          python3 -m unittest discover -s deploy -p 'test_*.py'
       - run: cargo clippy --all-targets --all-features -- -D warnings
       # The control plane's library alone, so no node-only dependency leaks into it.
       - run: cargo clippy --lib --no-default-features --features control-plane -- -D warnings

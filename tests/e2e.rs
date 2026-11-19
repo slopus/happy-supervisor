@@ -198,7 +198,8 @@ impl Node {
 
 async fn join(cp: &ControlPlane, token: &str, state: &Path) -> std::process::Output {
     Command::new(BIN)
-        .args(["join", "--url", &cp.join_url(), "--token", token])
+        .args(["join", "--url", &cp.join_url()])
+        .env("HAPPY_JOIN_TOKEN", token)
         .args(["--name", "e2e-node", "--state-dir"])
         .arg(state)
         .output()
@@ -267,6 +268,49 @@ async fn join_takes_a_one_time_token_and_stores_owner_only_credentials() {
             .exists()
     );
     assert_eq!(node.cp.joins().len(), 1);
+}
+
+/// The join token never travels as an argument, where `ps` shows it: `HAPPY_JOIN_TOKEN`
+/// (above) or `--token-file`, here `-` for stdin.
+#[tokio::test]
+async fn join_takes_its_token_from_stdin_or_the_environment_only() {
+    use tokio::io::AsyncWriteExt as _;
+    let cp = ControlPlane::start().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let join = |state: &str| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["join", "--url", &cp.join_url(), "--state-dir"])
+            .arg(dir.path().join(state))
+            .env_remove("HAPPY_JOIN_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+
+    let missing = join("a").output().await.unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&missing.stderr),
+        "happy-supervisor: join needs the join token in HAPPY_JOIN_TOKEN, or --token-file (- for stdin)\n"
+    );
+    let argument = join("a")
+        .args(["--token", &cp.issue_join_token()])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(argument.status.code(), Some(2), "clap refuses --token");
+
+    let mut child = join("b").args(["--token-file", "-"]).spawn().unwrap();
+    let token = format!("{}\n", cp.issue_join_token());
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(token.as_bytes()).await.unwrap();
+    drop(stdin);
+    let joined = child.wait_with_output().await.unwrap();
+    assert!(joined.status.success(), "{joined:?}");
+    assert!(dir.path().join("b/private/credentials.json").exists());
+    assert!(!dir.path().join("a/private/credentials.json").exists());
 }
 
 #[tokio::test]

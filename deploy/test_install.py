@@ -50,12 +50,15 @@ root = pathlib.Path(os.environ['MOCK_ROOT'])
 with (root / 'events').open('a') as out:
     out.write(json.dumps(['candidate', *sys.argv[1:]]) + '\n')
 if sys.argv[1] == 'join':
+    out = (root / 'events').open('a')
+    out.write(json.dumps(['join token', os.environ.get('HAPPY_JOIN_TOKEN')]) + '\n')
+    out.close()
     state = pathlib.Path(sys.argv[sys.argv.index('--state-dir') + 1])
     (state / 'private').mkdir(parents=True)
     (state / 'private' / 'credentials.json').write_text('{}')
 '''
 
-JOIN = ['join', '--url', 'https://cp.example/api/nodes/join', '--token', 'test-only-token']
+JOIN = ['join', '--url', 'https://cp.example/api/nodes/join']
 
 
 class InstallTests(unittest.TestCase):
@@ -131,6 +134,9 @@ class InstallTests(unittest.TestCase):
                        '--shell', '/usr/sbin/nologin', 'happy-workload'], events)
         self.assertIn(['candidate', *JOIN, '--name', 'box', '--state-dir', str(self.state),
                        '--workload-user', 'happy-workload'], events)
+        self.assertIn(['join token', 'test-only-token'], events)
+        self.assertNotIn('test-only-token', [arg for event in events if event[0] == 'candidate'
+                                             for arg in event])
         unit = self.unit.read_text()
         self.assertIn(f'ExecStart="{self.bin}" run --state-dir "{self.state}" --workload-user happy-workload\n',
                       unit)

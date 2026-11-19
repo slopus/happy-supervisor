@@ -110,7 +110,8 @@ try {
     & $bin install-sandbox
     if ($LASTEXITCODE -ne 0) { Fail "install-sandbox failed ($LASTEXITCODE)" }
     if (-not $upgrade) {
-        $join = @('join', '--url', $env:HAPPY_JOIN_URL, '--token', $env:HAPPY_JOIN_TOKEN, '--state-dir', $state)
+        # join reads the token from $env:HAPPY_JOIN_TOKEN, not the arguments, which anyone can list.
+        $join = @('join', '--url', $env:HAPPY_JOIN_URL, '--state-dir', $state)
         if ($env:HAPPY_NODE_NAME) { $join += @('--name', $env:HAPPY_NODE_NAME) }
         & $bin @join
         if ($LASTEXITCODE -ne 0) { Fail "join failed ($LASTEXITCODE)" }

@@ -17,7 +17,7 @@ curl -fsSL https://get.happy.engineering/install.sh | sudo HAPPY_JOIN_URL=<join 
 ```
 
 ```
-happy-supervisor join --url https://control.example.com/api/nodes/join --token <join token> [--name <name>] [--state-dir <dir>] [--workload-user <user>]
+HAPPY_JOIN_TOKEN=<join token> happy-supervisor join --url https://control.example.com/api/nodes/join [--name <name>] [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor run [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor serve --listen 127.0.0.1:7777 --token-file <file> [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor info [--state-dir <dir>] [--workload-user <user>]

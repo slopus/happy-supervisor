@@ -299,8 +299,9 @@ mkdir -p "$(dirname "$BIN")"
 install -m 755 "$work/$file" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 
+# The token goes in the environment, not the arguments, which ps shows.
 # shellcheck disable=SC2086 # $workload is two words or none.
-"$BIN" join --url "$HAPPY_JOIN_URL" --token "$HAPPY_JOIN_TOKEN" \
+HAPPY_JOIN_TOKEN="$HAPPY_JOIN_TOKEN" "$BIN" join --url "$HAPPY_JOIN_URL" \
   ${HAPPY_NODE_NAME:+--name "$HAPPY_NODE_NAME"} --state-dir "$STATE" $workload
 
 mkdir -p "$(dirname "$UNIT")"

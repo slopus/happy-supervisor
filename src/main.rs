@@ -27,9 +27,10 @@ enum Command {
         /// The full join endpoint the control plane handed out with the token.
         #[arg(long)]
         url: String,
-        /// The single-use join token.
+        /// A file holding the single-use join token, or `-` for one line of stdin. Without it, the
+        /// token comes from `HAPPY_JOIN_TOKEN`. It is never an argument, which `ps` would show.
         #[arg(long)]
-        token: String,
+        token_file: Option<String>,
         /// The node name. Defaults to the hostname.
         #[arg(long)]
         name: Option<String>,
@@ -129,15 +130,29 @@ fn open_state(
     Ok(state)
 }
 
+/// The join token, from `--token-file` or else `HAPPY_JOIN_TOKEN`.
+fn join_token(file: Option<&str>) -> happy_supervisor::Result<String> {
+    if let Some(file) = file {
+        return serve::read_token(file);
+    }
+    match std::env::var("HAPPY_JOIN_TOKEN") {
+        Ok(token) if !token.is_empty() => Ok(token),
+        _ => Err(Error::invalid_params(
+            "join needs the join token in HAPPY_JOIN_TOKEN, or --token-file (- for stdin)",
+        )),
+    }
+}
+
 async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
     match command {
         Command::Join {
             url,
-            token,
+            token_file,
             name,
             state_dir,
             workload_user,
         } => {
+            let token = join_token(token_file.as_deref())?;
             let state = open_state(state_dir, workload_user)?;
             let credentials = enroll::join(&url, &token, name, &state).await?;
             println!(

@@ -72,13 +72,8 @@ impl Node {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         let joined = Command::new(BIN)
-            .args([
-                "join",
-                "--url",
-                &cp.join_url(),
-                "--token",
-                &cp.issue_join_token(),
-            ])
+            .args(["join", "--url", &cp.join_url()])
+            .env("HAPPY_JOIN_TOKEN", cp.issue_join_token())
             .args(["--name", "tunnel-node", "--state-dir"])
             .arg(&state)
             .output()

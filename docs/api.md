@@ -24,8 +24,12 @@ credential only this machine holds, and tells the node where to connect. The joi
 never stored.
 
 ```
-happy-supervisor join --url https://control.example.com/api/nodes/join --token <join token> [--name <name>]
+HAPPY_JOIN_TOKEN=<join token> happy-supervisor join --url https://control.example.com/api/nodes/join [--name <name>]
 ```
+
+The token comes from `HAPPY_JOIN_TOKEN`, or from `--token-file <path>` (`-` reads one line of
+stdin), which wins when both are given. It is never an argument, where any user's `ps` would
+see it.
 
 `--url` is the **join endpoint itself**, a full URL the control plane hands out with the token.
 The supervisor does not derive any path from it.

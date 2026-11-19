@@ -57,9 +57,11 @@ that is not root runs its work as itself, which is already a separate user.
 4. Join. The state directory defaults to `/var/lib/happy-supervisor` for root:
 
    ```
-   sudo happy-supervisor join --url <join url> --token <join token> \
-     --workload-user happy-workload
+   sudo happy-supervisor join --url <join url> --token-file - --workload-user happy-workload
    ```
+
+   and paste the join token on stdin. `HAPPY_JOIN_TOKEN` works too, where `sudo` passes it on.
+   The token is never an argument, which every user's `ps` shows.
 
 5. Run it as a service, `/etc/systemd/system/happy-supervisor.service`:
 

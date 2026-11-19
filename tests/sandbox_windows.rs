@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::windows::io::{AsRawHandle as _, IntoRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use happy_supervisor::ErrorKind;
 use happy_supervisor::fs::{self, FsRequest, FsResponse};
@@ -794,4 +794,107 @@ fn file_operations_run_as_the_sandbox() {
             "written"
         );
     });
+}
+
+/// `exec.start` itself: the status pipe through the preamble, stdin pumped through the broker
+/// and the runner, the exit code back.
+#[test]
+fn exec_start_runs_through_the_broker() {
+    use happy_supervisor::exec::ExecManager;
+    use happy_supervisor::link::{ManualClock, NodeIdentity, Role, Session};
+    use happy_supervisor::protocol::{
+        ExecId, ExecLogParams, ExecStartParams, ExecState, ExecWriteParams, ExitStatus,
+    };
+
+    let _serial = serial();
+    helper::set_exe(PathBuf::from(env!("CARGO_BIN_EXE_happy-supervisor")));
+    let tree = Tree::new();
+    let identity = NodeIdentity {
+        node_id: "n_1".to_string(),
+        installation_id: "tz4a98xxat96iws9zmbrgj3a".to_string(),
+    };
+    let (_session, outbox) = Session::new(Role::Node(identity), ManualClock::new(0));
+    let exec = ExecManager::new(outbox);
+    let root = system_root();
+    let params = |exec_id: &str, argv: Vec<String>| -> ExecStartParams {
+        serde_json::from_value(serde_json::json!({
+            "execId": exec_id,
+            "argv": argv,
+            "cwd": root,
+            "env": { "SystemRoot": root, "PATH": format!(r"{root}\System32") },
+            "stdin": true,
+        }))
+        .unwrap()
+    };
+    let confinement = || confinement(&tree, &[], &["out"]);
+    let id = |text: &str| ExecId::try_from(text).unwrap();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let exited = |exec_id: &str| {
+            let exec_id = id(exec_id);
+            let exec = &exec;
+            async move {
+                for _ in 0..1000 {
+                    let state = exec
+                        .list()
+                        .into_iter()
+                        .find(|summary| summary.exec_id == exec_id)
+                        .map(|summary| summary.state);
+                    if let Some(ExecState::Exited { exit }) = state {
+                        return exit;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                panic!("{exec_id:?} did not exit");
+            }
+        };
+
+        let mut argv = cmd(format!(
+            r"echo inside& set /p line=& echo got !line!>{}\line.txt",
+            tree.show("out")
+        ));
+        argv.insert(2, "/v:on".to_string());
+        exec.start(params("w1", argv), confinement(), None)
+            .await
+            .unwrap();
+        exec.write(ExecWriteParams {
+            exec_id: id("w1"),
+            data: Bytes::new(b"from stdin\r\n".to_vec()),
+            eof: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(exited("w1").await, ExitStatus::Exited { code: 0 });
+        let log = exec
+            .log(ExecLogParams {
+                exec_id: id("w1"),
+                offset: 0,
+                length: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(log.data.into_vec(), b"inside\r\n");
+
+        let argv = cmd(format!(r"echo x>{}", tree.show("data/new.txt")));
+        exec.start(params("w2", argv), confinement(), None)
+            .await
+            .unwrap();
+        assert_eq!(exited("w2").await, ExitStatus::Exited { code: 1 });
+        assert!(!tree.path("data/new.txt").exists());
+
+        let argv = vec![r"C:\nonexistent\prog.exe".to_string()];
+        let err = exec
+            .start(params("w3", argv), confinement(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound, "{err}");
+    });
+    assert_eq!(
+        std::fs::read_to_string(tree.path("out/line.txt")).unwrap(),
+        "got from stdin\r\n"
+    );
 }

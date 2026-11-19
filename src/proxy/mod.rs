@@ -1,77 +1,80 @@
-//! The credential proxy (docs/proxy.md): a per-command HTTP proxy that sends requests for
-//! chosen hosts through the control plane as `proxy.*` streams. Owned by the proxy track; the
-//! scaffold froze the signatures.
+//! Command proxies (docs/proxy.md and the v2 delta): one HTTP proxy and one SOCKS5 proxy per
+//! command, outside the sandbox. They apply the command's `network.egress` and `ports`, resolve
+//! names themselves and filter internal addresses, and send requests for the credential route's
+//! hosts through the control plane as `proxy.*` streams.
 
+mod address;
 mod ca;
-mod server;
+pub mod egress;
+mod http;
+pub mod socks5;
 
-use std::path::{Path, PathBuf};
+use std::io;
+use std::net::IpAddr;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use base64::Engine;
 use rustls::crypto::CryptoProvider;
 
-use crate::protocol::{ExecId, ProxyMessage, ProxySpec};
+use crate::protocol::ProxyMessage;
 use crate::streams::{Streams, Upstream};
 pub use ca::NodeCa;
-use server::{Proxy, Tasks};
+pub use egress::NetDenied;
 
 use crate::error::{Error, ErrorKind, Result};
 
-/// Every command's proxy on this node, and the streams they share. Cheap to clone.
+/// Turns a host name into addresses. The proxies never connect by name, so the addresses they
+/// check are the ones they connect to.
+pub trait Resolver: Send + Sync + 'static {
+    /// Blocking; called on a blocking thread.
+    fn lookup(&self, host: &str) -> io::Result<Vec<IpAddr>>;
+}
+
+/// The operating system's resolver.
+pub struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    fn lookup(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        use std::net::ToSocketAddrs;
+        Ok((host, 0).to_socket_addrs()?.map(|a| a.ip()).collect())
+    }
+}
+
+/// What every command proxy on this node shares: the stream table, the CA, the resolver and
+/// where `net.denied` goes. Cheap to clone.
 #[derive(Clone)]
 pub struct ProxyManager {
     streams: Arc<Streams>,
     ca: NodeCa,
+    resolver: Arc<dyn Resolver>,
+    on_denied: Arc<dyn Fn(NetDenied) + Send + Sync>,
 }
 
 impl ProxyManager {
-    pub fn new(upstream: impl Upstream, ca: NodeCa) -> ProxyManager {
+    /// `on_denied` is called with locks held, so it must not block.
+    pub fn new(
+        upstream: impl Upstream,
+        ca: NodeCa,
+        on_denied: impl Fn(NetDenied) + Send + Sync + 'static,
+    ) -> ProxyManager {
         ProxyManager {
             streams: Arc::new(Streams::new(Box::new(upstream))),
             ca,
+            resolver: Arc::new(SystemResolver),
+            on_denied: Arc::new(on_denied),
         }
     }
 
-    /// `public/ca-bundle.pem`, which sandboxed commands with a proxy may read.
-    pub fn ca_bundle(&self) -> &Path {
-        self.ca.bundle_path()
+    pub fn with_resolver(self, resolver: impl Resolver) -> ProxyManager {
+        ProxyManager {
+            resolver: Arc::new(resolver),
+            ..self
+        }
     }
 
-    /// Starts the command's proxy on a loopback port. It runs until the lease is dropped.
-    pub async fn start_for_exec(&self, exec_id: ExecId, spec: ProxySpec) -> Result<ProxyLease> {
-        let mut secret = [0u8; 32];
-        random_bytes(&mut secret)?;
-        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
-        let proxy = Arc::new(Proxy {
-            exec_id: exec_id.clone(),
-            token: spec.token,
-            hosts: spec.hosts,
-            credentials: format!("happy:{secret}"),
-            streams: self.streams.clone(),
-            ca: self.ca.clone(),
-            tasks: Tasks::open(),
-        });
-        let port = server::listen(proxy.clone()).await?;
-        let url = format!("http://happy:{secret}@127.0.0.1:{port}");
-        let bundle = self.ca.bundle_path().to_path_buf();
-        let bundle_text = bundle.to_string_lossy().into_owned();
-        let env = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
-            .into_iter()
-            .map(|name| (name.to_owned(), url.clone()))
-            .chain(
-                [
-                    "SSL_CERT_FILE",
-                    "CURL_CA_BUNDLE",
-                    "REQUESTS_CA_BUNDLE",
-                    "NODE_EXTRA_CA_CERTS",
-                    "GIT_SSL_CAINFO",
-                ]
-                .into_iter()
-                .map(|name| (name.to_owned(), bundle_text.clone())),
-            )
-            .collect();
-        Ok(ProxyLease { proxy, env, bundle })
+    /// `public/ca-bundle.pem`, which sandboxed commands with a credential route may read.
+    pub fn ca_bundle(&self) -> &Path {
+        self.ca.bundle_path()
     }
 
     /// A `proxy.*` message from the control plane. Never blocks.
@@ -87,31 +90,6 @@ impl ProxyManager {
     /// The node's stream table, which tunnels share.
     pub(crate) fn streams(&self) -> &Arc<Streams> {
         &self.streams
-    }
-}
-
-/// A running command's proxy. Dropping it stops the proxy and resets its open streams.
-pub struct ProxyLease {
-    proxy: Arc<Proxy>,
-    env: Vec<(String, String)>,
-    bundle: PathBuf,
-}
-
-impl ProxyLease {
-    /// The variables to set in the command's environment, replacing any given.
-    pub fn env(&self) -> &[(String, String)] {
-        &self.env
-    }
-
-    pub fn ca_bundle(&self) -> &Path {
-        &self.bundle
-    }
-}
-
-impl Drop for ProxyLease {
-    fn drop(&mut self) {
-        self.proxy.streams.exec_stopped(&self.proxy.exec_id);
-        self.proxy.tasks.close();
     }
 }
 

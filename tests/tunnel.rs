@@ -47,6 +47,7 @@ impl Harness {
         let proxy = ProxyManager::new(
             Channel(tx),
             NodeCa::load_or_create(&private, &public).unwrap(),
+            |_| {},
         );
         Harness {
             tunnels: TunnelManager::new(&proxy),

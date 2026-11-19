@@ -26,7 +26,7 @@ use crate::protocol::{
     MAX_EXEC_LOG_READ_BYTES, MAX_EXEC_WRITE_BYTES, MAX_OUTPUT_CHUNK_BYTES, MEMORY_LOG_BUDGET_BYTES,
     RETAINED_EXITED_EXECS, Stream, Timeout, TimeoutAction,
 };
-use crate::proxy::ProxyLease;
+use crate::proxy::egress::CommandProxy;
 use crate::sandbox::{NetnsControl, Placeholders};
 
 /// After a process exits, how long its output may stay silent before the exit is reported
@@ -84,7 +84,7 @@ struct Running {
     /// The process exited and is being reaped. Its group may no longer be signalled.
     reaping: bool,
     /// The command's credential proxy. Dropped with this phase, so the proxy stops at the exit.
-    _proxy: Option<ProxyLease>,
+    _proxy: Option<CommandProxy>,
     /// The sandbox's placeholders, kept until the exit like the proxy.
     _placeholders: Option<Placeholders>,
     /// How `tcp.open` reaches the process's ports. `None`: its policy forbids binding them.
@@ -162,7 +162,7 @@ impl ExecManager {
         &self,
         params: ExecStartParams,
         confinement: Confinement,
-        proxy: Option<ProxyLease>,
+        proxy: Option<CommandProxy>,
     ) -> Result<ExecStartResult> {
         let exec_id = params.exec_id.clone();
         let memory_reserved = match params.log {
@@ -423,7 +423,7 @@ impl Inner {
         self: &Arc<Self>,
         params: ExecStartParams,
         confinement: &Confinement,
-        proxy: Option<ProxyLease>,
+        proxy: Option<CommandProxy>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<u32> {
         let ExecStartParams {
@@ -436,8 +436,8 @@ impl Inner {
             log,
             proxy: _,
         } = params;
-        if let Some(lease) = &proxy {
-            env.extend(lease.env().iter().cloned());
+        if let Some(proxy) = &proxy {
+            env.extend(proxy.env(&std::env::current_exe()?));
         }
         let program = resolve_program(argv.program(), &env)?;
         let log = open_log(&log, confinement)?;

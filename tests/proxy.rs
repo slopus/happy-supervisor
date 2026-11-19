@@ -1,6 +1,7 @@
 //! The credential proxy against real clients, with an in-memory control plane answering its
 //! streams (docs/proxy.md).
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +10,8 @@ use happy_supervisor::protocol::{
     Bytes, ExecId, HostPattern, ProxyBody, ProxyCredit, ProxyEnd, ProxyMessage, ProxyRequest,
     ProxyReset, ProxyResponse, ProxySpec, ProxyToken, Scheme, StreamId, TcpMessage,
 };
-use happy_supervisor::proxy::{NodeCa, ProxyLease, ProxyManager};
+use happy_supervisor::proxy::egress::{self, CommandProxy, CommandProxyConfig, ListenOn};
+use happy_supervisor::proxy::{NodeCa, ProxyManager};
 use happy_supervisor::streams::Upstream;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -34,7 +36,8 @@ impl Upstream for Channel {
 /// One command's proxy, and the control plane's end of its streams.
 struct Harness {
     manager: ProxyManager,
-    lease: Option<ProxyLease>,
+    proxy: Option<CommandProxy>,
+    env: Vec<(String, String)>,
     from_node: mpsc::UnboundedReceiver<ProxyMessage>,
     dir: tempfile::TempDir,
 }
@@ -47,7 +50,9 @@ impl Harness {
         std::fs::create_dir(&public).unwrap();
         let ca = NodeCa::load_or_create(&private, &public).unwrap();
         let (tx, from_node) = mpsc::unbounded_channel();
-        let manager = ProxyManager::new(Channel(tx), ca);
+        let manager = ProxyManager::new(Channel(tx), ca, |denied| {
+            panic!("a host-mode proxy refused {denied:?}")
+        });
         let spec = ProxySpec {
             token: ProxyToken::try_from(TOKEN).unwrap(),
             hosts: hosts
@@ -55,24 +60,25 @@ impl Harness {
                 .map(|h| HostPattern::try_from(*h).unwrap())
                 .collect(),
         };
-        let lease = manager
-            .start_for_exec(ExecId::try_from("build-1").unwrap(), spec)
-            .await
-            .unwrap();
+        let config = CommandProxyConfig {
+            exec_id: ExecId::try_from("build-1").unwrap(),
+            egress: None,
+            credential: Some(spec),
+            listen: ListenOn::Loopback,
+        };
+        let proxy = egress::start(config, &manager).await.unwrap();
+        let env = proxy.env(Path::new("/usr/bin/happy-supervisor"));
         Harness {
             manager,
-            lease: Some(lease),
+            proxy: Some(proxy),
+            env,
             from_node,
             dir,
         }
     }
 
-    fn lease(&self) -> &ProxyLease {
-        self.lease.as_ref().unwrap()
-    }
-
     fn env(&self, name: &str) -> String {
-        let (_, value) = self.lease().env().iter().find(|(n, _)| n == name).unwrap();
+        let (_, value) = self.env.iter().find(|(n, _)| n == name).unwrap();
         value.clone()
     }
 
@@ -85,17 +91,17 @@ impl Harness {
             .unwrap()
     }
 
-    /// `curl` as the command would run it: with the lease's environment and nothing else
-    /// pointing it at a proxy.
+    /// `curl` as the command would run it: with the proxy's environment and nothing else
+    /// pointing it at a proxy. `NO_PROXY` is dropped, since the upstreams here are on localhost.
     fn curl(&self, args: &[&str]) -> Command {
         let mut curl = Command::new("curl");
         curl.args(["-sS", "--max-time", "30"])
             .args(args)
             .env_remove("ALL_PROXY")
             .env_remove("all_proxy")
+            .envs(self.env.iter().cloned())
             .env_remove("NO_PROXY")
             .env_remove("no_proxy")
-            .envs(self.lease().env().iter().cloned())
             .kill_on_drop(true);
         // Windows' curl uses Schannel, which trusts the Windows store and not CURL_CA_BUNDLE,
         // and checks revocation, which the node CA's leaves cannot answer.
@@ -205,7 +211,10 @@ async fn run(mut curl: Command) -> (String, String) {
 async fn the_environment_points_at_the_proxy_and_the_bundle() {
     let h = Harness::start(&["api.example.test"]).await;
     let bundle = h.dir.path().join("public").join("ca-bundle.pem");
-    assert_eq!(h.lease().ca_bundle(), bundle);
+    assert_eq!(
+        h.proxy.as_ref().unwrap().ca_bundle(),
+        Some(bundle.as_path())
+    );
     assert_eq!(h.manager.ca_bundle(), bundle);
     let url = h.env("HTTP_PROXY");
     let secret = url
@@ -224,6 +233,8 @@ async fn the_environment_points_at_the_proxy_and_the_bundle() {
         ("HTTPS_PROXY", &url),
         ("http_proxy", &url),
         ("https_proxy", &url),
+        ("NO_PROXY", "localhost,127.0.0.1,::1"),
+        ("no_proxy", "localhost,127.0.0.1,::1"),
         ("SSL_CERT_FILE", bundle),
         ("CURL_CA_BUNDLE", bundle),
         ("REQUESTS_CA_BUNDLE", bundle),
@@ -233,7 +244,7 @@ async fn the_environment_points_at_the_proxy_and_the_bundle() {
     .iter()
     .map(|(n, v)| (n.to_string(), v.to_string()))
     .collect();
-    assert_eq!(h.lease().env(), expected);
+    assert_eq!(h.env, expected);
 }
 
 #[tokio::test]
@@ -771,7 +782,7 @@ async fn responses_are_framed_by_content_length_or_chunked() {
 }
 
 #[tokio::test]
-async fn dropping_the_lease_resets_open_streams_and_stops_the_listener() {
+async fn dropping_the_proxy_resets_open_streams_and_stops_the_listener() {
     let mut h = Harness::start(&["api.example.test"]).await;
     let port = h.port();
     let curl = h.curl(&["http://api.example.test/"]);
@@ -780,7 +791,7 @@ async fn dropping_the_lease_resets_open_streams_and_stops_the_listener() {
         curl.output().await.unwrap()
     });
     let request = h.request().await;
-    h.lease.take();
+    h.proxy.take();
     let reset = loop {
         match h.next().await {
             ProxyMessage::Reset(reset) => break reset,

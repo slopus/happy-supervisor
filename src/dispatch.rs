@@ -16,6 +16,7 @@ use crate::protocol::{
     FsWriteParams, NodeInfo, NodeUpdate, ProxyMessage, SandboxInfo, TcpMessage, TcpOpenParams,
     Value, WatchId, WatchStartParams, WatchStopParams, WithAccess,
 };
+use crate::proxy::egress::{self, CommandProxyConfig, ListenOn};
 use crate::proxy::{NodeCa, ProxyManager};
 use crate::state::StateDir;
 use crate::tunnel::TunnelManager;
@@ -41,7 +42,8 @@ impl Node {
         let installation_id = state.installation_id()?;
         let name = state.credentials()?.map(|c| c.name);
         let ca = NodeCa::load_or_create(&state.private_dir(), &state.public_dir())?;
-        let proxy = ProxyManager::new(outbox.clone(), ca);
+        let denied = outbox.clone();
+        let proxy = ProxyManager::new(outbox.clone(), ca, move |event| denied.net_denied(event));
         let records = crate::sandbox::placeholder_records(&state.private_dir());
         if let Err(err) = crate::sandbox::Placeholders::sweep(&records) {
             tracing::warn!("removing a previous run's placeholders failed: {err}");
@@ -201,14 +203,19 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
             let mut confinement = node.confine(access).await?;
             let proxy = match params.proxy.take() {
                 Some(spec) => {
-                    let lease = node
-                        .proxy
-                        .start_for_exec(params.exec_id.clone(), spec)
-                        .await?;
-                    if let Confinement::Sandboxed(policy) = &mut confinement {
-                        policy.allow_read_file(lease.ca_bundle());
+                    let config = CommandProxyConfig {
+                        exec_id: params.exec_id.clone(),
+                        egress: None,
+                        credential: Some(spec),
+                        listen: ListenOn::Loopback,
+                    };
+                    let proxy = egress::start(config, &node.proxy).await?;
+                    if let (Confinement::Sandboxed(policy), Some(bundle)) =
+                        (&mut confinement, proxy.ca_bundle())
+                    {
+                        policy.allow_read_file(bundle);
                     }
-                    Some(lease)
+                    Some(proxy)
                 }
                 None => None,
             };
@@ -320,7 +327,7 @@ mod tests {
         };
         let (_session, outbox) = Session::new(Role::Node(identity), ManualClock::new(0));
         let ca = NodeCa::load_or_create(&state.private_dir(), &state.public_dir()).unwrap();
-        let proxy = ProxyManager::new(outbox.clone(), ca);
+        let proxy = ProxyManager::new(outbox.clone(), ca, |_| {});
         let installation_id = "tz4a98xxat96iws9zmbrgj3a".to_string();
         let node = Node::new(state, installation_id, None, sandbox, outbox, proxy);
         (node, dir)

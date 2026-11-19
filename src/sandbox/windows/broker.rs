@@ -27,7 +27,7 @@ use super::token::{self, TokenSpec};
 use super::win::{check, owned, wide};
 use crate::error::{Error, ErrorKind, Result};
 use crate::helper::{EXIT_BAD_JOB, EXIT_EXEC_FAILED, Job, JobOp, STATUS_MAGIC};
-use crate::policy::{Network, ResolvedPolicy};
+use crate::policy::ResolvedPolicy;
 use crate::protocol::Limits;
 use crate::wire::{from_cbor, to_cbor};
 
@@ -133,7 +133,8 @@ fn run(
         Ok(install) => install,
         Err(err) => return Err((unavailable(err), status)),
     };
-    let mut lease = match Lease::acquire(&install, &install::dir()) {
+    let net = install::NetProfile::of(job.policy.network());
+    let mut lease = match Lease::acquire(&install, &install::dir(), net) {
         Ok(lease) => lease,
         Err(err) => return Err((unavailable(err), status)),
     };
@@ -163,7 +164,7 @@ fn confine_and_launch(
             .slot
             .password()
             .map_err(|err| Error::sandbox_unavailable(err.to_string()))?;
-        let spec = token_spec(install, &lease.slot.group_sid, &job.policy);
+        let spec = token_spec(install, &lease.slot, &job.policy);
         let account = token::logon(&lease.slot.account, &password)
             .map_err(|err| Error::sandbox_unavailable(err.to_string()))?;
         let check = token::impersonation(&token::restricted(&account, &spec)?)?;
@@ -207,32 +208,14 @@ fn cannot_enforce(path: &Path, err: io::Error) -> Error {
     )
 }
 
-/// The runner's token: writes restricted when the policy denies them by default, and the
-/// network groups the policy does not want made deny-only.
-fn token_spec(install: &Install, slot_group: &str, policy: &ResolvedPolicy) -> TokenSpec {
-    let groups = &install.groups;
-    let (isolated, local_bind) = match policy.network() {
-        Network::Host { local_bind, .. } => (false, *local_bind),
-        Network::Isolated { local_bind, .. } => (true, *local_bind),
-    };
-    let mut enabled = Vec::new();
-    let mut disabled = Vec::new();
-    for (sid, on) in [
-        (&groups.isolated, isolated),
-        (&groups.no_listen, !local_bind),
-        (&groups.loopback, isolated && local_bind),
-    ] {
-        if on {
-            enabled.push(sid.clone());
-        } else {
-            disabled.push(sid.clone());
-        }
-    }
+/// The runner's token: writes restricted when the policy denies them by default. The account
+/// already holds the network groups its profile needs; they join the restricting SIDs so the
+/// filters' access check passes them however it counts.
+fn token_spec(install: &Install, slot: &install::Slot, policy: &ResolvedPolicy) -> TokenSpec {
     TokenSpec::new(
         policy.write_default() == crate::policy::Default::Deny,
-        slot_group,
-        enabled,
-        disabled,
+        &slot.group_sid,
+        slot.net.group_sids(&install.groups),
     )
 }
 

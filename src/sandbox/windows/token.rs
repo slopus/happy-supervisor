@@ -1,7 +1,7 @@
 // Derived from codex-rs/windows-sandbox-rs/src/token.rs (OpenAI Codex, Copyright 2025 OpenAI,
-// Apache License 2.0). Changed: the restricting SIDs and the SIDs made deny-only come from a
-// [`TokenSpec`], and the default DACL names the slot's group instead of the logon SID, which
-// CreateProcessWithLogonW shares with the caller.
+// Apache License 2.0). Changed: the restricting SIDs come from a [`TokenSpec`], and the default
+// DACL names the slot's group instead of the logon SID, which CreateProcessWithLogonW shares
+// with the caller.
 
 //! The command's token: the leased account's own token, restricted.
 
@@ -40,20 +40,13 @@ pub(super) struct TokenSpec {
     pub write_restricted: bool,
     /// Restricting SIDs besides the token's logon SID, which is always one.
     pub restrict: Vec<String>,
-    /// Groups made deny-only, so the network filters that match them skip this command.
-    pub disable: Vec<String>,
     /// The slot's group, the only one the default DACL lets open the command's own objects.
     pub owner_group: String,
 }
 
 impl TokenSpec {
-    /// `slot_group` gets every file grant; `enabled` and `disabled` are the network groups.
-    pub(super) fn new(
-        write_restricted: bool,
-        slot_group: &str,
-        enabled: Vec<String>,
-        disabled: Vec<String>,
-    ) -> TokenSpec {
+    /// `slot_group` gets every file grant; `network` are the account's network groups.
+    pub(super) fn new(write_restricted: bool, slot_group: &str, network: Vec<String>) -> TokenSpec {
         let mut restrict = vec![
             slot_group.to_string(),
             EVERYONE.to_string(),
@@ -61,11 +54,10 @@ impl TokenSpec {
         ];
         // The filters' access check may count as a write, so the groups they match must pass
         // the restricted check too. Nothing grants them file access.
-        restrict.extend(enabled);
+        restrict.extend(network);
         TokenSpec {
             write_restricted,
             restrict,
-            disable: disabled,
             owner_group: slot_group.to_string(),
         }
     }
@@ -113,26 +105,19 @@ pub(super) fn current_user() -> io::Result<Sid> {
 
 /// A primary token from `base` restricted as `spec` says.
 pub(super) fn restricted(base: &OwnedHandle, spec: &TokenSpec) -> io::Result<OwnedHandle> {
-    let mut restrict = spec
+    let mut sids = spec
         .restrict
         .iter()
         .map(|sid| Sid::parse(sid))
         .collect::<io::Result<Vec<_>>>()?;
-    restrict.extend(logon_sid(base)?);
-    let disable = spec
-        .disable
+    sids.extend(logon_sid(base)?);
+    let restrict: Vec<SID_AND_ATTRIBUTES> = sids
         .iter()
-        .map(|sid| Sid::parse(sid))
-        .collect::<io::Result<Vec<_>>>()?;
-    let entries = |sids: &[Sid]| -> Vec<SID_AND_ATTRIBUTES> {
-        sids.iter()
-            .map(|sid| SID_AND_ATTRIBUTES {
-                Sid: sid.as_psid(),
-                Attributes: 0,
-            })
-            .collect()
-    };
-    let (disable, restrict) = (entries(&disable), entries(&restrict));
+        .map(|sid| SID_AND_ATTRIBUTES {
+            Sid: sid.as_psid(),
+            Attributes: 0,
+        })
+        .collect();
     let (mut flags, restrict_count) = (DISABLE_MAX_PRIVILEGE | LUA_TOKEN, restrict.len());
     let restrict_count = if spec.write_restricted {
         flags |= WRITE_RESTRICTED;
@@ -146,8 +131,8 @@ pub(super) fn restricted(base: &OwnedHandle, spec: &TokenSpec) -> io::Result<Own
         CreateRestrictedToken(
             base.as_raw_handle() as HANDLE,
             flags,
-            disable.len() as u32,
-            disable.as_ptr(),
+            0,
+            std::ptr::null(),
             0,
             std::ptr::null(),
             restrict_count as u32,

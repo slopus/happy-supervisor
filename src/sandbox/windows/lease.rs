@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::acl;
-use super::install::{Install, Slot};
+use super::install::{Install, NetProfile, Slot};
 use super::win::Sid;
 
 const ERROR_SHARING_VIOLATION: i32 = 32;
@@ -25,19 +25,24 @@ pub(super) struct Lease {
 
 impl Lease {
     /// Takes the first free slot, waiting up to a minute for one.
-    pub(super) fn acquire(install: &Install, dir: &Path) -> io::Result<Lease> {
+    pub(super) fn acquire(install: &Install, dir: &Path, net: NetProfile) -> io::Result<Lease> {
         let deadline = Instant::now() + WAIT;
+        let slots: Vec<&Slot> = install
+            .slots
+            .iter()
+            .filter(|slot| slot.net == net)
+            .collect();
         loop {
-            for (index, slot) in install.slots.iter().enumerate() {
+            for slot in &slots {
                 let opened = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .share_mode(0)
-                    .open(dir.join(format!("lease-{}", index + 1)));
+                    .open(dir.join(format!("lease-{}", slot.account)));
                 match opened {
-                    Ok(journal) => return Lease::take(slot.clone(), journal),
+                    Ok(journal) => return Lease::take((*slot).clone(), journal),
                     Err(err) if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {}
                     Err(err) => return Err(err),
                 }
@@ -46,8 +51,8 @@ impl Lease {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
-                        "all {} sandbox accounts stayed busy for {}s",
-                        install.slots.len(),
+                        "all {} sandbox accounts for {net:?} networking stayed busy for {}s",
+                        slots.len(),
                         WAIT.as_secs()
                     ),
                 ));

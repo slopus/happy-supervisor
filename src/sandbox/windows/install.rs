@@ -21,7 +21,7 @@ use super::win::{Sid, check, check_code, protect, random, unprotect, wide};
 
 /// Bumped when the accounts, groups or filters change shape, so an older install reports the
 /// sandbox unavailable instead of half-working.
-pub(super) const VERSION: u32 = 1;
+pub(super) const VERSION: u32 = 2;
 
 const DEFAULT_ACCOUNTS: usize = 8;
 
@@ -38,8 +38,8 @@ pub(super) struct Install {
     pub slots: Vec<Slot>,
 }
 
-/// The groups every sandbox account belongs to. WFP filters match them, and the runner turns
-/// the ones a policy does not want into deny-only SIDs so the filters skip that command.
+/// The network groups. WFP filters match them; an account's [`NetProfile`] fixes which ones it
+/// belongs to, so a command cannot leave one.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct NetGroups {
@@ -51,13 +51,82 @@ pub(super) struct NetGroups {
     pub loopback: String,
 }
 
-/// One account of the pool. A command leases a slot for its lifetime; every ACE the sandbox adds
-/// names the slot's own group, never the account, so files the account owns from an earlier
-/// lease give a later one no owner rights in the restricted check.
+/// Which network rules an account is under, from the policy's `network`: its mode and
+/// `localBind`. Each profile has its own accounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum NetProfile {
+    /// Host networking with `localBind`: no filters.
+    Host,
+    /// Host networking without `localBind`.
+    HostNoListen,
+    /// Isolated without `localBind`.
+    Isolated,
+    /// Isolated with `localBind`: loopback is open too.
+    IsolatedLoopback,
+}
+
+impl NetProfile {
+    pub(super) const ALL: [NetProfile; 4] = [
+        NetProfile::Host,
+        NetProfile::HostNoListen,
+        NetProfile::Isolated,
+        NetProfile::IsolatedLoopback,
+    ];
+
+    pub(super) fn of(network: &crate::policy::Network) -> NetProfile {
+        use crate::policy::Network;
+        match network {
+            Network::Host {
+                local_bind: true, ..
+            } => NetProfile::Host,
+            Network::Host {
+                local_bind: false, ..
+            } => NetProfile::HostNoListen,
+            Network::Isolated {
+                local_bind: false, ..
+            } => NetProfile::Isolated,
+            Network::Isolated {
+                local_bind: true, ..
+            } => NetProfile::IsolatedLoopback,
+        }
+    }
+
+    /// The letter in its accounts' names.
+    fn code(self) -> char {
+        match self {
+            NetProfile::Host => 'h',
+            NetProfile::HostNoListen => 'n',
+            NetProfile::Isolated => 'i',
+            NetProfile::IsolatedLoopback => 'l',
+        }
+    }
+
+    /// The network groups (of [`NET_GROUPS`], in that order) its accounts belong to.
+    fn groups(self) -> &'static [usize] {
+        match self {
+            NetProfile::Host => &[],
+            NetProfile::HostNoListen => &[1],
+            NetProfile::Isolated => &[0, 1],
+            NetProfile::IsolatedLoopback => &[0, 2],
+        }
+    }
+
+    /// The SIDs of the network groups its accounts belong to.
+    pub(super) fn group_sids(self, groups: &NetGroups) -> Vec<String> {
+        let all = [&groups.isolated, &groups.no_listen, &groups.loopback];
+        self.groups().iter().map(|&i| all[i].clone()).collect()
+    }
+}
+
+/// One account of the pool. A command leases a slot of its network profile for its lifetime;
+/// every ACE the sandbox adds names the slot's own group, never the account, so files the
+/// account owns from an earlier lease give a later one no owner rights in the restricted check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Slot {
     pub account: String,
+    pub net: NetProfile,
     pub group: String,
     pub group_sid: String,
     /// DPAPI-encrypted for the installing account, base64.
@@ -93,7 +162,8 @@ pub(super) fn dir() -> PathBuf {
 
 #[derive(Debug, clap::Args)]
 pub struct InstallArgs {
-    /// How many sandboxed operations can run at once: one account each.
+    /// How many sandboxed operations of one network profile can run at once: one account each,
+    /// for each of the four profiles.
     #[arg(long, default_value_t = DEFAULT_ACCOUNTS)]
     accounts: usize,
     /// The loopback ports isolated commands may reach, where their proxies listen.
@@ -133,7 +203,12 @@ pub fn install_main(args: InstallArgs) -> std::process::ExitCode {
     }
 }
 
-fn account_name(slot: usize) -> String {
+fn account_name(net: NetProfile, slot: usize) -> String {
+    format!("happy-sbx-{}{slot:02}", net.code())
+}
+
+/// The accounts of version 1, one pool for every profile.
+fn legacy_account_name(slot: usize) -> String {
     format!("happy-sbx-{slot:02}")
 }
 
@@ -157,26 +232,35 @@ fn install(accounts: usize, proxy_ports: RangeInclusive<u16>) -> io::Result<Stri
         ensure_group(name, "happy-supervisor sandbox network rules")?;
         net_sids.push(sid_of(name)?);
     }
+    for slot in 1..=99 {
+        let account = legacy_account_name(slot);
+        ignore_missing(delete_user(&account))?;
+        ignore_missing(delete_group(&format!("{account}-files")))?;
+    }
     let mut slots = Vec::new();
-    for slot in 1..=accounts {
-        let account = account_name(slot);
-        let group = format!("{account}-files");
-        let password = new_password()?;
-        ensure_user(&account, &password)?;
-        ensure_group(&group, "happy-supervisor sandbox file access, one account")?;
-        let account_sid = sid_of(&account)?;
-        for member_of in [users.as_str(), group.as_str()]
-            .into_iter()
-            .chain(NET_GROUPS)
-        {
-            add_member(member_of, &account_sid)?;
+    for net in NetProfile::ALL {
+        for slot in 1..=accounts {
+            let account = account_name(net, slot);
+            let group = format!("{account}-files");
+            let password = new_password()?;
+            ensure_user(&account, &password)?;
+            ensure_group(&group, "happy-supervisor sandbox file access, one account")?;
+            let account_sid = sid_of(&account)?;
+            let net_groups = net.groups().iter().map(|&i| NET_GROUPS[i]);
+            for member_of in [users.as_str(), group.as_str()]
+                .into_iter()
+                .chain(net_groups)
+            {
+                add_member(member_of, &account_sid)?;
+            }
+            slots.push(Slot {
+                group_sid: sid_of(&group)?.to_text()?,
+                group,
+                account,
+                net,
+                password: BASE64.encode(protect(password.as_bytes())?),
+            });
         }
-        slots.push(Slot {
-            group_sid: sid_of(&group)?.to_text()?,
-            group,
-            account,
-            password: BASE64.encode(protect(password.as_bytes())?),
-        });
     }
     let groups = NetGroups {
         isolated: net_sids[0].to_text()?,
@@ -198,7 +282,8 @@ fn install(accounts: usize, proxy_ports: RangeInclusive<u16>) -> io::Result<Stri
     )?;
     std::fs::rename(&staged, &path)?;
     Ok(format!(
-        "installed {accounts} sandbox accounts and {filters} WFP filters; proxy ports {}-{}; record {}",
+        "installed {} sandbox accounts ({accounts} per network profile) and {filters} WFP filters; proxy ports {}-{}; record {}",
+        record.slots.len(),
         proxy_ports.start(),
         proxy_ports.end(),
         path.display()
@@ -207,11 +292,15 @@ fn install(accounts: usize, proxy_ports: RangeInclusive<u16>) -> io::Result<Stri
 
 fn uninstall() -> io::Result<String> {
     net::uninstall()?;
-    let accounts = Install::load()
-        .map(|install| install.slots.len())
-        .unwrap_or(99);
-    for slot in 1..=accounts {
-        let account = account_name(slot);
+    let accounts: Vec<String> = match Install::load() {
+        Ok(install) => install.slots.into_iter().map(|slot| slot.account).collect(),
+        Err(_) => NetProfile::ALL
+            .into_iter()
+            .flat_map(|net| (1..=99).map(move |slot| account_name(net, slot)))
+            .chain((1..=99).map(legacy_account_name))
+            .collect(),
+    };
+    for account in accounts {
         ignore_missing(delete_user(&account))?;
         ignore_missing(delete_group(&format!("{account}-files")))?;
     }
@@ -455,7 +544,34 @@ mod tests {
 
     #[test]
     fn account_names_fit_the_twenty_character_limit() {
-        assert_eq!(account_name(1), "happy-sbx-01");
-        assert_eq!(account_name(99).len(), 12);
+        assert_eq!(account_name(NetProfile::Host, 1), "happy-sbx-h01");
+        assert_eq!(
+            account_name(NetProfile::IsolatedLoopback, 99),
+            "happy-sbx-l99"
+        );
+        assert_eq!(
+            format!("{}-files", account_name(NetProfile::Isolated, 99)).len(),
+            19
+        );
+    }
+
+    #[test]
+    fn each_profile_belongs_to_its_network_groups() {
+        let groups = NetGroups {
+            isolated: "S-1-5-21-1-1001".to_string(),
+            no_listen: "S-1-5-21-1-1002".to_string(),
+            loopback: "S-1-5-21-1-1003".to_string(),
+        };
+        let sids = |net: NetProfile| net.group_sids(&groups);
+        assert_eq!(sids(NetProfile::Host), Vec::<String>::new());
+        assert_eq!(sids(NetProfile::HostNoListen), ["S-1-5-21-1-1002"]);
+        assert_eq!(
+            sids(NetProfile::Isolated),
+            ["S-1-5-21-1-1001", "S-1-5-21-1-1002"]
+        );
+        assert_eq!(
+            sids(NetProfile::IsolatedLoopback),
+            ["S-1-5-21-1-1001", "S-1-5-21-1-1003"]
+        );
     }
 }

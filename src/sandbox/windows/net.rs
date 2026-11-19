@@ -1,12 +1,21 @@
 // Derived from codex-rs/windows-sandbox-rs/src/wfp.rs (OpenAI Codex, Copyright 2025 OpenAI,
 // Apache License 2.0). Changed: the filters are a table keyed on the sandbox's network groups
-// instead of one account, and permit filters carve the proxy ports and loopback out of the
-// blocks.
+// instead of one account, blocks match a group through a deny ACE so a command cannot step out
+// of them, and permit filters carve the proxy ports and loopback out of the blocks.
 
-//! The persistent WFP filters behind `network` (policy.md, Network). Each filter matches the
-//! tokens in which one of the sandbox's network groups is enabled; the runner turns the groups a
-//! command's policy does not want into deny-only SIDs, which an allow ACE in the filter's
-//! security descriptor does not match.
+//! The persistent WFP filters behind `network` (policy.md, Network), keyed on the network
+//! groups the sandbox accounts belong to (`install::NetProfile`).
+//!
+//! A filter's `ALE_USER_ID` condition is an access check of the connecting token against a
+//! security descriptor. An allow ACE matches only an enabled group, and any process can make
+//! its own groups deny-only in a restricted token of its own, so a block keyed on an allow ACE
+//! is one the command can leave. A deny ACE matches the group enabled or deny-only, and no
+//! process can drop a group from its token altogether. So a block matches when the check
+//! against `(D;;CC;;;group)(A;;CC;;;WD)...` fails (`FWP_MATCH_NOT_EQUAL`), and a permit when
+//! the check against `(A;;CC;;;group)` passes: a command can lose a permit, never gain one, and
+//! never shed a block. The allow ACEs for Everyone, RESTRICTED and WRITE RESTRICTED keep other
+//! processes' restricted tokens passing the check; one restricted to none of them fails it and
+//! falls under the blocks.
 
 use std::io;
 use std::ops::RangeInclusive;
@@ -15,19 +24,19 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_BYTE_BLOB, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_MATCH_RANGE, FWP_RANGE_TYPE,
-    FWP_RANGE0, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT8, FWP_UINT16, FWP_V4_ADDR_AND_MASK,
-    FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
-    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_IP_PROTOCOL,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
-    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0, FWPM_FILTER0_0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_ALE_AUTH_LISTEN_V4,
-    FWPM_LAYER_ALE_AUTH_LISTEN_V6, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
-    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0,
-    FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
-    FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmProviderAdd0,
-    FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0,
-    FwpmTransactionBegin0, FwpmTransactionCommit0,
+    FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_MATCH_NOT_EQUAL, FWP_MATCH_RANGE,
+    FWP_MATCH_TYPE, FWP_RANGE_TYPE, FWP_RANGE0, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT8,
+    FWP_UINT16, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK,
+    FWP_VALUE0, FWP_VALUE0_0, FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID,
+    FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT,
+    FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
+    FWPM_FILTER0_0, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_ALE_AUTH_LISTEN_V4, FWPM_LAYER_ALE_AUTH_LISTEN_V6,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+    FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT,
+    FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0,
+    FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -178,19 +187,19 @@ pub(super) fn install(groups: &NetGroups, proxy_ports: &RangeInclusive<u16>) -> 
     let engine = Engine::open()?;
     let transaction = engine.begin()?;
     add_provider_and_sublayer(&engine)?;
-    let matches = [
-        (Who::Isolated, GroupMatch::new(&groups.isolated)?),
-        (Who::NoListen, GroupMatch::new(&groups.no_listen)?),
-        (Who::Loopback, GroupMatch::new(&groups.loopback)?),
-    ];
+    let sid = |who: Who| match who {
+        Who::Isolated => &groups.isolated,
+        Who::NoListen => &groups.no_listen,
+        Who::Loopback => &groups.loopback,
+    };
     for spec in FILTERS {
         delete_filter(&engine, &spec.key)?;
-        let group = &matches
-            .iter()
-            .find(|(who, _)| *who == spec.who)
-            .expect("every group has a match")
-            .1;
-        add_filter(&engine, spec, group, proxy_ports)?;
+        let group = if spec.action == PERMIT {
+            GroupMatch::enabled(sid(spec.who))?
+        } else {
+            GroupMatch::member(sid(spec.who))?
+        };
+        add_filter(&engine, spec, &group, proxy_ports)?;
     }
     transaction.commit()?;
     Ok(FILTERS.len())
@@ -286,17 +295,30 @@ impl Drop for Transaction<'_> {
     }
 }
 
-/// The `ALE_USER_ID` condition for "tokens in which `sid` is an enabled group": a security
-/// descriptor granting it `FWP_ACTRL_MATCH_FILTER` (CC in SDDL).
+/// An `ALE_USER_ID` condition: a self-relative security descriptor and how to match it.
 struct GroupMatch {
     /// Owns what `blob` points to.
     _sd: Local<core::ffi::c_void>,
     blob: FWP_BYTE_BLOB,
+    match_type: FWP_MATCH_TYPE,
 }
 
 impl GroupMatch {
-    fn new(sid: &str) -> io::Result<GroupMatch> {
-        let sddl = wide(format!("O:LSD:(A;;CC;;;{sid})"));
+    /// Tokens that hold `sid` in any state, or that fail the check otherwise: for blocks.
+    fn member(sid: &str) -> io::Result<GroupMatch> {
+        GroupMatch::new(
+            &format!("O:LSD:(D;;CC;;;{sid})(A;;CC;;;WD)(A;;CC;;;RC)(A;;CC;;;{WRITE_RESTRICTED})"),
+            FWP_MATCH_NOT_EQUAL,
+        )
+    }
+
+    /// Tokens in which `sid` is enabled: for permits.
+    fn enabled(sid: &str) -> io::Result<GroupMatch> {
+        GroupMatch::new(&format!("O:LSD:(A;;CC;;;{sid})"), FWP_MATCH_EQUAL)
+    }
+
+    fn new(sddl: &str, match_type: FWP_MATCH_TYPE) -> io::Result<GroupMatch> {
+        let sddl = wide(sddl);
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
         let mut size = 0u32;
         // SAFETY: a NUL-terminated string in, a LocalAlloc'd self-relative descriptor out.
@@ -314,9 +336,13 @@ impl GroupMatch {
                 data: sd as *mut u8,
             },
             _sd: Local(sd),
+            match_type,
         })
     }
 }
+
+/// The WRITE RESTRICTED SID, which write-restricted service tokens restrict to.
+const WRITE_RESTRICTED: &str = "S-1-5-33";
 
 fn add_provider_and_sublayer(engine: &Engine) -> io::Result<()> {
     let name = wide("happy-supervisor sandbox");
@@ -375,7 +401,7 @@ fn add_filter(
     };
     let mut conditions = vec![FWPM_FILTER_CONDITION0 {
         fieldKey: FWPM_CONDITION_ALE_USER_ID,
-        matchType: FWP_MATCH_EQUAL,
+        matchType: group.match_type,
         conditionValue: FWP_CONDITION_VALUE0 {
             r#type: FWP_SECURITY_DESCRIPTOR_TYPE,
             Anonymous: FWP_CONDITION_VALUE0_0 {

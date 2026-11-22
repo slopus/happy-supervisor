@@ -45,7 +45,15 @@ impl Install {
         // Not the default temporary directory: root's on macOS is private to root.
         let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::copy(BIN, dir.path().join("happy-supervisor")).unwrap();
+        // Copied by `cp`, not std::fs::copy: a process this test forks for another test while the
+        // copy is open for writing inherits that descriptor until it execs, and executing the
+        // copy meanwhile fails with ETXTBSY ("Text file busy"). Only `cp` ever holds it here.
+        let copied = std::process::Command::new("cp")
+            .arg(BIN)
+            .arg(dir.path().join("happy-supervisor"))
+            .status()
+            .unwrap();
+        assert!(copied.success());
         std::fs::write(dir.path().join("token"), format!("{TOKEN}\n")).unwrap();
         Install { dir }
     }

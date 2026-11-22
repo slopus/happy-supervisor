@@ -139,3 +139,4 @@ triggers and `release.yml` do.
 * **0.2.2.** On the Linux release builds (static musl), isolated commands work again: the proxy
   sockets are opened with `O_PATH`, which musl dropped, so every isolated exec failed with
   "cannot open …/http.sock: No such device or address".
+* **0.2.3.** The code of 0.2.2; the release pipeline now publishes without an approval.

@@ -140,3 +140,7 @@ triggers and `release.yml` do.
   sockets are opened with `O_PATH`, which musl dropped, so every isolated exec failed with
   "cannot open …/http.sock: No such device or address".
 * **0.2.3.** The code of 0.2.2; the release pipeline now publishes without an approval.
+* **0.2.4.** A refused bind in a sandboxed command is reported as the event `net.bindDenied`
+  (a control plane that does not know it replies `unknown_kind`, which the node ignores). As
+  PID 1 (in a container), `run` and `serve` keep an init in front of them that reaps orphans. The
+  proxy's 403 says the sandbox blocked the host and that the command needs more access.

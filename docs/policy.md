@@ -320,9 +320,10 @@ command, file operation or watch.
   `HOME`, `USER` and `LOGNAME`, on macOS its `TMPDIR`, and Homebrew's `bin` and `sbin` at the
   front of `PATH`, ahead of any other copy (api.md, `exec.start`).
 * The node trusts `private/system` only while the state directory, `private/` and the file are
-  the supervisor's user's own, no symlink, and writable by no one else, and every directory
-  above them is root's or the supervisor's user's and writable by no one else (or sticky, as
-  `/tmp`), so no other user can replace any of it. Otherwise it refuses, and `system enable`
+  the supervisor's user's own, no symlink, and writable by no one else, and every entry above
+  them, on the path as given and as resolved, symlinks included, is root's or the supervisor's
+  user's, and a directory writable by no one else unless it is sticky (`/tmp`), so no other user
+  can replace any of it. Otherwise it refuses, and `system enable`
   does not enable it.
 * The supervisor logs each system operation (its command and program, or its path) with the
   account it ran as.

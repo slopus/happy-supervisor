@@ -198,20 +198,12 @@ impl StateDir {
     /// read. Otherwise system access is refused.
     pub fn system(&self) -> Result<Option<SystemAccess>> {
         let path = self.private_dir().join(SYSTEM);
-        if !path.exists() {
-            return Ok(None);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io_error(&path, err)),
         }
-        #[cfg(unix)]
-        if let Some(unprotected) = self.unprotected(&path) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                format!(
-                    "system access stays refused: {} is a symlink or another user's, or others \
-                     may write it",
-                    unprotected.display()
-                ),
-            ));
-        }
+        self.check_protected()?;
         let text = match std::fs::read(&path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -222,31 +214,59 @@ impl StateDir {
             .map_err(|err| io_error(&path, err))
     }
 
-    /// The first of the state directory, `private/` and `marker` that is not the supervisor's
-    /// user's own, a symlink, or writable by others, else the first directory above them that
-    /// another user could change ([`StateDir::system`]).
+    /// Refuses unless no other user can replace what [`StateDir::system`] reads: the state
+    /// directory, `private/` and `private/system` (when it exists) must be the supervisor's
+    /// user's own, no symlink, and writable by no one else. Every entry above them, on the path
+    /// as given and as resolved, must be root's or the supervisor's user's, and a directory
+    /// writable by no one else unless it is sticky (`/tmp`). `system enable` checks this before
+    /// it writes.
+    pub fn check_protected(&self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(path) = self.unprotected() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "system access stays refused: {} is a symlink or another user's, or others \
+                     may write it",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
-    fn unprotected(&self, marker: &Path) -> Option<PathBuf> {
+    fn unprotected(&self) -> Option<PathBuf> {
         use std::os::unix::fs::MetadataExt as _;
         let me = nix::unistd::geteuid().as_raw();
-        let private = self.private_dir();
-        let own = [self.root.as_path(), private.as_path(), marker];
-        if let Some(path) = own.into_iter().find(|path| {
-            !std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        let mut own = vec![self.root.clone(), self.private_dir()];
+        let marker = self.private_dir().join(SYSTEM);
+        if std::fs::symlink_metadata(&marker).is_ok() {
+            own.push(marker);
+        }
+        let mine = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|meta| {
                 !meta.file_type().is_symlink() && meta.uid() == me && meta.mode() & 0o022 == 0
             })
-        }) {
-            return Some(path.to_path_buf());
+        };
+        if let Some(path) = own.into_iter().find(|path| !mine(path)) {
+            return Some(path);
         }
-        self.root
-            .ancestors()
-            .skip(1)
-            .find(|dir| {
-                !std::fs::metadata(dir).is_ok_and(|meta| {
-                    (meta.uid() == 0 || meta.uid() == me)
-                        && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0)
-                })
+        let held = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|meta| {
+                (meta.uid() == 0 || meta.uid() == me)
+                    && (meta.file_type().is_symlink()
+                        || meta.mode() & 0o022 == 0
+                        || meta.mode() & 0o1000 != 0)
             })
+        };
+        let Ok(resolved) = std::fs::canonicalize(&self.root) else {
+            return Some(self.root.clone());
+        };
+        [&self.root, &resolved]
+            .into_iter()
+            .flat_map(|root| root.ancestors().skip(1))
+            .find(|path| !held(path))
             .map(Path::to_path_buf)
     }
 

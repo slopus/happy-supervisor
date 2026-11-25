@@ -75,9 +75,6 @@ enum Command {
     System {
         #[command(subcommand)]
         action: SystemAction,
-        /// The service's state directory, which the installers pass to `run`.
-        #[arg(long, global = true, required = true)]
-        state_dir: PathBuf,
     },
     /// Print this node's NodeInfo as JSON.
     Info {
@@ -96,11 +93,20 @@ enum SystemAction {
     Enable {
         #[arg(long)]
         user: Option<String>,
+        #[command(flatten)]
+        state: ServiceState,
     },
     /// Refuse system access from the next request on.
-    Disable,
+    Disable(ServiceState),
     /// Print the account system access runs as, or that it is disabled.
-    Status,
+    Status(ServiceState),
+}
+
+#[derive(clap::Args)]
+struct ServiceState {
+    /// The service's state directory, which the installers pass to `run`.
+    #[arg(long)]
+    state_dir: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -219,18 +225,21 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         }
         #[cfg(windows)]
         Command::InstallSandbox(_) => unreachable!("handled before the runtime starts"),
-        Command::System { action, state_dir } => {
-            let state = StateDir::existing(state_dir)?;
+        Command::System { action } => {
+            let (SystemAction::Enable { state, .. }
+            | SystemAction::Disable(state)
+            | SystemAction::Status(state)) = &action;
+            let state = StateDir::existing(state.state_dir.clone())?;
             match action {
-                SystemAction::Enable { user } => {
+                SystemAction::Enable { user, .. } => {
                     let access = identity::enable_system(&state, user)?;
                     println!("system access enabled: it runs as {}", access.user);
                 }
-                SystemAction::Disable => {
+                SystemAction::Disable(_) => {
                     state.store_system(None)?;
                     println!("system access disabled");
                 }
-                SystemAction::Status => match state.system()? {
+                SystemAction::Status(_) => match state.system()? {
                     Some(access) => println!("system access enabled: it runs as {}", access.user),
                     None => println!("system access disabled"),
                 },

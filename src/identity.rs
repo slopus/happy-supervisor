@@ -240,11 +240,8 @@ pub fn enable_system(state: &StateDir, user: Option<String>) -> Result<SystemAcc
         path: homebrew.map(|brew| brew.path).unwrap_or_default(),
     };
     System::resolve(access.clone(), &supervisor_user)?;
+    state.check_protected()?;
     state.store_system(Some(&access))?;
-    if let Err(err) = state.system() {
-        state.store_system(None)?;
-        return Err(err);
-    }
     Ok(access)
 }
 

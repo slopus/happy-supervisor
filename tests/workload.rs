@@ -444,6 +444,51 @@ impl Node {
     }
 }
 
+#[test]
+fn the_system_commands_need_the_services_state_and_root_to_enable() {
+    let install = Install::new();
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(install.path("happy-supervisor"))
+            .arg("system")
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        (output.status.code(), stderr.trim().to_string())
+    };
+    let missing = install.path("missing");
+    assert_eq!(
+        run(&["status", "--state-dir", missing.to_str().unwrap()]),
+        (
+            Some(1),
+            format!(
+                "happy-supervisor: no supervisor state at {}: pass the service's --state-dir",
+                missing.display()
+            )
+        )
+    );
+    assert_eq!(run(&["status"]).0, Some(2));
+    if root() {
+        return;
+    }
+    std::fs::create_dir_all(install.path("state/private")).unwrap();
+    assert_eq!(
+        run(&[
+            "enable",
+            "--state-dir",
+            install.path("state").to_str().unwrap()
+        ]),
+        (
+            Some(1),
+            format!(
+                "happy-supervisor: enabling system access needs root (sudo) on Linux or macOS; \
+                 this runs as {:?}",
+                id(&["-un"])
+            )
+        )
+    );
+}
+
 #[tokio::test]
 async fn system_access_runs_as_the_enabled_account_only_while_enabled() {
     if !root() {
@@ -538,6 +583,24 @@ async fn system_access_runs_as_the_enabled_account_only_while_enabled() {
             ErrorKind::PermissionDenied,
             "system access runs as \"hs-no-such-user\", which no longer exists; an administrator \
              runs `sudo happy-supervisor system enable` again"
+        )
+    );
+
+    let alias = node.install.path("alias");
+    std::os::unix::fs::symlink(node.install.path(""), &alias).unwrap();
+    let nobody = nix::unistd::User::from_name(USER).unwrap().unwrap();
+    std::os::unix::fs::lchown(&alias, Some(nobody.uid.as_raw()), None).unwrap();
+    let output = std::process::Command::new(node.install.path("happy-supervisor"))
+        .args(["system", "status", "--state-dir"])
+        .arg(alias.join("state"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        format!(
+            "happy-supervisor: system access stays refused: {} is a symlink or another user's, \
+             or others may write it",
+            alias.display()
         )
     );
 

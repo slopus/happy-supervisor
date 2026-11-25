@@ -43,7 +43,7 @@ pub mod server;
 pub mod state;
 #[cfg(feature = "node")]
 pub mod streams;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "node", target_os = "linux"))]
 pub mod system_account;
 #[cfg(feature = "testing")]
 pub mod testing;

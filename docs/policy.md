@@ -299,9 +299,10 @@ system-wide software on this machine, so `apt-get install`, `npm install -g` and
 work. It is off unless an administrator enables it, and the control plane asks for it per
 command, file operation or watch.
 
-* `sudo happy-supervisor system enable [--user <name>] [--state-dir <dir>]` records the account
+* `sudo happy-supervisor system enable [--user <name>] --state-dir <dir>` records the account
   in `private/system`, which only root can read or write. `system disable` removes it, and
-  `system status` prints it. `install.sh --system` runs `system enable` after joining.
+  `system status` prints it. Each takes the service's state directory (install.md) and refuses
+  one that does not exist. `install.sh --system` runs `system enable` after joining.
 * The account is root on Linux. On macOS it is the owner of Homebrew (`/opt/homebrew`, else
   `/usr/local/Homebrew`), because `brew` refuses to run as root and Homebrew's `npm -g` installs
   into its prefix; without Homebrew it is root. `--user` names another account. Root on macOS
@@ -318,6 +319,13 @@ command, file operation or watch.
   access as the workload user (above). A command's environment is `env` with the account's
   `HOME`, `USER` and `LOGNAME`, on macOS its `TMPDIR`, and Homebrew's `bin` and `sbin` at the
   front of `PATH` (api.md, `exec.start`).
+* The node trusts `private/system` only while the state directory, `private/` and the file are
+  the supervisor's user's own, no symlink, and writable by no one else; otherwise it refuses.
 * The supervisor logs each system operation (its command and program, or its path) with the
   account it ran as.
+* Enabling it hands the control plane the machine. As root, a system command can read the node
+  token and the proxy CA key in `private/`, rewrite `private/system` so a later `system
+  disable` does not hold, and replace the supervisor. Turn it off in the control plane as well,
+  and after a node that ran system commands has it disabled, rotate its token (`node.update`).
+  Homebrew's owner on macOS cannot read `private/`.
 * Not supported on Windows, where the node refuses it.

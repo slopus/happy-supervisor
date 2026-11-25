@@ -561,7 +561,7 @@ reply's `ok`. A `(event)` heading marks an event.
 
 ## Access
 
-Every exec, file and watch command carries `access`. It is one of two shapes:
+Every exec, file and watch command carries `access`. It is one of three shapes:
 
 ```json
 { "mode": "raw" }

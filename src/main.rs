@@ -219,7 +219,7 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         #[cfg(windows)]
         Command::InstallSandbox(_) => unreachable!("handled before the runtime starts"),
         Command::System { action, state_dir } => {
-            let state = StateDir::open(state_dir)?;
+            let state = StateDir::existing(state_dir)?;
             match action {
                 SystemAction::Enable { user } => {
                     let access = identity::enable_system(&state, user)?;

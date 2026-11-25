@@ -56,7 +56,9 @@ $env:HAPPY_JOIN_URL='…'; $env:HAPPY_JOIN_TOKEN='…'; irm https://get.happy.en
 `install.sh --system` (`sh -s -- --system`, with sudo only) also enables system access
 (docs/policy.md, System access): the control plane may run chosen commands as root on Linux and
 as Homebrew's owner on macOS, for `apt-get install`, `npm install -g` and `brew install`. NodeInfo
-then reports `identity.system`. `sudo happy-supervisor system enable|disable` changes it later.
+then reports `identity.system`. `sudo happy-supervisor system enable|disable --state-dir <dir>`
+changes it later, with the service's state directory: `/var/lib/happy-supervisor` on Linux,
+`"/Library/Application Support/happy-supervisor"` on macOS.
 
 Run again without `HAPPY_JOIN_TOKEN` to upgrade a joined computer in place; `install.sh
 --uninstall` (or `$env:HAPPY_UNINSTALL='1'`) removes it. `HAPPY_SUPERVISOR_VERSION` pins a

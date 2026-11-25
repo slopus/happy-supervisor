@@ -156,6 +156,16 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(candidate[0][1], 'join')
         self.assertLess(events.index(candidate[1]), events.index(['systemctl', 'restart', 'happy-supervisor']))
 
+    def test_an_upgrade_with_system_enables_it_before_stopping_the_service(self):
+        self.fresh()
+        self.run_install()
+        (self.root / 'events').unlink()
+        del self.env['HAPPY_JOIN_TOKEN']
+        events = self.run_install('--system')
+        enable = ['candidate', 'system', 'enable', '--state-dir', str(self.state)]
+        self.assertLess(events.index(enable),
+                        events.index(['systemctl', 'disable', '--now', 'happy-supervisor']))
+
     def test_system_without_sudo_refuses_before_downloading(self):
         self.fresh(MOCK_UID='1000')
         events = self.run_install('--system', success=False)

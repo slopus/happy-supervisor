@@ -186,8 +186,8 @@ impl System {
     }
 
     /// Gives a command the account's environment (api.md, Access): its `HOME`, `USER` and
-    /// `LOGNAME`, on macOS its `TMPDIR`, and the recorded directories at the front of `PATH`,
-    /// so package managers use the account's caches and find Homebrew.
+    /// `LOGNAME`, on macOS its `TMPDIR`, and the recorded directories first in `PATH`, ahead of
+    /// any other copy of them, so package managers use the account's caches and Homebrew's tools.
     pub fn apply_env(&self, env: &mut BTreeMap<String, String>) {
         env.insert("HOME".to_owned(), self.home.clone());
         for key in ["USER", "LOGNAME"] {
@@ -196,19 +196,19 @@ impl System {
         if let Some(temp) = temp_dir(self.account.as_deref()) {
             env.insert("TMPDIR".to_owned(), temp);
         }
-        let path = env.get("PATH").map_or("", String::as_str);
-        let mut entries: Vec<&str> = self
+        if self.path.is_empty() {
+            return;
+        }
+        let rest = env.get("PATH").map_or("", String::as_str);
+        let entries: Vec<&str> = self
             .path
             .iter()
             .map(String::as_str)
-            .filter(|dir| !path.split(':').any(|entry| entry == *dir))
+            .chain(
+                rest.split(':')
+                    .filter(|entry| !entry.is_empty() && !self.path.iter().any(|dir| dir == entry)),
+            )
             .collect();
-        if entries.is_empty() {
-            return;
-        }
-        if !path.is_empty() {
-            entries.push(path);
-        }
         let joined = entries.join(":");
         env.insert("PATH".to_owned(), joined);
     }
@@ -690,7 +690,7 @@ mod tests {
         let mut env = BTreeMap::from([
             (
                 "PATH".to_string(),
-                "/usr/bin:/opt/homebrew/sbin".to_string(),
+                "/usr/local/bin:/opt/homebrew/sbin:/usr/bin".to_string(),
             ),
             ("HOME".to_string(), "/home/happy-workload".to_string()),
             ("LANG".to_string(), "C.UTF-8".to_string()),
@@ -703,7 +703,7 @@ mod tests {
             BTreeMap::from([
                 (
                     "PATH".to_string(),
-                    "/opt/homebrew/bin:/usr/bin:/opt/homebrew/sbin".to_string()
+                    "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin".to_string()
                 ),
                 ("HOME".to_string(), "/Users/admin".to_string()),
                 ("USER".to_string(), "admin".to_string()),

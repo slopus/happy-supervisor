@@ -109,8 +109,9 @@ case "${1:-}" in
     ;;
   *) fail "unknown option $1: the options are --system and --uninstall" ;;
 esac
+# Runs `system enable` with the binary in $1.
 enable_system() {
-  [ -z "$system" ] || "$BIN" system enable --state-dir "$STATE"
+  [ -z "$system" ] || "$1" system enable --state-dir "$STATE"
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -242,10 +243,12 @@ fetch "$BASE/releases/$version/$file" "$work/$file"
 
 # Verified: only now does anything reach a system path, or the user's own.
 if [ -n "$upgrade" ]; then
+  # Before the service stops, so a release without `system` leaves the running one as it was.
+  chmod 755 "$work/$file"
+  enable_system "$work/$file"
   service_stop
   install -m 755 "$work/$file" "$BIN.new"
   mv -f "$BIN.new" "$BIN"
-  enable_system
   service_start
   echo "happy-supervisor upgraded to $version"
   exit 0
@@ -321,7 +324,7 @@ mv -f "$BIN.new" "$BIN"
 # shellcheck disable=SC2086 # $workload is two words or none.
 HAPPY_JOIN_TOKEN="$HAPPY_JOIN_TOKEN" "$BIN" join --url "$HAPPY_JOIN_URL" \
   ${HAPPY_NODE_NAME:+--name "$HAPPY_NODE_NAME"} --state-dir "$STATE" $workload
-enable_system
+enable_system "$BIN"
 
 mkdir -p "$(dirname "$UNIT")"
 if [ "$os" = linux ]; then

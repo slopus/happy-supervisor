@@ -66,6 +66,12 @@ jobs:
       - name: system access installs packages, as root
         if: runner.os != 'Windows'
         run: |
+          # system enable refuses a /opt that others may change; the runner's may be one.
+          if [ "$RUNNER_OS" = Linux ]; then
+            ls -ld /opt
+            sudo chown root:root /opt
+            sudo chmod 755 /opt
+          fi
           bin=$(cargo test --all-features --test workload --no-run --message-format=json \
             | jq -r 'select(.target.name == "workload" and .executable != null) | .executable')
           sudo HS_TEST_PATH="$(dirname "$(command -v npm)")" "$bin" --ignored --nocapture \

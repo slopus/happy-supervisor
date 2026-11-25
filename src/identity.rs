@@ -205,6 +205,18 @@ impl System {
     /// `LOGNAME`, on macOS its `TMPDIR`, and the recorded directories first in `PATH`, ahead of
     /// any other copy of them, so package managers use the account's caches and Homebrew's tools.
     pub fn apply_env(&self, env: &mut BTreeMap<String, String>) {
+        // A root command never gets the directory `happy-system` writes, even from a
+        // `defaultEnv` read while system access ran as `happy-system`.
+        #[cfg(target_os = "linux")]
+        if self.account.is_none()
+            && let Some(path) = env.get_mut("PATH")
+        {
+            let kept: Vec<&str> = path
+                .split(':')
+                .filter(|entry| *entry != crate::system_account::PREFIX_BIN)
+                .collect();
+            *path = kept.join(":");
+        }
         env.insert("HOME".to_owned(), self.home.clone());
         for key in ["USER", "LOGNAME"] {
             env.insert(key.to_owned(), self.user.clone());
@@ -771,6 +783,23 @@ mod tests {
         let mut empty = BTreeMap::new();
         system.apply_env(&mut empty);
         assert_eq!(empty["PATH"], "/opt/homebrew/bin:/opt/homebrew/sbin");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_root_command_never_gets_the_directory_happy_system_writes() {
+        let system = System {
+            user: "root".to_string(),
+            account: None,
+            home: "/root".to_string(),
+            path: vec![],
+        };
+        let mut env = BTreeMap::from([(
+            "PATH".to_string(),
+            "/usr/bin:/opt/happy-system/npm/bin:/bin".to_string(),
+        )]);
+        system.apply_env(&mut env);
+        assert_eq!(env["PATH"], "/usr/bin:/bin");
     }
 
     #[test]

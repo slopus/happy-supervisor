@@ -311,14 +311,20 @@ command, file operation or watch.
   `defaultEnv`, on a node with a workload user, appends it to `PATH` too, so every command finds
   what it installs; appended, so nothing it installs shadows a system program, though a user
   whose `PATH` has it runs what `happy-system` put there under a name nothing earlier has. Root's
-  `PATH` never gets it, and neither does `defaultEnv` when raw commands run as root. The prefix
-  is not under `/usr/local`, whose directories root searches first, and `/opt/happy-system` must
-  be root's, under directories only root may write. `system enable` refuses an existing
-  `happy-system` that is root, in root's group or in any group but its own. `/etc/cron.deny`
-  and `/etc/at.deny` name the account, and `system disable` kills every process it has, so
-  nothing it left behind keeps running. An administrator can give the account a package manager
-  of its own, such as Homebrew on Linux under `/home/linuxbrew/.linuxbrew` owned by
-  `happy-system`, with `--path` for its `bin`.
+  `PATH` never gets it: not from the profile script, not in `defaultEnv` when raw commands run as
+  root, and a system command as root has it taken out of its `PATH`. The prefix is not under
+  `/usr/local`, whose directories root searches first. `system enable` checks before it changes
+  anything, and refuses rather than repairs: `/opt/happy-system` and every directory above it
+  must be root's and writable by no one else (but root's group, or anyone in a sticky
+  directory), and an existing `happy-system` must not be root, in root's group or in any group
+  but its own. The account is added to `/etc/cron.deny`, and to `/etc/at.deny` when that exists
+  (without it `at` is root's alone); a scheduler with an allow file is left alone, and one whose
+  allow file names the account makes `system enable` refuse. `system disable` kills every
+  process the account has, through a pidfd after checking the uid again, so nothing it left
+  behind keeps running; a command whose start was already under way at that moment can still
+  start after it, so check `identity.system` and the processes, or disable again. An
+  administrator can give the account a package manager of its own, such as Homebrew on Linux
+  under `/home/linuxbrew/.linuxbrew` owned by `happy-system`, with `--path` for its `bin`.
 * `apt-get install` as `happy-system` goes through the supervisor, which runs it as root with
   package names only (Installing with apt, below).
 * `--user root` runs system access as root on Linux, so every `apt-get` command works. It is

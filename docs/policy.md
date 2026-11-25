@@ -308,10 +308,15 @@ command, file operation or watch.
   system user with a home and no login shell, owning the npm prefix `/opt/happy-system/npm`,
   which its `~/.npmrc` names, so `npm install -g` works without root. `/etc/profile.d/happy-system.sh`
   appends `/opt/happy-system/npm/bin` to the `PATH` of every user but root, and NodeInfo
-  `defaultEnv` appends it to `PATH` too, so every command finds what it installs; appended, so
-  nothing it installs shadows a system program. The prefix is not under `/usr/local`, whose
-  directories root searches first. `/etc/cron.deny` names the account, and `system disable` kills
-  every process it has, so nothing it left behind keeps running. `apt-get` needs root, so it does
+  `defaultEnv`, on a node with a workload user, appends it to `PATH` too, so every command finds
+  what it installs; appended, so nothing it installs shadows a system program, though a user
+  whose `PATH` has it runs what `happy-system` put there under a name nothing earlier has. Root's
+  `PATH` never gets it, and neither does `defaultEnv` when raw commands run as root. The prefix
+  is not under `/usr/local`, whose directories root searches first, and `/opt/happy-system` must
+  be root's, under directories only root may write. `system enable` refuses an existing
+  `happy-system` that is root, in root's group or in any group but its own. `/etc/cron.deny`
+  and `/etc/at.deny` name the account, and `system disable` kills every process it has, so
+  nothing it left behind keeps running. `apt-get` needs root, so it does
   not work as `happy-system`. An administrator can give the account a package manager of its own,
   such as Homebrew on Linux under `/home/linuxbrew/.linuxbrew` owned by `happy-system`, with
   `--path` for its `bin`.
@@ -327,7 +332,8 @@ command, file operation or watch.
   entry and no setuid program is involved, so the workload user, which every raw command runs
   as, gains nothing.
 * The node reads `private/system` on every system request, so `system disable` refuses the next
-  one without a restart; running commands keep running. A refusal is `permission_denied` and
+  one without a restart. Running commands keep running, except on Linux as `happy-system`,
+  whose processes it kills. A refusal is `permission_denied` and
   says why: the supervisor is not root, system access is not enabled, or its account no longer
   exists. NodeInfo `identity.system` names the account, or is `null` when the node refuses it.
 * A system command, file operation or watch is unconfined and runs as that account, like raw

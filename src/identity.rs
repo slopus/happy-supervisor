@@ -109,12 +109,14 @@ impl Identity {
 
     /// On Linux with system access as `happy-system`, the directory of the programs it installs
     /// with `npm install -g`, which NodeInfo `defaultEnv` appends to `PATH` so every command
-    /// finds them.
+    /// finds them. Only with a workload user: `happy-system` may write it, so it is never on the
+    /// `PATH` of commands that run as root.
     pub fn shared_bin(&self) -> Option<&'static str> {
         #[cfg(target_os = "linux")]
-        if self
-            .system()
-            .is_ok_and(|system| system.user == crate::system_account::USER)
+        if self.workload().is_some()
+            && self
+                .system()
+                .is_ok_and(|system| system.user == crate::system_account::USER)
         {
             return Some(crate::system_account::PREFIX_BIN);
         }

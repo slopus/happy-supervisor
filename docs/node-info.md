@@ -197,9 +197,9 @@ The environment a command would usually get on this machine, for the control pla
 `exec.start`. It holds `PATH`, `HOME` (`USERPROFILE` on Windows), `USER` (`USERNAME` on
 Windows), `LANG` and `TMPDIR` (`TEMP` and `TMP` on Windows) when set in the supervisor's
 environment, and also `SystemRoot` on Windows. With a workload user, `HOME` and `USER` are that
-user's home directory and name. On Linux with system access as `happy-system`, `PATH` ends with
-`/opt/happy-system/npm/bin`, where its `npm install -g` puts programs (policy.md, System
-access). Nothing else of the supervisor's environment is reported.
+user's home directory and name. On Linux with a workload user and system access as
+`happy-system`, `PATH` ends with `/opt/happy-system/npm/bin`, where its `npm install -g` puts
+programs (policy.md, System access). Nothing else of the supervisor's environment is reported.
 
 ### `collectedAtMs`
 

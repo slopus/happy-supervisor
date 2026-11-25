@@ -135,6 +135,44 @@ impl Node {
         self.exec.shutdown().await;
     }
 
+    /// On Linux, a socket through which a system command that runs as `happy-system` installs
+    /// with apt while system access still runs as `happy-system` (policy.md, Installing with
+    /// apt), and the command's `env` to reach it.
+    #[cfg(target_os = "linux")]
+    async fn apt_gate(
+        &self,
+        system: &System,
+        env: &mut BTreeMap<String, String>,
+    ) -> Result<Option<crate::exec::AptGate>> {
+        use crate::system_account::USER;
+        let Some(account) = system.account().filter(|_| system.user() == USER) else {
+            return Ok(None);
+        };
+        let uid = account.uid();
+        let identity = self.identity.clone();
+        let enabled = move || identity.system().is_ok_and(|system| system.user() == USER);
+        let gate = tokio::task::spawn_blocking(move || crate::exec::AptGate::open(uid, enabled))
+            .await
+            .map_err(|err| Error::new(ErrorKind::Io, format!("system access failed: {err}")))?
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("system access failed: cannot open the apt socket: {err}"),
+                )
+            })?;
+        gate.apply_env(env);
+        Ok(Some(gate))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn apt_gate(
+        &self,
+        _system: &System,
+        _env: &mut BTreeMap<String, String>,
+    ) -> Result<Option<crate::exec::AptGate>> {
+        Ok(None)
+    }
+
     /// What an operation runs under, and as whom. `what` names it in the log line every system
     /// operation writes.
     async fn confine(&self, access: Access, what: impl FnOnce() -> String) -> Result<Work> {
@@ -304,38 +342,6 @@ struct Work {
     system: Option<System>,
 }
 
-/// A socket through which a system command that does not run as root installs with apt, on
-/// Linux (policy.md, System access), and the command's `env` to reach it.
-#[cfg(target_os = "linux")]
-async fn apt_gate(
-    system: &System,
-    env: &mut BTreeMap<String, String>,
-) -> Result<Option<crate::exec::AptGate>> {
-    let Some(account) = system.account() else {
-        return Ok(None);
-    };
-    let uid = account.uid();
-    let gate = tokio::task::spawn_blocking(move || crate::exec::AptGate::open(uid))
-        .await
-        .map_err(|err| Error::new(ErrorKind::Io, format!("system access failed: {err}")))?
-        .map_err(|err| {
-            Error::new(
-                ErrorKind::Io,
-                format!("system access failed: cannot open the apt socket: {err}"),
-            )
-        })?;
-    gate.apply_env(env);
-    Ok(Some(gate))
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn apt_gate(
-    _system: &System,
-    _env: &mut BTreeMap<String, String>,
-) -> Result<Option<crate::exec::AptGate>> {
-    Ok(None)
-}
-
 /// With a workload user, the sandbox's bridge connects to the proxy sockets as that user. They
 /// stay in `private/`, which only the supervisor's user can reach; that one sandbox's helper
 /// connects to them through descriptors the node passes it (policy.md, Workload user).
@@ -405,7 +411,7 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
             let mut apt = None;
             if let Some(system) = system {
                 system.apply_env(&mut params.env);
-                apt = apt_gate(&system, &mut params.env).await?;
+                apt = node.apt_gate(&system, &mut params.env).await?;
             }
             let proxy = node
                 .command_proxy(&params.exec_id, params.proxy.take(), &mut confinement)

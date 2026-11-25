@@ -41,7 +41,7 @@ pub fn provision() -> Result<()> {
     let user = lookup()?.ok_or_else(|| io(format!("{USER} was not created")))?;
     unprivileged(&user)?;
     let (uid, gid) = (user.uid.as_raw(), user.gid.as_raw());
-    root_dir(Path::new(DIR))?;
+    root_dir(Path::new(DIR), 0o755)?;
     std::fs::create_dir_all(PREFIX).map_err(|err| io(format!("cannot create {PREFIX}: {err}")))?;
     std::os::unix::fs::chown(PREFIX, Some(uid), Some(gid))
         .map_err(|err| io(format!("cannot give {PREFIX} to {USER}: {err}")))?;
@@ -71,12 +71,12 @@ fn unprivileged(user: &nix::unistd::User) -> Result<()> {
     Ok(())
 }
 
-/// Creates `dir` or makes sure of it: a directory, root's, that no one else may write, under
-/// parents that only root may write either.
-fn root_dir(dir: &Path) -> Result<()> {
+/// Creates `dir` or makes sure of it: a directory, root's, with `mode`, under parents that only
+/// root may write either.
+pub(crate) fn root_dir(dir: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)))
         .map_err(|err| io(format!("cannot create {}: {err}", dir.display())))?;
     for path in dir.ancestors() {
         let meta = std::fs::symlink_metadata(path)
@@ -296,7 +296,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let mine = dir.path().join("happy-system");
-        let err = root_dir(&mine).unwrap_err();
+        let err = root_dir(&mine, 0o755).unwrap_err();
         assert_eq!(err.kind, ErrorKind::PermissionDenied);
         assert_eq!(
             err.message,

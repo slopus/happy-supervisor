@@ -1,22 +1,32 @@
 //! Installing packages with apt for a system command that runs as `happy-system`, which is not
-//! root (policy.md, System access). The supervisor, which is, runs `apt-get install` for it, with
-//! package names only: no apt options, no files, no versions or releases, no removals, and none
-//! of the caller's environment. So the command chooses which packages from the repositories the
-//! administrator configured get installed, and nothing else that runs as root.
+//! root (policy.md, Installing with apt). The supervisor, which is, runs `apt-get install` for
+//! it, with package names only: no apt options, no files, no versions or releases, no removals,
+//! and none of the caller's environment. So the command chooses which packages from the
+//! repositories the administrator configured get installed, and nothing else that runs as root.
 //!
-//! Each such command gets its own socket, which exists only while the command runs and which only
-//! processes of its session, as `happy-system`, may use. The `apt` and `apt-get` the command finds
-//! first in `PATH` are links to this binary ([`shim_main`]), which forward `install` there with
-//! their standard output and error, and exit as `apt-get` did.
+//! Each such command gets its own socket ([`AptGate`]), which serves only processes of the
+//! command's session, as `happy-system`, and only until the command exits. The `apt` and
+//! `apt-get` the command finds first in `PATH` are links to a copy of this binary
+//! ([`shim_main`]), which forward `install` there, print what `apt-get` prints, and exit as it
+//! did.
+//!
+//! The shim sends the request as JSON and closes its side for writing. The supervisor answers
+//! with frames, a kind byte and a big-endian `u32` length, then the payload: [`OUTPUT`] chunks,
+//! then one [`EXITED`] (a big-endian `i32`) or [`REFUSED`] (a UTF-8 message).
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::Result;
+use crate::system_account::root_dir;
 
 /// The environment variable that names the command's socket.
 pub const SOCKET_ENV: &str = "HAPPY_APT_SOCKET";
@@ -26,6 +36,21 @@ const SHIM_NAMES: [&str; 2] = ["apt", "apt-get"];
 const APT_FAILED: u8 = 100;
 const MAX_REQUEST: usize = 64 << 10;
 const MAX_PACKAGES: usize = 256;
+const MAX_FRAME: usize = 64 << 10;
+/// Connections one socket answers at once; more are closed unanswered.
+const MAX_CONNECTIONS: usize = 4;
+/// How long the supervisor waits for a request.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the supervisor waits for the shim to take output, before it stops sending it and
+/// lets `apt-get` finish without it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Where `apt-get` and `apt-cache` run: a fixed environment, none of the caller's.
+const APT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Frame kinds.
+pub const OUTPUT: u8 = 0;
+pub const EXITED: u8 = 1;
+pub const REFUSED: u8 = 2;
 
 /// What the shim asks for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,9 +61,8 @@ pub struct Request {
     pub no_install_recommends: bool,
 }
 
-/// What the supervisor answers, after `apt-get` wrote its output to the shim's.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// How a request ended.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Reply {
     Exited(i32),
     Refused(String),
@@ -155,21 +179,48 @@ pub fn shim_main(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<E
     }
 }
 
-/// Sends `request` with this process's standard output and error, and waits for the reply.
+/// Sends `request`, prints the output, and returns how it ended.
 fn forward(socket: &Path, request: &Request) -> std::io::Result<Reply> {
-    use std::os::fd::AsFd as _;
-    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
-    let fds = [
-        std::io::stdout().as_fd().try_clone_to_owned()?,
-        std::io::stderr().as_fd().try_clone_to_owned()?,
-    ];
+    let mut stream = UnixStream::connect(socket)?;
     let body = serde_json::to_vec(request).expect("a request serializes");
-    crate::helper::send_fds(stream.as_fd(), &body, &fds)?;
-    drop(fds);
+    stream.write_all(&body)?;
     stream.shutdown(std::net::Shutdown::Write)?;
-    let mut reply = Vec::new();
-    stream.read_to_end(&mut reply)?;
-    serde_json::from_slice(&reply).map_err(std::io::Error::other)
+    let mut stdout = std::io::stdout().lock();
+    loop {
+        let mut head = [0u8; 5];
+        stream.read_exact(&mut head)?;
+        let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        if len > MAX_FRAME {
+            return Err(std::io::Error::other("a frame is too long"));
+        }
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload)?;
+        match head[0] {
+            OUTPUT => {
+                // Output that cannot be printed is lost; apt-get goes on.
+                let _ = stdout.write_all(&payload).and_then(|()| stdout.flush());
+            }
+            EXITED => {
+                let code = <[u8; 4]>::try_from(payload.as_slice())
+                    .map_err(|_| std::io::Error::other("a bad exit frame"))?;
+                return Ok(Reply::Exited(i32::from_be_bytes(code)));
+            }
+            REFUSED => {
+                return Ok(Reply::Refused(
+                    String::from_utf8_lossy(&payload).into_owned(),
+                ));
+            }
+            kind => return Err(std::io::Error::other(format!("a frame of kind {kind}"))),
+        }
+    }
+}
+
+fn frame(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(5 + payload.len());
+    bytes.push(kind);
+    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(payload);
+    stream.write_all(&bytes)
 }
 
 /// Where the shims are: a copy of this binary and the `apt` and `apt-get` links to it, all
@@ -184,7 +235,7 @@ const SHIM_BINARY: &str = "happy-supervisor";
 /// root.
 fn install_shims() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ONE: Mutex<()> = Mutex::new(());
     let _one = ONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     root_dir(Path::new(SHIM_DIR), 0o755)?;
     let exe = crate::helper::exe()?;
@@ -197,15 +248,24 @@ fn install_shims() -> Result<()> {
             && copy.modified().ok() == source.modified().ok()
     });
     if !fresh {
-        let partial = Path::new(SHIM_DIR).join(".happy-supervisor.partial");
+        // Unique to this process, in a directory only root writes.
+        let partial = Path::new(SHIM_DIR).join(format!(".partial-{}", std::process::id()));
         let _ = std::fs::remove_file(&partial);
-        std::fs::copy(&exe, &partial)?;
-        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::File::options()
-            .write(true)
-            .open(&partial)?
-            .set_modified(source.modified()?)?;
-        std::fs::rename(&partial, &copy)?;
+        let copied = std::fs::copy(&exe, &partial)
+            .and_then(|_| {
+                std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))
+            })
+            .and_then(|()| {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&partial)?
+                    .set_modified(source.modified()?)
+            })
+            .and_then(|()| std::fs::rename(&partial, &copy));
+        if let Err(err) = copied {
+            let _ = std::fs::remove_file(&partial);
+            return Err(err.into());
+        }
     }
     for name in SHIM_NAMES {
         let link = Path::new(SHIM_DIR).join(name);
@@ -218,59 +278,68 @@ fn install_shims() -> Result<()> {
     Ok(())
 }
 
-/// Creates `dir` or makes sure of it: a directory, root's, with `mode`.
-fn root_dir(dir: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    std::fs::create_dir_all(dir)?;
-    let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.is_dir() {
-        return Err(Error::new(
-            ErrorKind::Io,
-            format!("{} is not a directory", dir.display()),
-        ));
-    }
-    if meta.uid() != 0 {
-        std::os::unix::fs::chown(dir, Some(0), Some(0))?;
-    }
-    if meta.mode() & 0o7777 != mode {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
-}
-
-/// One system command's socket. Dropping it, which its exec does at the exit, closes it and
-/// removes it, so nothing the command left running can install.
+/// One system command's socket. It serves from [`AptGate::serve`] until it is dropped, which the
+/// command's exec does as soon as the command exits, before its output ends: from then on
+/// nothing the command left running can install, and a request not yet running is refused.
 pub struct AptGate {
     path: PathBuf,
     listener: Option<std::os::unix::net::UnixListener>,
     task: Option<tokio::task::AbortHandle>,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
     uid: u32,
+    /// `false` once the gate is dropped. Held from the last check until `apt-get` started.
+    open: Mutex<bool>,
+    /// Whether system access still runs as this account, read again just before `apt-get`
+    /// starts, so `system disable` stops what it has not started yet.
+    enabled: Box<dyn Fn() -> bool + Send + Sync>,
+    connections: AtomicUsize,
+}
+
+/// One of a socket's [`MAX_CONNECTIONS`], given back when dropped.
+struct Slot(Arc<Shared>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// One `apt-get` at a time: dpkg takes a lock anyway, and a second would fail on it.
-static APT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static APT: Mutex<()> = Mutex::new(());
 
 impl AptGate {
-    /// A socket that only `uid` (and root) may connect to, with the shims it needs. Blocking;
-    /// needs root.
-    pub fn open(uid: u32) -> Result<AptGate> {
+    /// A socket that only `uid` (and root) may connect to, with the shims it needs, for as long
+    /// as `enabled` says system access still runs as `uid`. Blocking; needs root.
+    pub fn open(uid: u32, enabled: impl Fn() -> bool + Send + Sync + 'static) -> Result<AptGate> {
         use std::os::unix::fs::PermissionsExt as _;
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         install_shims()?;
         root_dir(Path::new(SOCKET_DIR), 0o711)?;
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = Path::new(SOCKET_DIR).join(format!("{}-{n}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        std::os::unix::fs::chown(&path, Some(uid), None)?;
-        listener.set_nonblocking(true)?;
-        Ok(AptGate {
+        // From here on, dropping the gate removes the socket.
+        let gate = AptGate {
             path,
             listener: Some(listener),
             task: None,
-            uid,
-        })
+            shared: Arc::new(Shared {
+                uid,
+                open: Mutex::new(true),
+                enabled: Box::new(enabled),
+                connections: AtomicUsize::new(0),
+            }),
+        };
+        std::fs::set_permissions(&gate.path, std::fs::Permissions::from_mode(0o600))?;
+        std::os::unix::fs::chown(&gate.path, Some(uid), None)?;
+        if let Some(listener) = &gate.listener {
+            listener.set_nonblocking(true)?;
+        }
+        Ok(gate)
     }
 
     /// Points the command's shims at this socket, and puts them first in its `PATH`.
@@ -291,17 +360,22 @@ impl AptGate {
         let Some(listener) = self.listener.take() else {
             return;
         };
-        let uid = self.uid;
+        let shared = self.shared.clone();
         let task = runtime.spawn(async move {
             let Ok(listener) = tokio::net::UnixListener::from_std(listener) else {
                 return;
             };
             while let Ok((stream, _)) = listener.accept().await {
+                if shared.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    shared.connections.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
+                let slot = Slot(shared.clone());
                 let peer = stream.peer_cred().ok();
                 let Ok(stream) = stream.into_std() else {
                     continue;
                 };
-                tokio::task::spawn_blocking(move || answer(stream, peer, uid, session));
+                tokio::task::spawn_blocking(move || answer(stream, peer, &slot.0, session));
             }
         });
         self.task = Some(task.abort_handle());
@@ -310,6 +384,11 @@ impl AptGate {
 
 impl Drop for AptGate {
     fn drop(&mut self) {
+        *self
+            .shared
+            .open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -317,67 +396,154 @@ impl Drop for AptGate {
     }
 }
 
-/// Checks who asks, then runs the install and replies.
-fn answer(
-    mut stream: std::os::unix::net::UnixStream,
-    peer: Option<tokio::net::unix::UCred>,
-    uid: u32,
-    session: u32,
-) {
-    use std::os::fd::AsFd as _;
-    let _ = stream.set_nonblocking(false);
-    let in_session = peer.is_some_and(|peer| {
+/// Whether `peer` is a process of the command's session, as the account.
+fn in_session(peer: Option<tokio::net::unix::UCred>, uid: u32, session: u32) -> bool {
+    peer.is_some_and(|peer| {
         peer.uid() == uid
             && peer.pid().is_some_and(|pid| {
                 nix::unistd::getsid(Some(nix::unistd::Pid::from_raw(pid)))
                     .is_ok_and(|sid| sid.as_raw() as u32 == session)
             })
-    });
-    let reply = if !in_session {
-        Reply::Refused("only the system command's own processes may install".to_owned())
-    } else {
-        match crate::helper::recv_fds(stream.as_fd(), MAX_REQUEST, 2) {
-            Ok((body, fds)) => match serde_json::from_slice::<Request>(&body)
-                .map_err(|err| format!("bad request: {err}"))
-                .and_then(|request| Ok((request.packages()?, request.no_install_recommends)))
-            {
-                Ok((packages, no_recommends)) => install(&packages, no_recommends, fds),
-                Err(why) => Reply::Refused(why),
-            },
-            Err(err) => Reply::Refused(format!("bad request: {err}")),
-        }
-    };
-    let _ = stream.write_all(&serde_json::to_vec(&reply).expect("a reply serializes"));
+    })
 }
 
-/// `apt-get install -y --no-remove` with a fixed environment, its output on `fds` (standard
-/// output, then error).
-fn install(packages: &[PackageName], no_recommends: bool, fds: Vec<std::os::fd::OwnedFd>) -> Reply {
-    use std::process::{Command, Stdio};
-    let mut fds = fds.into_iter();
-    let (Some(stdout), Some(stderr)) = (fds.next(), fds.next()) else {
-        return Reply::Refused("bad request: send standard output and error".to_owned());
+/// Reads the request, checks who asks and what for, then installs, sending the output, and
+/// replies.
+fn answer(
+    mut stream: UnixStream,
+    peer: Option<tokio::net::unix::UCred>,
+    shared: &Shared,
+    session: u32,
+) {
+    let timeouts = stream
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(Some(READ_TIMEOUT)))
+        .and_then(|()| stream.set_write_timeout(Some(WRITE_TIMEOUT)));
+    let mut body = Vec::new();
+    // The whole request first, so a refusal is read rather than reset.
+    if timeouts.is_err()
+        || (&mut stream)
+            .take(MAX_REQUEST as u64 + 1)
+            .read_to_end(&mut body)
+            .is_err()
+    {
+        return;
+    }
+    let checked = if !in_session(peer, shared.uid, session) {
+        Err("only the system command's own processes may install".to_owned())
+    } else if body.len() > MAX_REQUEST {
+        Err("the request is too long".to_owned())
+    } else {
+        serde_json::from_slice::<Request>(&body)
+            .map_err(|err| format!("bad request: {err}"))
+            .and_then(|request| Ok((request.packages()?, request.no_install_recommends)))
+            .and_then(|(packages, no_recommends)| {
+                packages.iter().try_for_each(known)?;
+                Ok((packages, no_recommends))
+            })
     };
-    let names: Vec<&str> = packages.iter().map(PackageName::as_str).collect();
-    tracing::info!("system access: apt-get install {}", names.join(" "));
-    let _one = APT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let status = Command::new("/usr/bin/apt-get")
-        .args(["install", "-y", "-q", "--no-remove"])
-        .args(no_recommends.then_some("--no-install-recommends"))
-        .args(&names)
+    let reply = match checked {
+        Ok((packages, no_recommends)) => {
+            let still = || shared.enabled.as_ref()() && in_session(peer, shared.uid, session);
+            install(&packages, no_recommends, &mut stream, &shared.open, still)
+        }
+        Err(why) => Reply::Refused(why),
+    };
+    let _ = match reply {
+        Reply::Exited(code) => frame(&mut stream, EXITED, &code.to_be_bytes()),
+        Reply::Refused(why) => frame(&mut stream, REFUSED, why.as_bytes()),
+    };
+}
+
+/// Refuses a name that is not exactly a package in apt's lists, so `apt-get` never reads it as
+/// a pattern.
+fn known(name: &PackageName) -> std::result::Result<(), String> {
+    let output = std::process::Command::new("/usr/bin/apt-cache")
+        .args(["--all-names", "pkgnames", name.as_str()])
         .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("HOME", "/root")
+        .env("PATH", APT_PATH)
         .env("LANG", "C.UTF-8")
-        .env("DEBIAN_FRONTEND", "noninteractive")
         .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .status();
-    match status {
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|err| format!("cannot run /usr/bin/apt-cache: {err}"))?;
+    if output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == name.as_str().as_bytes())
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is not a package in this machine's apt lists",
+            name.as_str()
+        ))
+    }
+}
+
+/// `apt-get install -y --no-remove` with a fixed environment, its output sent on `stream` while
+/// the shim takes it. It starts only if the gate is still `open` and `still` holds.
+fn install(
+    packages: &[PackageName],
+    no_recommends: bool,
+    stream: &mut UnixStream,
+    open: &Mutex<bool>,
+    still: impl Fn() -> bool,
+) -> Reply {
+    use std::process::{Command, Stdio};
+    let names: Vec<&str> = packages.iter().map(PackageName::as_str).collect();
+    let _one = APT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut output, input) = match std::io::pipe() {
+        Ok(pipe) => pipe,
+        Err(err) => return Reply::Refused(format!("cannot run apt-get: {err}")),
+    };
+    let spawned = {
+        let open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*open || !still() {
+            return Reply::Refused("the system command exited, or system access ended".to_owned());
+        }
+        tracing::info!("system access: apt-get install {}", names.join(" "));
+        let mut command = Command::new("/usr/bin/apt-get");
+        command
+            .args(["install", "-y", "-q", "--no-remove"])
+            .args(no_recommends.then_some("--no-install-recommends"))
+            .args(&names)
+            .env_clear()
+            .env("PATH", APT_PATH)
+            .env("HOME", "/root")
+            .env("LANG", "C.UTF-8")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .current_dir("/")
+            .stdin(Stdio::null());
+        match input.try_clone() {
+            Ok(stderr) => command.stdout(input).stderr(stderr).spawn(),
+            Err(err) => Err(err),
+        }
+        // `command` drops here with its copies of the pipe's input.
+    };
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(err) => return Reply::Refused(format!("cannot run /usr/bin/apt-get: {err}")),
+    };
+    // Once the shim stops taking output, the rest is read and dropped, so apt-get never waits.
+    let mut sending = true;
+    let mut chunk = [0u8; 16 << 10];
+    loop {
+        match output.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if sending && frame(stream, OUTPUT, &chunk[..n]).is_err() {
+                    sending = false;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    match child.wait() {
         Ok(status) => Reply::Exited(status.code().unwrap_or(APT_FAILED as i32)),
-        Err(err) => Reply::Refused(format!("cannot run /usr/bin/apt-get: {err}")),
+        Err(err) => Reply::Refused(format!("waiting for apt-get failed: {err}")),
     }
 }
 
@@ -433,6 +599,37 @@ mod tests {
         };
         assert_eq!(none.packages(), Err("name 1 to 256 packages".to_owned()));
         assert!(serde_json::from_str::<Request>(r#"{"install": [], "options": ["-o"]}"#).is_err());
+    }
+
+    #[test]
+    fn nothing_installs_once_the_gate_closed_or_system_access_ended() {
+        let hello = [PackageName::parse("hello").unwrap()];
+        let ended = Reply::Refused("the system command exited, or system access ended".to_owned());
+        let (mut stream, _shim) = UnixStream::pair().unwrap();
+        let closed = Mutex::new(false);
+        let spawned = std::cell::Cell::new(false);
+        let still = || {
+            spawned.set(true);
+            true
+        };
+        assert_eq!(install(&hello, false, &mut stream, &closed, still), ended);
+        assert!(!spawned.get(), "a closed gate does not even check");
+        let open = Mutex::new(true);
+        assert_eq!(install(&hello, false, &mut stream, &open, || false), ended);
+    }
+
+    #[test]
+    fn frames_are_a_kind_a_length_and_the_payload() {
+        let (mut supervisor, mut shim) = UnixStream::pair().unwrap();
+        frame(&mut supervisor, REFUSED, b"no").unwrap();
+        frame(&mut supervisor, EXITED, &7i32.to_be_bytes()).unwrap();
+        drop(supervisor);
+        let mut bytes = Vec::new();
+        shim.read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            [2, 0, 0, 0, 2, b'n', b'o', 1, 0, 0, 0, 4, 0, 0, 0, 7]
+        );
     }
 
     #[test]

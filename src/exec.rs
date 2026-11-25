@@ -102,8 +102,6 @@ struct Running {
     _proxy: Option<CommandProxy>,
     /// The sandbox's placeholders, kept until the exit like the proxy.
     _placeholders: Option<Placeholders>,
-    /// A system command's apt socket, removed at the exit like the proxy.
-    _apt: Option<AptGate>,
     /// How `tcp.open` reaches the process's ports. `None`: its policy forbids binding them.
     tunnel: Option<TunnelRoute>,
 }
@@ -207,7 +205,8 @@ impl ExecManager {
     /// `user` is who the command runs as (identity.rs); `None` runs it as the supervisor.
     ///
     /// `apt` is a system command's socket for installing with apt (apt.rs). It serves the
-    /// command's session from the spawn, and closes at the exit like the proxy.
+    /// command's session from the spawn, and closes as soon as the process exits, before its
+    /// output ends.
     pub async fn start(
         &self,
         params: ExecStartParams,
@@ -652,6 +651,7 @@ impl Inner {
             done: done_rx,
             readers,
             cgroup,
+            apt,
         };
         if let Err(err) = std::thread::Builder::new()
             .name("exec-wait".to_string())
@@ -687,7 +687,6 @@ impl Inner {
             reaping: false,
             _proxy: proxy,
             _placeholders: placeholders,
-            _apt: apt,
             tunnel,
         });
         Ok(pid)
@@ -809,13 +808,18 @@ struct Waiter {
     readers: usize,
     /// The command's cgroup, for `memoryBytes` and `processes` on Linux. Removed after the exit.
     cgroup: Option<process::Cgroup>,
+    /// A system command's apt socket, closed at the exit, so what the command left running
+    /// cannot install while its output drains.
+    apt: Option<AptGate>,
 }
 
 impl Waiter {
-    fn run(self, mut child: Child) {
+    fn run(mut self, mut child: Child) {
         if let Err(err) = process::wait_exit(&child) {
             tracing::warn!("waiting for {} failed: {err}", self.exec_id);
         }
+        // Closes a system command's apt socket.
+        self.apt = None;
         if let Some(running) = lock(&self.inner.table).running(&self.exec_id, &self.output) {
             running.reaping = true;
         }

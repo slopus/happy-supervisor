@@ -44,7 +44,7 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | `connect::main` (`happy-supervisor __connect <host> <port>`, the SSH `ProxyCommand` of an isolated command: one connection through the SOCKS5 proxy in `ALL_PROXY`, over stdio) | `connect` | Linux track |
 | `Identity` (the supervisor's user, whether it is root, the `Workload` user every raw and sandboxed command and file operation runs as, and `System`, the account of system access read from `private/system`; `Workload::apply` makes a child that user), NodeInfo `identity` | `identity` | scaffold |
 | `system_account` (Linux: `provision` creates `happy-system`, the account system access runs as by default, with its npm prefix, profile script and `cron.deny` and `at.deny` lines; `kill_processes` for `system disable`) | `system_account` | scaffold |
-| `apt` (Linux: `AptGate`, one `happy-system` command's socket, which runs `apt-get install` as root with names checked by `PackageName`, for the command's session while it runs; `shim_main`, the binary run as `apt` or `apt-get`, which `main.rs` calls first) | `apt` | scaffold |
+| `apt` (Linux: `AptGate`, one `happy-system` command's socket, which runs `apt-get install` as root with names checked by `PackageName` and `apt-cache`, for the command's session until its process exits, when the exec's waiter drops it; `shim_main`, the binary run as `apt` or `apt-get`, which `main.rs` calls first) | `apt` | scaffold |
 | `node_info::collect(installation_id, name, &SandboxInfo, &Identity) -> NodeInfo` | `node_info/*` | node-info track |
 | `Node`, `dispatch(&Node, kind, body) -> Option<Result<Value>>`: a reply for every command kind, `None` for a `proxy.*` or `tcp.*` stream message | `dispatch` | scaffold wires kinds to the functions above |
 

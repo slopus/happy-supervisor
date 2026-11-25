@@ -731,7 +731,8 @@ async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
     let names: Vec<String> = NOT_PACKAGE_NAMES.iter().map(|n| format!("'{n}'")).collect();
     let refused = format!(
         "for name in {}; do apt-get install -y \"$name\"; echo \"exit $?\"; done; \
-         apt update; echo \"exit $?\"; apt-get remove -y hello; echo \"exit $?\"",
+         apt update; echo \"exit $?\"; apt-get remove -y hello; echo \"exit $?\"; \
+         apt-get install -y hell.o; echo \"exit $?\"",
         names.join(" ")
     );
     let (exit, output) = node
@@ -739,7 +740,7 @@ async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
         .await;
     eprintln!("system `{refused}`: {exit:?}\n{output}");
     assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert_eq!(output.matches("exit 100\n").count(), 15, "{output}");
+    assert_eq!(output.matches("exit 100\n").count(), 16, "{output}");
     for name in NOT_PACKAGE_NAMES {
         let why = if name.starts_with('-') {
             format!("apt-get: the option {name} is not allowed; ")
@@ -756,6 +757,11 @@ async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
         output.contains("apt-get: only install is allowed, not remove; "),
         "{output}"
     );
+    // A pattern apt-get would match against package names, which the supervisor refuses.
+    assert!(
+        output.contains("apt-get: hell.o is not a package in this machine's apt lists; "),
+        "{output}"
+    );
 
     // The supervisor checks the names itself, whatever reaches the socket.
     let direct = r#"python3 -c '
@@ -764,17 +770,17 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(os.environ["HAPPY_APT_SOCKET"])
 s.sendall(b"{\"install\": [\"coreutils-\"]}")
 s.shutdown(socket.SHUT_WR)
-print(s.recv(4096).decode())
+reply = b""
+while chunk := s.recv(4096):
+    reply += chunk
+print(reply[0], reply[5:].decode())
 '"#;
     let (exit, output) = node
         .sh_in("direct", direct, system(), false, env.clone())
         .await;
     eprintln!("system, straight to the socket: {exit:?}\n{output}");
     assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert_eq!(
-        output,
-        "{\"refused\":\"\\\"coreutils-\\\" is not a package name\"}\n"
-    );
+    assert_eq!(output, "2 \"coreutils-\" is not a package name\n");
 
     // Another session of the account, while the command runs, may not install.
     let other = "setsid -w sh -c 'apt-get install -y hello; echo \"exit $?\"'";
@@ -789,34 +795,24 @@ print(s.recv(4096).decode())
     );
     assert!(output.ends_with("exit 100\n"), "{output}");
 
-    // Nor may what the command leaves running after it exits.
-    let left = "/tmp/happy-system-left-behind";
-    let _ = std::fs::remove_file(left);
+    // Nor may what the command leaves running after it exits, even holding its output open.
+    let left = format!("/tmp/happy-system-left-behind-{}", std::process::id());
+    let _ = std::fs::remove_file(&left);
     let behind = format!(
-        "(sleep 3; apt-get install -y hello >{left} 2>&1; echo \"exit $?\" >>{left}) \
-         </dev/null >/dev/null 2>&1 &"
+        "echo \"$HAPPY_APT_SOCKET\"; (sleep 3; apt-get install -y hello >{left} 2>&1; \
+         echo \"exit $?\" >>{left}) </dev/null &"
     );
     let (exit, output) = node
         .sh_in("behind", &behind, system(), false, env.clone())
         .await;
-    assert_eq!(
-        (exit, output.as_str()),
-        (ExitStatus::Exited { code: 0 }, "")
-    );
-    // The exit is sent just before the command's socket closes.
-    let mut sockets = usize::MAX;
-    for _ in 0..50 {
-        sockets = std::fs::read_dir("/opt/happy-system/apt").unwrap().count();
-        if sockets == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(sockets, 0, "every command's socket is gone");
+    assert_eq!(exit, ExitStatus::Exited { code: 0 });
+    let socket = output.trim_end();
+    assert!(socket.starts_with("/opt/happy-system/apt/"), "{output}");
+    assert!(!Path::new(socket).exists(), "{socket} is gone at the exit");
     let mut output = String::new();
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        output = std::fs::read_to_string(left).unwrap_or_default();
+        output = std::fs::read_to_string(&left).unwrap_or_default();
         if output.contains("exit ") {
             break;
         }
@@ -827,7 +823,7 @@ print(s.recv(4096).decode())
         "{output}"
     );
     assert!(output.ends_with("exit 100\n"), "{output}");
-    std::fs::remove_file(left).unwrap();
+    std::fs::remove_file(&left).unwrap();
 }
 
 /// The rest of [`system_access_installs_packages`] on Linux, where system access runs as

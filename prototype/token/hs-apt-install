@@ -1,0 +1,19 @@
+#!/bin/bash
+# Option D (iii): the one root operation a happy-system account would get. It installs packages,
+# by name only, from the repositories the administrator configured: no apt options, no files,
+# no versions or releases, no removals, and none of the caller's environment.
+#
+#   hs-apt-install <package>...
+set -eu
+[ "$#" -ge 1 ] || { echo "usage: hs-apt-install <package>..." >&2; exit 2; }
+for name in "$@"; do
+  # A Debian package name. apt reads a trailing - or + as remove or install, and a name ending
+  # in .deb as a file, so neither is one here.
+  if ! [[ $name =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || [[ $name =~ [-+]$ ]] || [[ $name == *.deb ]]; then
+    echo "hs-apt-install: refused $name: not a package name" >&2
+    exit 2
+  fi
+done
+exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 \
+  DEBIAN_FRONTEND=noninteractive \
+  apt-get install -y -q --no-remove "$@"

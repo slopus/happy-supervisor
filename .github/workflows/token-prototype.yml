@@ -1,0 +1,24 @@
+# Throwaway evidence for protecting the node token from system access (prototype/token). Runs
+# only on the prototype branch.
+name: token-prototype
+
+on:
+  push:
+    branches: [system-token-prototype]
+  workflow_dispatch:
+
+jobs:
+  option-a:
+    name: option A, hide and harden
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q
+      - run: sudo NPM_DIR="$(dirname "$(command -v npm)")" bash prototype/token/option-a.sh
+  option-d:
+    name: option D, a dedicated account
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q
+      - run: sudo NPM_DIR="$(dirname "$(command -v npm)")" bash prototype/token/option-d.sh

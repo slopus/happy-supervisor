@@ -45,7 +45,7 @@ WORKLOAD_USER=happy-workload
 SYSTEM_USER=happy-system
 SYSTEM_DIR=/opt/happy-system
 SYSTEM_PROFILE=/etc/profile.d/happy-system.sh
-CRON_DENY=/etc/cron.deny
+DENY_FILES="/etc/cron.deny /etc/at.deny"
 LABEL=engineering.happy.supervisor
 
 fail() {
@@ -147,7 +147,9 @@ if [ "${1:-}" = "--uninstall" ]; then
           deluser --remove-home "$SYSTEM_USER" 2>/dev/null || deluser "$SYSTEM_USER"
       fi
       rm -rf "$SYSTEM_DIR" "$SYSTEM_PROFILE"
-      [ ! -f "$CRON_DENY" ] || sed -i "/^$SYSTEM_USER\$/d" "$CRON_DENY"
+      for deny in $DENY_FILES; do
+        [ ! -f "$deny" ] || sed -i "/^$SYSTEM_USER\$/d" "$deny"
+      done
     fi
   fi
   echo "happy-supervisor uninstalled"

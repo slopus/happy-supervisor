@@ -144,6 +144,6 @@ triggers and `release.yml` do.
   (a control plane that does not know it replies `unknown_kind`, which the node ignores). As
   PID 1 (in a container), `run` and `serve` keep an init in front of them that reaps orphans. The
   proxy's 403 says the sandbox blocked the host and that the command needs more access.
-* **0.2.5.** A policy may set `filesystem.writeTemp` to let a command write the work user's own
+* **0.2.6.** A policy may set `filesystem.writeTemp` to let a command write the work user's own
   temp directory, which NodeInfo reports as `identity.tempDir` (macOS: `DARWIN_USER_TEMP_DIR`).
   On macOS, file operations run under isolated policies.

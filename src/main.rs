@@ -236,6 +236,7 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
                     println!("system access enabled: it runs as {}", access.user);
                 }
                 SystemAction::Disable(_) => {
+                    state.check_protected()?;
                     state.store_system(None)?;
                     println!("system access disabled");
                 }

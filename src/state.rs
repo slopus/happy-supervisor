@@ -214,60 +214,66 @@ impl StateDir {
             .map_err(|err| io_error(&path, err))
     }
 
-    /// Refuses unless no other user can replace what [`StateDir::system`] reads: the state
-    /// directory, `private/` and `private/system` (when it exists) must be the supervisor's
-    /// user's own, no symlink, and writable by no one else. Every entry above them, on the path
-    /// as given and as resolved, must be root's or the supervisor's user's, and a directory
-    /// writable by no one else unless it is sticky (`/tmp`). `system enable` checks this before
-    /// it writes.
+    /// Refuses unless no other user can replace what [`StateDir::system`] reads or `system
+    /// enable` and `disable` write. The state directory's path must be absolute and go through
+    /// no symlink. The state directory, `private/` and `private/system` (when it exists) must be
+    /// the supervisor's user's own and writable by no one else, and every directory above them
+    /// root's or the supervisor's user's and writable by no one else unless it is sticky (`/tmp`).
     pub fn check_protected(&self) -> Result<()> {
         #[cfg(unix)]
-        if let Some(path) = self.unprotected() {
+        if let Some(problem) = self.unprotected() {
             return Err(Error::new(
                 ErrorKind::PermissionDenied,
-                format!(
-                    "system access stays refused: {} is a symlink or another user's, or others \
-                     may write it",
-                    path.display()
-                ),
+                format!("system access stays refused: {problem}"),
             ));
         }
         Ok(())
     }
 
     #[cfg(unix)]
-    fn unprotected(&self) -> Option<PathBuf> {
+    fn unprotected(&self) -> Option<String> {
         use std::os::unix::fs::MetadataExt as _;
+        let resolved = std::fs::canonicalize(&self.root).ok();
+        if resolved.as_ref() != Some(&self.root) {
+            return Some(format!(
+                "{} is not an absolute path without symlinks; pass {}",
+                self.root.display(),
+                resolved.map_or_else(
+                    || "the resolved path".to_owned(),
+                    |r| r.display().to_string()
+                )
+            ));
+        }
         let me = nix::unistd::geteuid().as_raw();
-        let mut own = vec![self.root.clone(), self.private_dir()];
         let marker = self.private_dir().join(SYSTEM);
+        let mut own = vec![self.root.clone(), self.private_dir()];
         if std::fs::symlink_metadata(&marker).is_ok() {
             own.push(marker);
         }
-        let mine = |path: &Path| {
+        let mine = |path: &PathBuf| {
             std::fs::symlink_metadata(path).is_ok_and(|meta| {
                 !meta.file_type().is_symlink() && meta.uid() == me && meta.mode() & 0o022 == 0
             })
         };
-        if let Some(path) = own.into_iter().find(|path| !mine(path)) {
-            return Some(path);
-        }
-        let held = |path: &Path| {
+        let held = |path: &&Path| {
             std::fs::symlink_metadata(path).is_ok_and(|meta| {
                 (meta.uid() == 0 || meta.uid() == me)
-                    && (meta.file_type().is_symlink()
-                        || meta.mode() & 0o022 == 0
-                        || meta.mode() & 0o1000 != 0)
+                    && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0)
             })
         };
-        let Ok(resolved) = std::fs::canonicalize(&self.root) else {
-            return Some(self.root.clone());
+        let unsafe_path = match own.into_iter().find(|path| !mine(path)) {
+            Some(path) => path,
+            None => self
+                .root
+                .ancestors()
+                .skip(1)
+                .find(|dir| !held(dir))?
+                .to_path_buf(),
         };
-        [&self.root, &resolved]
-            .into_iter()
-            .flat_map(|root| root.ancestors().skip(1))
-            .find(|path| !held(path))
-            .map(Path::to_path_buf)
+        Some(format!(
+            "{} is a symlink or another user's, or others may write it",
+            unsafe_path.display()
+        ))
     }
 
     /// Enables system access with `access`, atomically and owner-only, or disables it.
@@ -468,7 +474,7 @@ mod tests {
     #[test]
     fn system_access_is_stored_and_removed() {
         let tmp = tempfile::tempdir().unwrap();
-        let state = StateDir::open(Some(tmp.path().to_path_buf())).unwrap();
+        let state = StateDir::open(Some(tmp.path().canonicalize().unwrap())).unwrap();
         assert_eq!(state.system().unwrap(), None);
         let access = SystemAccess {
             user: "admin".to_string(),
@@ -489,14 +495,15 @@ mod tests {
     #[test]
     fn system_access_others_can_write_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
-        let tmp = tempfile::tempdir().unwrap();
-        let state = StateDir::open(Some(tmp.path().to_path_buf())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().canonicalize().unwrap();
+        let state = StateDir::open(Some(tmp.clone())).unwrap();
         let access = SystemAccess {
             user: "root".to_string(),
             path: vec![],
         };
         state.store_system(Some(&access)).unwrap();
-        let marker = tmp.path().join("private/system");
+        let marker = tmp.join("private/system");
         let refused = |path: &Path| {
             Error::new(
                 ErrorKind::PermissionDenied,
@@ -516,13 +523,13 @@ mod tests {
         mode(&state.private_dir(), 0o770);
         assert_eq!(state.system().unwrap_err(), refused(&state.private_dir()));
         mode(&state.private_dir(), 0o700);
-        std::fs::rename(&marker, tmp.path().join("real")).unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("real"), &marker).unwrap();
+        std::fs::rename(&marker, tmp.join("real")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real"), &marker).unwrap();
         assert_eq!(state.system().unwrap_err(), refused(&marker));
         std::fs::remove_file(&marker).unwrap();
         assert_eq!(state.system().unwrap(), None);
 
-        let shared = tmp.path().join("shared");
+        let shared = tmp.join("shared");
         std::fs::create_dir(&shared).unwrap();
         let below = StateDir::open(Some(shared.join("state"))).unwrap();
         below.store_system(Some(&access)).unwrap();
@@ -530,6 +537,22 @@ mod tests {
         assert_eq!(below.system().unwrap_err(), refused(&shared));
         mode(&shared, 0o1777);
         assert_eq!(below.system().unwrap(), Some(access));
+
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        let through = StateDir::open(Some(link.join("state"))).unwrap();
+        assert_eq!(
+            through.system().unwrap_err(),
+            Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "system access stays refused: {} is not an absolute path without symlinks; \
+                     pass {}",
+                    link.join("state").display(),
+                    shared.join("state").display()
+                )
+            )
+        );
     }
 
     #[cfg(unix)]

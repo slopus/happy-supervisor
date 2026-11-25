@@ -598,9 +598,10 @@ async fn system_access_runs_as_the_enabled_account_only_while_enabled() {
     assert_eq!(
         String::from_utf8(output.stderr).unwrap().trim(),
         format!(
-            "happy-supervisor: system access stays refused: {} is a symlink or another user's, \
-             or others may write it",
-            alias.display()
+            "happy-supervisor: system access stays refused: {} is not an absolute path without \
+             symlinks; pass {}",
+            alias.join("state").display(),
+            node.install.path("state").display()
         )
     );
 

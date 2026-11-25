@@ -371,8 +371,8 @@ command, file operation or watch.
 `apt-get` needs root, and an `apt-get` that runs as root with options the caller picks can run
 anything as root (`-o APT::Update::Pre-Invoke::=…`, a local `.deb`, a `Dpkg::Pre-Invoke` in an
 `APT_CONFIG`). So a Linux system command that runs as `happy-system` asks the supervisor instead,
-which takes package names and nothing else. An account named with `--user` other than
-`happy-system` gets none of this.
+which takes package names to install, or a bare `update`, and nothing else. An account named
+with `--user` other than `happy-system` gets none of this.
 
 * Each such command gets a socket, `/opt/happy-system/apt/<pid>-<n>.sock`, owned by
   `happy-system`, mode `0600`, in a directory only root may change. It serves from the spawn
@@ -380,25 +380,27 @@ which takes package names and nothing else. An account named with `--user` other
   command's output ends. The command's environment names it in `HAPPY_APT_SOCKET`.
 * `/opt/happy-system/bin`, root's, holds a copy of the supervisor binary and the links `apt` and
   `apt-get` to it, and comes first in the command's `PATH`. Run under those names, the binary
-  forwards `install` and the package names, prints what `apt-get` prints (its output and errors
-  together, on standard output), and exits as `apt-get` did. It takes `apt-get install` or `apt
-  install`, `-y`, `-q`, `--yes`, `--assume-yes`, `--quiet` and `--no-install-recommends`, and
-  refuses anything else (`update`, `remove`, other options) with exit code 100 and a message
-  saying what is allowed.
+  forwards `install` and the package names, or `update`, prints what `apt-get` prints (its
+  output and errors together, on standard output), and exits as `apt-get` did. It takes
+  `apt-get install` or `apt install` with `-y`, `-q`, `--yes`, `--assume-yes`, `--quiet` and
+  `--no-install-recommends`, and `apt-get update` or `apt update` with no options or arguments,
+  and refuses anything else (`update foo`, `update -o …`, `remove`, other options) with exit
+  code 100 and a message saying what is allowed.
 * The supervisor answers only a process of the command's own session (the command leads it)
   whose user is `happy-system`, by the socket's peer credentials, so a process that called
   `setsid`, or that the command left running after its exit, cannot install. It answers four
   requests per socket and sixteen in all at a time, and waits 10 seconds at most for a whole
   request.
-* It checks each name itself, whatever reaches the socket: lowercase letters, digits, `+`, `.`
+* It checks each name to install itself, whatever reaches the socket: lowercase letters, digits, `+`, `.`
   and `-`; 2 to 128 characters; starting with a letter or digit; not ending in `-` or `.deb`; and
   exactly the name of a real package in apt's lists (`apt-cache pkgnames`, so not a virtual
   one), so `apt-get`, which takes a package's own name first, does not read it as a pattern of
   the packages in those lists, a version, a release, an architecture, a file or a removal.
-* Then it runs `/usr/bin/apt-get install -y -q --no-remove [--no-install-recommends] <names>`
+* Then it runs `/usr/bin/apt-get install -y -q --no-remove [--no-install-recommends] <names>`,
+  or `/usr/bin/apt-get update -q`, which reads only the sources the administrator configured,
   with a fixed environment (`PATH`, `HOME=/root`, `LANG`, `DEBIAN_FRONTEND=noninteractive`),
   standard input closed, `/` as working directory and its output in a pipe of the supervisor's,
-  one at a time, and logs the names. Just before it starts, under the same lock that closing
+  one at a time, and logs what it runs. Just before it starts, under the same lock that closing
   the socket takes, it checks again that the command is still running, that the asking process
   is still in its session, and that `private/system` still names `happy-system`, so a request
   waiting when the command exits or `system disable` runs does not start. `system disable` runs
@@ -409,8 +411,9 @@ which takes package names and nothing else. An account named with `--user` other
   seconds after it exits is dropped too.
 * So a system command can install, as root, any package of the repositories the administrator
   configured, whose maintainer scripts then run as root and may change the machine's
-  configuration. Enabling system access trusts those repositories with that. A command cannot add
-  a repository, pick a version or remove a package, and `apt-get update` is the administrator's.
+  configuration. Enabling system access trusts those repositories with that. A command can
+  refresh the lists from them, so that a fresh machine's empty lists do not stop it, but cannot
+  add a repository, pick a version or remove a package.
 * Processes of one user can trace each other where `kernel.yama.ptrace_scope` is 0, so on such a
   machine something `happy-system` left running from an earlier command could make the current
   one install a package by name, as that command could itself.

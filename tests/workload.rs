@@ -716,10 +716,30 @@ const NOT_PACKAGE_NAMES: [&str; 13] = [
     "h*",
 ];
 
-/// `apt-get install` as `happy-system`, which the supervisor runs for the command's own
-/// processes, with package names only.
+/// `apt-get install` and `apt-get update` as `happy-system`, which the supervisor runs for the
+/// command's own processes, with package names only.
 async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
-    let apt = format!("id -un; apt-get install -y hello && hello; {read}");
+    // A fresh machine's: no lists, so nothing is a package until `apt-get update`.
+    for entry in std::fs::read_dir("/var/lib/apt/lists").unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    let install = "apt-get install -y hello";
+    let (exit, output) = node
+        .sh_in("no-lists", install, system(), false, env.clone())
+        .await;
+    eprintln!("system `{install}` without lists: {exit:?}\n{output}");
+    assert_eq!(exit, ExitStatus::Exited { code: 100 });
+    assert!(
+        output.starts_with("apt-get: hello is not a package in this machine's apt lists; "),
+        "{output}"
+    );
+
+    let apt = format!("id -un; apt-get update && apt-get install -y hello && hello; {read}");
     let (exit, output) = node.sh_in("apt", &apt, system(), false, env.clone()).await;
     eprintln!("system `{apt}`: {exit:?}\n{output}");
     assert_eq!(exit, ExitStatus::Exited { code: 1 }, "the last is the read");
@@ -731,7 +751,9 @@ async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
     let names: Vec<String> = NOT_PACKAGE_NAMES.iter().map(|n| format!("'{n}'")).collect();
     let refused = format!(
         "for name in {}; do apt-get install -y \"$name\"; echo \"exit $?\"; done; \
-         apt update; echo \"exit $?\"; apt-get remove -y hello; echo \"exit $?\"; \
+         apt update foo; echo \"exit $?\"; \
+         apt-get update -o APT::Update::Pre-Invoke::=id; echo \"exit $?\"; \
+         apt-get remove -y hello; echo \"exit $?\"; \
          apt-get install -y hell.o; echo \"exit $?\"",
         names.join(" ")
     );
@@ -740,7 +762,7 @@ async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
         .await;
     eprintln!("system `{refused}`: {exit:?}\n{output}");
     assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert_eq!(output.matches("exit 100\n").count(), 16, "{output}");
+    assert_eq!(output.matches("exit 100\n").count(), 17, "{output}");
     for name in NOT_PACKAGE_NAMES {
         let why = if name.starts_with('-') {
             format!("apt-get: the option {name} is not allowed; ")
@@ -749,14 +771,13 @@ async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
         };
         assert!(output.contains(&why), "{why}\n{output}");
     }
-    assert!(
-        output.contains("apt: only install is allowed, not update; "),
-        "{output}"
-    );
-    assert!(
-        output.contains("apt-get: only install is allowed, not remove; "),
-        "{output}"
-    );
+    for why in [
+        "apt: update takes no options or arguments: update foo; ",
+        "apt-get: update takes no options or arguments: update -o APT::Update::Pre-Invoke::=id; ",
+        "apt-get: only install and update are allowed, not remove; ",
+    ] {
+        assert!(output.contains(why), "{why}\n{output}");
+    }
     // A pattern apt-get would match against package names, which the supervisor refuses.
     assert!(
         output.contains("apt-get: hell.o is not a package in this machine's apt lists; "),
@@ -768,7 +789,7 @@ async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
 import os, socket
 s = socket.socket(socket.AF_UNIX)
 s.connect(os.environ["HAPPY_APT_SOCKET"])
-s.sendall(b"{\"install\": [\"coreutils-\"]}")
+s.sendall(b"{\"do\": \"install\", \"packages\": [\"coreutils-\"]}")
 s.shutdown(socket.SHUT_WR)
 reply = b""
 while chunk := s.recv(4096):

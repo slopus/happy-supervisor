@@ -57,13 +57,49 @@ pub const OUTPUT: u8 = 0;
 pub const EXITED: u8 = 1;
 pub const REFUSED: u8 = 2;
 
-/// What the shim asks for.
+/// What the shim asks for: `{"do": "install", "packages": [...]}` or `{"do": "update"}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Request {
-    pub install: Vec<String>,
-    #[serde(default)]
-    pub no_install_recommends: bool,
+#[serde(
+    tag = "do",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum Request {
+    Install {
+        packages: Vec<String>,
+        #[serde(default)]
+        no_install_recommends: bool,
+    },
+    /// `apt-get update` from the sources the administrator configured, with nothing else.
+    Update {},
+}
+
+/// A request the supervisor checked, which it runs as root.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Apt {
+    Install {
+        packages: Vec<PackageName>,
+        no_install_recommends: bool,
+    },
+    Update,
+}
+
+impl Apt {
+    /// `apt-get`'s arguments.
+    fn args(&self) -> Vec<&str> {
+        match self {
+            Apt::Install {
+                packages,
+                no_install_recommends,
+            } => ["install", "-y", "-q", "--no-remove"]
+                .into_iter()
+                .chain(no_install_recommends.then_some("--no-install-recommends"))
+                .chain(packages.iter().map(PackageName::as_str))
+                .collect(),
+            Apt::Update => vec!["update", "-q"],
+        }
+    }
 }
 
 /// How a request ended.
@@ -103,21 +139,42 @@ impl PackageName {
 }
 
 impl Request {
-    /// The packages, each a [`PackageName`]: the supervisor's own check, whatever the shim did.
-    pub fn packages(&self) -> Result<Vec<PackageName>, String> {
-        if self.install.is_empty() || self.install.len() > MAX_PACKAGES {
-            return Err(format!("name 1 to {MAX_PACKAGES} packages"));
+    /// The supervisor's own check, whatever the shim did: each package a [`PackageName`].
+    pub fn check(&self) -> Result<Apt, String> {
+        match self {
+            Request::Install {
+                packages,
+                no_install_recommends,
+            } => {
+                if packages.is_empty() || packages.len() > MAX_PACKAGES {
+                    return Err(format!("name 1 to {MAX_PACKAGES} packages"));
+                }
+                Ok(Apt::Install {
+                    packages: packages
+                        .iter()
+                        .map(|name| PackageName::parse(name))
+                        .collect::<Result<_, _>>()?,
+                    no_install_recommends: *no_install_recommends,
+                })
+            }
+            Request::Update {} => Ok(Apt::Update),
         }
-        self.install
-            .iter()
-            .map(|name| PackageName::parse(name))
-            .collect()
     }
 }
 
 /// The shim's command line, `apt-get [-y] [-q] install [--no-install-recommends] <package>...`
-/// or the same with `apt`, as a request. Anything else is refused, with what is allowed.
+/// or a bare `apt-get update`, or the same with `apt`, as a request. Anything else is refused,
+/// with what is allowed.
 pub fn parse_command_line(args: &[String]) -> Result<Request, String> {
+    if args.iter().find(|arg| !arg.starts_with('-')) == Some(&"update".to_owned()) {
+        return match args {
+            [_] => Ok(Request::Update {}),
+            _ => Err(format!(
+                "update takes no options or arguments: {}",
+                args.join(" ")
+            )),
+        };
+    }
     let mut install = None;
     let mut no_install_recommends = false;
     for arg in args {
@@ -138,13 +195,13 @@ pub fn parse_command_line(args: &[String]) -> Result<Request, String> {
         }
         match &mut install {
             None if arg == "install" => install = Some(Vec::new()),
-            None => return Err(format!("only install is allowed, not {arg}")),
+            None => return Err(format!("only install and update are allowed, not {arg}")),
             Some(names) => names.push(PackageName::parse(arg)?.0),
         }
     }
     match install {
-        Some(names) if !names.is_empty() => Ok(Request {
-            install: names,
+        Some(packages) if !packages.is_empty() => Ok(Request::Install {
+            packages,
             no_install_recommends,
         }),
         _ => Err("name the packages to install".to_owned()),
@@ -153,7 +210,7 @@ pub fn parse_command_line(args: &[String]) -> Result<Request, String> {
 
 const USAGE: &str = "system commands run as happy-system, not root, and may only install \
                      packages by name from this machine's repositories: apt-get install [-y] \
-                     [-q] [--no-install-recommends] <package>...";
+                     [-q] [--no-install-recommends] <package>..., or apt-get update";
 
 /// `apt` or `apt-get` in a system command: when the program name in `args` is one, forwards the
 /// command line to the supervisor and returns `apt-get`'s exit code. `None` otherwise.
@@ -326,7 +383,7 @@ impl Drop for Slot {
     }
 }
 
-/// One `apt-get` at a time: dpkg takes a lock anyway, and a second would fail on it.
+/// One `apt-get` at a time: apt and dpkg take locks anyway, and a second would fail on them.
 static APT: Mutex<()> = Mutex::new(());
 
 impl AptGate {
@@ -424,8 +481,8 @@ fn in_session(peer: Option<tokio::net::unix::UCred>, uid: u32, session: u32) -> 
     })
 }
 
-/// Reads the request, checks who asks and what for, then installs, sending the output, and
-/// replies.
+/// Reads the request, checks who asks and what for, then runs `apt-get`, sending the output,
+/// and replies.
 fn answer(
     mut stream: UnixStream,
     peer: Option<tokio::net::unix::UCred>,
@@ -443,20 +500,22 @@ fn answer(
     } else {
         serde_json::from_slice::<Request>(&body)
             .map_err(|err| format!("bad request: {err}"))
-            .and_then(|request| Ok((request.packages()?, request.no_install_recommends)))
-            .and_then(|(packages, no_recommends)| {
-                packages.iter().try_for_each(known)?;
-                Ok((packages, no_recommends))
+            .and_then(|request| request.check())
+            .and_then(|apt| {
+                if let Apt::Install { packages, .. } = &apt {
+                    packages.iter().try_for_each(known)?;
+                }
+                Ok(apt)
             })
     };
     let reply = match checked {
-        Ok((packages, no_recommends)) => {
+        Ok(apt) => {
             let still = || {
                 leader_runs(session)
                     && in_session(peer, shared.uid, session)
                     && shared.enabled.as_ref()()
             };
-            install(&packages, no_recommends, &mut stream, &shared.open, still)
+            run(&apt, &mut stream, &shared.open, still)
         }
         Err(why) => Reply::Refused(why),
     };
@@ -527,17 +586,12 @@ fn known(name: &PackageName) -> std::result::Result<(), String> {
     }
 }
 
-/// `apt-get install -y --no-remove` with a fixed environment, its output sent on `stream` while
-/// the shim takes it. It starts only if the gate is still `open` and `still` holds.
-fn install(
-    packages: &[PackageName],
-    no_recommends: bool,
-    stream: &mut UnixStream,
-    open: &Mutex<bool>,
-    still: impl Fn() -> bool,
-) -> Reply {
+/// `apt-get` with `apt`'s arguments (`install -y --no-remove`, or `update`) and a fixed
+/// environment, its output sent on `stream` while the shim takes it. It starts only if the gate
+/// is still `open` and `still` holds.
+fn run(apt: &Apt, stream: &mut UnixStream, open: &Mutex<bool>, still: impl Fn() -> bool) -> Reply {
     use std::process::{Command, Stdio};
-    let names: Vec<&str> = packages.iter().map(PackageName::as_str).collect();
+    let args = apt.args();
     let _one = APT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (output, input) = match std::io::pipe() {
         Ok(pipe) => pipe,
@@ -548,12 +602,10 @@ fn install(
         if !*open || !still() {
             return Reply::Refused("the system command exited, or system access ended".to_owned());
         }
-        tracing::info!("system access: apt-get install {}", names.join(" "));
+        tracing::info!("system access: apt-get {}", args.join(" "));
         let mut command = Command::new("/usr/bin/apt-get");
         command
-            .args(["install", "-y", "-q", "--no-remove"])
-            .args(no_recommends.then_some("--no-install-recommends"))
-            .args(&names)
+            .args(&args)
             .env_clear()
             .env("PATH", APT_PATH)
             .env("HOME", "/root")
@@ -660,24 +712,53 @@ mod tests {
     }
 
     #[test]
-    fn the_supervisor_checks_the_names_whatever_the_shim_sent() {
+    fn the_supervisor_checks_the_request_whatever_the_shim_sent() {
         let request: Request =
-            serde_json::from_str(r#"{"install": ["hello", "coreutils-"]}"#).unwrap();
+            serde_json::from_str(r#"{"do": "install", "packages": ["hello", "coreutils-"]}"#)
+                .unwrap();
         assert_eq!(
-            request.packages(),
+            request.check(),
             Err("\"coreutils-\" is not a package name".to_owned())
         );
-        let none = Request {
-            install: vec![],
+        let none = Request::Install {
+            packages: vec![],
             no_install_recommends: false,
         };
-        assert_eq!(none.packages(), Err("name 1 to 256 packages".to_owned()));
-        assert!(serde_json::from_str::<Request>(r#"{"install": [], "options": ["-o"]}"#).is_err());
+        assert_eq!(none.check(), Err("name 1 to 256 packages".to_owned()));
+        let hello: Request = serde_json::from_str(
+            r#"{"do": "install", "packages": ["hello"], "noInstallRecommends": true}"#,
+        )
+        .unwrap();
+        let checked = hello.check().unwrap();
+        assert_eq!(
+            checked.args(),
+            [
+                "install",
+                "-y",
+                "-q",
+                "--no-remove",
+                "--no-install-recommends",
+                "hello"
+            ]
+        );
+        let update: Request = serde_json::from_str(r#"{"do": "update"}"#).unwrap();
+        assert_eq!(update.check().unwrap().args(), ["update", "-q"]);
+        for bad in [
+            r#"{"do": "install", "packages": [], "options": ["-o"]}"#,
+            r#"{"do": "update", "options": ["-o", "APT::Update::Pre-Invoke::=id"]}"#,
+            r#"{"do": "update", "packages": ["foo"]}"#,
+            r#"{"do": "upgrade"}"#,
+        ] {
+            assert!(serde_json::from_str::<Request>(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
     fn nothing_installs_once_the_gate_closed_or_system_access_ended() {
-        let hello = [PackageName::parse("hello").unwrap()];
+        let hello = Apt::Install {
+            packages: vec![PackageName::parse("hello").unwrap()],
+            no_install_recommends: false,
+        };
         let ended = Reply::Refused("the system command exited, or system access ended".to_owned());
         let (mut stream, _shim) = UnixStream::pair().unwrap();
         let closed = Mutex::new(false);
@@ -686,10 +767,10 @@ mod tests {
             spawned.set(true);
             true
         };
-        assert_eq!(install(&hello, false, &mut stream, &closed, still), ended);
+        assert_eq!(run(&hello, &mut stream, &closed, still), ended);
         assert!(!spawned.get(), "a closed gate does not even check");
         let open = Mutex::new(true);
-        assert_eq!(install(&hello, false, &mut stream, &open, || false), ended);
+        assert_eq!(run(&Apt::Update, &mut stream, &open, || false), ended);
     }
 
     #[test]
@@ -726,9 +807,9 @@ mod tests {
     }
 
     #[test]
-    fn the_shim_takes_install_and_its_harmless_options_only() {
-        let hello = Request {
-            install: vec!["hello".to_owned(), "figlet".to_owned()],
+    fn the_shim_takes_install_with_its_harmless_options_and_a_bare_update_only() {
+        let hello = Request::Install {
+            packages: vec!["hello".to_owned(), "figlet".to_owned()],
             no_install_recommends: false,
         };
         for line in [
@@ -741,14 +822,33 @@ mod tests {
         }
         assert_eq!(
             parse_command_line(&args("install -y --no-install-recommends hello figlet")),
-            Ok(Request {
+            Ok(Request::Install {
+                packages: vec!["hello".to_owned(), "figlet".to_owned()],
                 no_install_recommends: true,
-                ..hello
             })
         );
+        assert_eq!(parse_command_line(&args("update")), Ok(Request::Update {}));
         for (line, why) in [
-            ("update", "only install is allowed, not update"),
-            ("remove hello", "only install is allowed, not remove"),
+            (
+                "update foo",
+                "update takes no options or arguments: update foo",
+            ),
+            (
+                "update -o APT::Update::Pre-Invoke::=id",
+                "update takes no options or arguments: update -o APT::Update::Pre-Invoke::=id",
+            ),
+            (
+                "-q update",
+                "update takes no options or arguments: -q update",
+            ),
+            (
+                "upgrade",
+                "only install and update are allowed, not upgrade",
+            ),
+            (
+                "remove hello",
+                "only install and update are allowed, not remove",
+            ),
             ("install", "name the packages to install"),
             (
                 "-o APT::Update::Pre-Invoke::=id install hello",

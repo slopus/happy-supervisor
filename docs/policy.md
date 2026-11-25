@@ -324,7 +324,9 @@ command, file operation or watch.
   no symlink, and every directory above it is root's or the supervisor's user's and writable by
   no one else unless it is sticky (`/tmp`), so no other user can replace any of it. `system
   enable` and `disable` check the same before they write. Otherwise it refuses, and `system enable`
-  does not enable it.
+  does not enable it. The check reads mode bits, which on Linux include a POSIX ACL's mask; a
+  macOS ACL on a directory of a custom state path that lets another user write is not seen, so
+  keep a custom state path out of such directories.
 * The supervisor logs each system operation (its command and program, or its path) with the
   account it ran as.
 * Enabling it hands the control plane the machine. As root, a system command can read the node

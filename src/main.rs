@@ -115,6 +115,11 @@ struct ServiceState {
 }
 
 fn main() -> ExitCode {
+    // `apt` and `apt-get` in a system command are links to this binary (apt.rs).
+    #[cfg(target_os = "linux")]
+    if let Some(code) = happy_supervisor::apt::shim_main(std::env::args_os()) {
+        return code;
+    }
     // The helper must start before any runtime or thread exists (docs/architecture.md).
     if std::env::args_os()
         .nth(1)

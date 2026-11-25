@@ -311,11 +311,12 @@ command, file operation or watch.
   `defaultEnv` appends it to `PATH` too, so every command finds what it installs; appended, so
   nothing it installs shadows a system program. The prefix is not under `/usr/local`, whose
   directories root searches first. `/etc/cron.deny` names the account, and `system disable` kills
-  every process it has, so nothing it left behind keeps running. `apt-get` needs root, so it does
-  not work as `happy-system`. An administrator can give the account a package manager of its own,
-  such as Homebrew on Linux under `/home/linuxbrew/.linuxbrew` owned by `happy-system`, with
-  `--path` for its `bin`.
-* `--user root` runs system access as root on Linux, so `apt-get` works. It is
+  every process it has, so nothing it left behind keeps running. An administrator can give the
+  account a package manager of its own, such as Homebrew on Linux under
+  `/home/linuxbrew/.linuxbrew` owned by `happy-system`, with `--path` for its `bin`.
+* `apt-get install` as `happy-system` goes through the supervisor, which runs it as root with
+  package names only (Installing with apt, below).
+* `--user root` runs system access as root on Linux, so every `apt-get` command works. It is
   root-equivalent: a system command can then read the node's credentials (below), and `system
   enable` and `system status` say so.
 * On macOS the account is the owner of Homebrew (`/opt/homebrew`, else `/usr/local/Homebrew`),
@@ -352,3 +353,33 @@ command, file operation or watch.
   (`node.update`). On macOS, Homebrew's owner is usually the person who uses the Mac, whose own
   files system commands can then read.
 * Not supported on Windows, where the node refuses it.
+
+### Installing with apt
+
+`apt-get` needs root, and an `apt-get` that runs as root with options the caller picks can run
+anything as root (`-o APT::Update::Pre-Invoke::=…`, a local `.deb`, a `Dpkg::Pre-Invoke` in an
+`APT_CONFIG`). So a Linux system command that runs as `happy-system` asks the supervisor instead,
+which takes package names and nothing else:
+
+* Each such command gets a socket, `/opt/happy-system/apt/<pid>-<n>.sock`, owned by
+  `happy-system`, mode `0600`, in a directory only root may change. It exists from the spawn to
+  the command's exit, when the supervisor closes and removes it. The command's environment names
+  it in `HAPPY_APT_SOCKET`.
+* `/opt/happy-system/bin`, root's, holds a copy of the supervisor binary and the links `apt` and
+  `apt-get` to it, and comes first in the command's `PATH`. Run under those names, the binary
+  forwards `install` and the package names, with its standard output and error, and exits as
+  `apt-get` did. It takes `apt-get install` or `apt install`, `-y`, `-q`, `--yes`,
+  `--assume-yes`, `--quiet` and `--no-install-recommends`, and refuses anything else (`update`,
+  `remove`, other options) with exit code 100 and a message saying what is allowed.
+* The supervisor answers only a process of the command's own session (the command leads it) whose
+  user is `happy-system`, by the socket's peer credentials, so a process that called `setsid`, or
+  that the command left running after its exit, cannot install. It checks each name itself
+  (lowercase letters, digits, `+`, `.` and `-`; 2 to 128 characters; starting with a letter or
+  digit; not ending in `-` or `.deb`), so `=version`, `/release`, `:arch`, a file and a removal
+  are refused whatever reaches the socket, and runs
+  `/usr/bin/apt-get install -y -q --no-remove [--no-install-recommends] <names>` with a fixed
+  environment (`PATH`, `HOME=/root`, `LANG`, `DEBIAN_FRONTEND=noninteractive`), standard input
+  closed and `/` as working directory, one at a time. It logs the names.
+* So a system command can install, as root, any package of the repositories the administrator
+  configured, whose maintainer scripts then run as root. It cannot add a repository, pick a
+  version or remove a package, and `apt-get update` is the administrator's.

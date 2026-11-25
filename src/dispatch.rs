@@ -1,6 +1,7 @@
 //! The message boundary: parses each command's body, resolves `access` once, and calls the
 //! module that owns the command. Stream messages from the control plane go to the proxy.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -303,6 +304,38 @@ struct Work {
     system: Option<System>,
 }
 
+/// A socket through which a system command that does not run as root installs with apt, on
+/// Linux (policy.md, System access), and the command's `env` to reach it.
+#[cfg(target_os = "linux")]
+async fn apt_gate(
+    system: &System,
+    env: &mut BTreeMap<String, String>,
+) -> Result<Option<crate::exec::AptGate>> {
+    let Some(account) = system.account() else {
+        return Ok(None);
+    };
+    let uid = account.uid();
+    let gate = tokio::task::spawn_blocking(move || crate::exec::AptGate::open(uid))
+        .await
+        .map_err(|err| Error::new(ErrorKind::Io, format!("system access failed: {err}")))?
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::Io,
+                format!("system access failed: cannot open the apt socket: {err}"),
+            )
+        })?;
+    gate.apply_env(env);
+    Ok(Some(gate))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn apt_gate(
+    _system: &System,
+    _env: &mut BTreeMap<String, String>,
+) -> Result<Option<crate::exec::AptGate>> {
+    Ok(None)
+}
+
 /// With a workload user, the sandbox's bridge connects to the proxy sockets as that user. They
 /// stay in `private/`, which only the supervisor's user can reach; that one sandbox's helper
 /// connects to them through descriptors the node passes it (policy.md, Workload user).
@@ -369,13 +402,19 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
                 user,
                 system,
             } = node.confine(access, what).await?;
+            let mut apt = None;
             if let Some(system) = system {
                 system.apply_env(&mut params.env);
+                apt = apt_gate(&system, &mut params.env).await?;
             }
             let proxy = node
                 .command_proxy(&params.exec_id, params.proxy.take(), &mut confinement)
                 .await?;
-            to_value(node.exec.start(params, confinement, proxy, user).await?)
+            to_value(
+                node.exec
+                    .start(params, confinement, proxy, user, apt)
+                    .await?,
+            )
         }
         CommandKind::ExecWrite => {
             node.exec.write(parse::<ExecWriteParams>(params)?).await?;

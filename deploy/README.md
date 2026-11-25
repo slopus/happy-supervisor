@@ -163,3 +163,5 @@ triggers and `release.yml` do.
   On Linux, system access runs as `happy-system`, which `system enable` creates with the npm
   prefix `/opt/happy-system/npm` and which cannot read the node's credentials; root only with
   `--user root`. `system disable` kills its processes, and `install.sh --uninstall` removes it.
+  Its `apt-get install <names>` asks the supervisor, which runs it as root with package names
+  only, for that command's processes while it runs.

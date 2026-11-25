@@ -110,9 +110,10 @@ sandboxed work can read it (policy.md, Fixed rules).
 
    It creates `happy-system` and its npm prefix `/opt/happy-system/npm` if missing, and takes
    effect at once, without a restart; `system disable` turns it off the same way and kills
-   `happy-system`'s processes. `happy-system` cannot read the credentials. For `apt-get
-   install`, add `--user root` instead: a system command is then root, so it can read the
-   credentials too.
+   `happy-system`'s processes. `happy-system` cannot read the credentials. Its `apt-get install
+   <names>` goes through the supervisor, which installs packages by name only (policy.md,
+   Installing with apt). For any other `apt-get` command, add `--user root` instead: a system
+   command is then root, so it can read the credentials too.
 
 ## Containers
 

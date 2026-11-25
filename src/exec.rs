@@ -33,6 +33,12 @@ use crate::protocol::{
 use crate::proxy::egress::{Admit, CommandProxy, Limiter};
 use crate::sandbox::{BindReports, NetPlan, NetnsControl, Placeholders};
 
+#[cfg(target_os = "linux")]
+pub use crate::apt::AptGate;
+/// A system command's socket for installing with apt, which only Linux has (apt.rs).
+#[cfg(not(target_os = "linux"))]
+pub enum AptGate {}
+
 /// What `exec.write` with `eof` sends to a terminal: Ctrl-D, its default end-of-file character.
 const EOF_CHARACTER: u8 = 0x04;
 
@@ -96,6 +102,8 @@ struct Running {
     _proxy: Option<CommandProxy>,
     /// The sandbox's placeholders, kept until the exit like the proxy.
     _placeholders: Option<Placeholders>,
+    /// A system command's apt socket, removed at the exit like the proxy.
+    _apt: Option<AptGate>,
     /// How `tcp.open` reaches the process's ports. `None`: its policy forbids binding them.
     tunnel: Option<TunnelRoute>,
 }
@@ -197,12 +205,16 @@ impl ExecManager {
     /// command holds it until it exits, and a failed start drops it, which stops the proxy.
     ///
     /// `user` is who the command runs as (identity.rs); `None` runs it as the supervisor.
+    ///
+    /// `apt` is a system command's socket for installing with apt (apt.rs). It serves the
+    /// command's session from the spawn, and closes at the exit like the proxy.
     pub async fn start(
         &self,
         params: ExecStartParams,
         confinement: Confinement,
         proxy: Option<CommandProxy>,
         user: Option<Arc<Workload>>,
+        apt: Option<AptGate>,
     ) -> Result<ExecStartResult> {
         let exec_id = params.exec_id.clone();
         let memory_reserved = match params.log {
@@ -215,7 +227,7 @@ impl ExecManager {
         // Spawning and registering run to completion on a blocking thread, so a cancelled
         // caller cannot leave a process running unregistered.
         let started = tokio::task::spawn_blocking(move || {
-            let result = inner.launch(params, &confinement, proxy, user.as_deref(), &runtime);
+            let result = inner.launch(params, &confinement, proxy, user.as_deref(), apt, &runtime);
             if result.is_err() {
                 inner.fail(&exec_id);
             }
@@ -490,6 +502,7 @@ impl Inner {
         confinement: &Confinement,
         proxy: Option<CommandProxy>,
         workload: Option<&Workload>,
+        mut apt: Option<AptGate>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<u32> {
         let ExecStartParams {
@@ -623,6 +636,13 @@ impl Inner {
         drop(done_tx);
 
         let pid = child.id();
+        // The process leads its session, whose processes alone the socket serves.
+        if let Some(gate) = &mut apt {
+            #[cfg(target_os = "linux")]
+            gate.serve(pid, runtime);
+            #[cfg(not(target_os = "linux"))]
+            match *gate {}
+        }
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let mut table = lock(&self.table);
         let waiter = Waiter {
@@ -667,6 +687,7 @@ impl Inner {
             reaping: false,
             _proxy: proxy,
             _placeholders: placeholders,
+            _apt: apt,
             tunnel,
         });
         Ok(pid)
@@ -1271,34 +1292,34 @@ mod tests {
         let manager = manager(45);
         let raw = || Confinement::Raw;
         manager
-            .start(sh("a", "sleep 30", 16), raw(), None, None)
+            .start(sh("a", "sleep 30", 16), raw(), None, None, None)
             .await
             .unwrap();
         manager
-            .start(sh("d", "printf 0123456789", 16), raw(), None, None)
+            .start(sh("d", "printf 0123456789", 16), raw(), None, None, None)
             .await
             .unwrap();
         exited(&manager, "d").await;
         manager
-            .start(sh("e", "printf abcdefghij", 16), raw(), None, None)
+            .start(sh("e", "printf abcdefghij", 16), raw(), None, None, None)
             .await
             .unwrap();
         exited(&manager, "e").await;
 
         let err = manager
-            .start(sh("big", "true", 30), raw(), None, None)
+            .start(sh("big", "true", 30), raw(), None, None, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::TooLarge);
         manager
-            .start(sh("f", "true", 16), raw(), None, None)
+            .start(sh("f", "true", 16), raw(), None, None, None)
             .await
             .unwrap();
         assert_eq!(log_of(&manager, "d").await, (vec![], 10, 0));
         assert_eq!(log_of(&manager, "e").await, (b"abcdefghij".to_vec(), 10, 1));
 
         let err = manager
-            .start(sh("big", "true", 1), raw(), None, None)
+            .start(sh("big", "true", 1), raw(), None, None, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::AlreadyExists);

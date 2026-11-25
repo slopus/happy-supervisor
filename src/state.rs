@@ -44,14 +44,10 @@ impl StateDir {
         Ok(state)
     }
 
-    /// The existing state directory at `dir`, or the platform default, changing nothing: for the
-    /// administrator's commands, which must not narrow a running node's `0711` root or create a
-    /// directory the service does not use.
-    pub fn existing(dir: Option<PathBuf>) -> Result<StateDir> {
-        let root = match dir {
-            Some(dir) => dir,
-            None => default_root()?,
-        };
+    /// The existing state directory at `root`, changing nothing: for the administrator's
+    /// commands, which must not narrow a running node's `0711` root or create a directory the
+    /// service does not use.
+    pub fn existing(root: PathBuf) -> Result<StateDir> {
         let state = StateDir {
             root,
             workload_user: None,
@@ -196,30 +192,25 @@ impl StateDir {
     /// `{"mode": "system"}` work runs as. `None` when system access is not enabled.
     ///
     /// It authorizes work as root, so the state directory, `private/` and the file must each be
-    /// the supervisor's user's own, not a symlink, and writable by no one else; otherwise system
-    /// access is refused.
+    /// the supervisor's user's own, not a symlink, and writable by no one else, and every
+    /// directory above them root's or the supervisor's user's and writable by no one else (or
+    /// sticky, as `/tmp`). Then no other user can replace any of it between this check and the
+    /// read. Otherwise system access is refused.
     pub fn system(&self) -> Result<Option<SystemAccess>> {
         let path = self.private_dir().join(SYSTEM);
         if !path.exists() {
             return Ok(None);
         }
         #[cfg(unix)]
-        for checked in [&self.root, &self.private_dir(), &path] {
-            use std::os::unix::fs::MetadataExt as _;
-            let meta = std::fs::symlink_metadata(checked).map_err(|err| io_error(checked, err))?;
-            let own = !meta.file_type().is_symlink()
-                && meta.uid() == nix::unistd::geteuid().as_raw()
-                && meta.mode() & 0o022 == 0;
-            if !own {
-                return Err(Error::new(
-                    ErrorKind::PermissionDenied,
-                    format!(
-                        "system access stays refused: {} must belong to the supervisor's user, \
-                         be no symlink, and be writable by no one else",
-                        checked.display()
-                    ),
-                ));
-            }
+        if let Some(unprotected) = self.unprotected(&path) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "system access stays refused: {} is a symlink or another user's, or others \
+                     may write it",
+                    unprotected.display()
+                ),
+            ));
         }
         let text = match std::fs::read(&path) {
             Ok(text) => text,
@@ -229,6 +220,34 @@ impl StateDir {
         serde_json::from_slice(&text)
             .map(Some)
             .map_err(|err| io_error(&path, err))
+    }
+
+    /// The first of the state directory, `private/` and `marker` that is not the supervisor's
+    /// user's own, a symlink, or writable by others, else the first directory above them that
+    /// another user could change ([`StateDir::system`]).
+    #[cfg(unix)]
+    fn unprotected(&self, marker: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt as _;
+        let me = nix::unistd::geteuid().as_raw();
+        let private = self.private_dir();
+        let own = [self.root.as_path(), private.as_path(), marker];
+        if let Some(path) = own.into_iter().find(|path| {
+            !std::fs::symlink_metadata(path).is_ok_and(|meta| {
+                !meta.file_type().is_symlink() && meta.uid() == me && meta.mode() & 0o022 == 0
+            })
+        }) {
+            return Some(path.to_path_buf());
+        }
+        self.root
+            .ancestors()
+            .skip(1)
+            .find(|dir| {
+                !std::fs::metadata(dir).is_ok_and(|meta| {
+                    (meta.uid() == 0 || meta.uid() == me)
+                        && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0)
+                })
+            })
+            .map(Path::to_path_buf)
     }
 
     /// Enables system access with `access`, atomically and owner-only, or disables it.
@@ -462,8 +481,8 @@ mod tests {
             Error::new(
                 ErrorKind::PermissionDenied,
                 format!(
-                    "system access stays refused: {} must belong to the supervisor's user, be no \
-                     symlink, and be writable by no one else",
+                    "system access stays refused: {} is a symlink or another user's, or others \
+                     may write it",
                     path.display()
                 ),
             )
@@ -482,6 +501,15 @@ mod tests {
         assert_eq!(state.system().unwrap_err(), refused(&marker));
         std::fs::remove_file(&marker).unwrap();
         assert_eq!(state.system().unwrap(), None);
+
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let below = StateDir::open(Some(shared.join("state"))).unwrap();
+        below.store_system(Some(&access)).unwrap();
+        mode(&shared, 0o777);
+        assert_eq!(below.system().unwrap_err(), refused(&shared));
+        mode(&shared, 0o1777);
+        assert_eq!(below.system().unwrap(), Some(access));
     }
 
     #[cfg(unix)]
@@ -491,7 +519,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("missing");
         assert_eq!(
-            StateDir::existing(Some(missing.clone())).unwrap_err(),
+            StateDir::existing(missing.clone()).unwrap_err(),
             Error::not_found(format!(
                 "no supervisor state at {}: pass the service's --state-dir",
                 missing.display()
@@ -500,7 +528,7 @@ mod tests {
         assert!(!missing.exists());
         let state = StateDir::open(Some(tmp.path().to_path_buf())).unwrap();
         state.open_to_workload().unwrap();
-        StateDir::existing(Some(tmp.path().to_path_buf())).unwrap();
+        StateDir::existing(tmp.path().to_path_buf()).unwrap();
         let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o711);
     }

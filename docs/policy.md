@@ -318,9 +318,12 @@ command, file operation or watch.
 * A system command, file operation or watch is unconfined and runs as that account, like raw
   access as the workload user (above). A command's environment is `env` with the account's
   `HOME`, `USER` and `LOGNAME`, on macOS its `TMPDIR`, and Homebrew's `bin` and `sbin` at the
-  front of `PATH` (api.md, `exec.start`).
+  front of `PATH`, ahead of any other copy (api.md, `exec.start`).
 * The node trusts `private/system` only while the state directory, `private/` and the file are
-  the supervisor's user's own, no symlink, and writable by no one else; otherwise it refuses.
+  the supervisor's user's own, no symlink, and writable by no one else, and every directory
+  above them is root's or the supervisor's user's and writable by no one else (or sticky, as
+  `/tmp`), so no other user can replace any of it. Otherwise it refuses, and `system enable`
+  does not enable it.
 * The supervisor logs each system operation (its command and program, or its path) with the
   account it ran as.
 * Enabling it hands the control plane the machine. As root, a system command can read the node

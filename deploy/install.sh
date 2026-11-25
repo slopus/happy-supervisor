@@ -16,7 +16,8 @@
 #
 # With --system (`sh -s -- --system`, sudo only) the control plane may also run chosen commands as
 # the account that installs software: root on Linux, Homebrew's owner on macOS (docs/policy.md,
-# System access). `sudo happy-supervisor system enable|disable` changes that later.
+# System access). `sudo happy-supervisor system enable|disable --state-dir <the service's>` changes
+# that later.
 #
 # Run again without HAPPY_JOIN_TOKEN to upgrade a joined computer in place (the same sudo or not).
 # Uninstall (removes the service, its state, the binary and, for a system install, the
@@ -243,11 +244,13 @@ fetch "$BASE/releases/$version/$file" "$work/$file"
 
 # Verified: only now does anything reach a system path, or the user's own.
 if [ -n "$upgrade" ]; then
-  # Before the service stops, so a release without `system` leaves the running one as it was.
-  chmod 755 "$work/$file"
-  enable_system "$work/$file"
-  service_stop
   install -m 755 "$work/$file" "$BIN.new"
+  # Before the service stops, so a release without `system` leaves the running one as it was.
+  enable_system "$BIN.new" || {
+    rm -f "$BIN.new"
+    fail "could not enable system access; the running service is unchanged"
+  }
+  service_stop
   mv -f "$BIN.new" "$BIN"
   service_start
   echo "happy-supervisor upgraded to $version"

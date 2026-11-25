@@ -241,6 +241,10 @@ pub fn enable_system(state: &StateDir, user: Option<String>) -> Result<SystemAcc
     };
     System::resolve(access.clone(), &supervisor_user)?;
     state.store_system(Some(&access))?;
+    if let Err(err) = state.system() {
+        state.store_system(None)?;
+        return Err(err);
+    }
     Ok(access)
 }
 

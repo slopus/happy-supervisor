@@ -21,7 +21,7 @@ HAPPY_JOIN_TOKEN=<join token> happy-supervisor join --url https://control.exampl
 happy-supervisor run [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor serve --listen 127.0.0.1:7777 --token-file <file> [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor info [--state-dir <dir>] [--workload-user <user>]
-happy-supervisor system enable [--user <user>] | disable | status [--state-dir <dir>]   # as root
+happy-supervisor system enable [--user <user>] | disable | status --state-dir <dir>   # as root
 happy-supervisor install-sandbox        # Windows, once, as an administrator
 ```
 

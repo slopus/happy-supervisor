@@ -75,8 +75,9 @@ enum Command {
     System {
         #[command(subcommand)]
         action: SystemAction,
-        #[arg(long, global = true)]
-        state_dir: Option<PathBuf>,
+        /// The service's state directory, which the installers pass to `run`.
+        #[arg(long, global = true, required = true)]
+        state_dir: PathBuf,
     },
     /// Print this node's NodeInfo as JSON.
     Info {

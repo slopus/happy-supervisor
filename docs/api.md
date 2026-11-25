@@ -636,8 +636,8 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
 * `env` is the **whole** environment. Nothing from the supervisor's own environment is passed.
   NodeInfo's `defaultEnv` holds the usual variables for this machine, for the control plane
   to copy. The one exception is `system` access: the node sets `HOME`, `USER` and `LOGNAME` to
-  the system account's, on macOS also its `TMPDIR`, and puts Homebrew's `bin` and `sbin` at the
-  front of `PATH` when they are missing (policy.md, System access).
+  the system account's, on macOS also its `TMPDIR`, and puts Homebrew's `bin` and `sbin` first
+  in `PATH`, ahead of any other copy of them (policy.md, System access).
 * `stdin: true` keeps the process's stdin open for `exec.write`. `false` gives it an empty,
   closed stdin.
 * `timeout` is optional. Without it the process runs until it exits or is killed. With it,

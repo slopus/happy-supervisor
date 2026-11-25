@@ -15,13 +15,14 @@
 # and says why. A user install refuses when bubblewrap is missing.
 #
 # With --system (`sh -s -- --system`, sudo only) the control plane may also run chosen commands as
-# the account that installs software: root on Linux, Homebrew's owner on macOS (docs/policy.md,
-# System access). `sudo happy-supervisor system enable|disable --state-dir <the service's>` changes
+# the account that installs software: on Linux happy-system, which it creates with an npm prefix
+# it owns and which cannot read the node's credentials; on macOS Homebrew's owner
+# (docs/policy.md, System access). `sudo happy-supervisor system enable|disable --state-dir <the service's>` changes
 # that later.
 #
 # Run again without HAPPY_JOIN_TOKEN to upgrade a joined computer in place (the same sudo or not).
 # Uninstall (removes the service, its state, the binary and, for a system install, the
-# happy-workload user):
+# happy-workload user and on Linux happy-system and its npm prefix):
 #
 #   curl -fsSL https://get.happy.engineering/install.sh | sudo sh -s -- --uninstall
 #
@@ -40,6 +41,11 @@ MINISIGN_LINUX_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d982
 MINISIGN_MACOS_SHA256="89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63"
 APPARMOR_PROFILE=/etc/apparmor.d/happy-supervisor-bwrap
 WORKLOAD_USER=happy-workload
+# System access's account on Linux, which `system enable` creates (src/system_account.rs).
+SYSTEM_USER=happy-system
+SYSTEM_DIR=/opt/happy-system
+SYSTEM_PROFILE=/etc/profile.d/happy-system.sh
+CRON_DENY=/etc/cron.deny
 LABEL=engineering.happy.supervisor
 
 fail() {
@@ -133,6 +139,15 @@ if [ "${1:-}" = "--uninstall" ]; then
     elif id -u "$WORKLOAD_USER" >/dev/null 2>&1; then
       userdel -r "$WORKLOAD_USER" 2>/dev/null || userdel "$WORKLOAD_USER" 2>/dev/null ||
         deluser --remove-home "$WORKLOAD_USER" 2>/dev/null || deluser "$WORKLOAD_USER"
+    fi
+    if [ "$os" = linux ]; then
+      if id -u "$SYSTEM_USER" >/dev/null 2>&1; then
+        pkill -KILL -u "$SYSTEM_USER" 2>/dev/null || true
+        userdel -r "$SYSTEM_USER" 2>/dev/null || userdel "$SYSTEM_USER" 2>/dev/null ||
+          deluser --remove-home "$SYSTEM_USER" 2>/dev/null || deluser "$SYSTEM_USER"
+      fi
+      rm -rf "$SYSTEM_DIR" "$SYSTEM_PROFILE"
+      [ ! -f "$CRON_DENY" ] || sed -i "/^$SYSTEM_USER\$/d" "$CRON_DENY"
     fi
   fi
   echo "happy-supervisor uninstalled"

@@ -26,7 +26,8 @@ and how to install the node is in [docs/install.md](docs/install.md).
 6. Every command, file operation and watch is either **raw**, running with the rights of the
    node's workload user (the supervisor's own when it has none), **sandboxed** by a policy
    that the operating system enforces, as that same user, or **system**, unconfined as the
-   account that installs software (root on Linux). System access is off until the machine's
+   account that installs software (`happy-system` on Linux, which cannot read the node's private
+   state; root only if the administrator names it). System access is off until the machine's
    administrator enables it as root, needs a supervisor running as root, and gives the workload
    user no way to it (no sudoers entry, no setuid program).
 7. A sandboxed command, `fs.*` call and watch are bound by the same policy. A watch reports only

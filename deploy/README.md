@@ -54,8 +54,10 @@ $env:HAPPY_JOIN_URL='…'; $env:HAPPY_JOIN_TOKEN='…'; irm https://get.happy.en
   a scheduled task that runs the supervisor as that user at logon, not elevated.
 
 `install.sh --system` (`sh -s -- --system`, with sudo only) also enables system access
-(docs/policy.md, System access): the control plane may run chosen commands as root on Linux and
-as Homebrew's owner on macOS, for `apt-get install`, `npm install -g` and `brew install`. NodeInfo
+(docs/policy.md, System access): the control plane may run chosen commands as `happy-system` on
+Linux, which it creates with an npm prefix it owns, for `npm install -g`, and as Homebrew's owner
+on macOS, for `brew install` and `npm install -g`. `apt-get install` needs root on Linux: `sudo
+happy-supervisor system enable --user root --state-dir <dir>`, which is root-equivalent. NodeInfo
 then reports `identity.system`. `sudo happy-supervisor system enable|disable --state-dir <dir>`
 changes it later, with the service's state directory: `/var/lib/happy-supervisor` on Linux,
 `"/Library/Application Support/happy-supervisor"` on macOS.
@@ -158,3 +160,6 @@ triggers and `release.yml` do.
   as the account that installs software (root on Linux, Homebrew's owner on macOS), once an
   administrator runs `sudo happy-supervisor system enable` or installs with `install.sh
   --system`. NodeInfo reports it as `identity.system`.
+  On Linux, system access runs as `happy-system`, which `system enable` creates with the npm
+  prefix `/opt/happy-system/npm` and which cannot read the node's credentials; root only with
+  `--user root`. `system disable` kills its processes, and `install.sh --uninstall` removes it.

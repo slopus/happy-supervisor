@@ -73,7 +73,7 @@ class InstallTests(unittest.TestCase):
         self.stub = self.root / 'stubs'
         self.stub.mkdir()
         self.stubs('id', 'uname', 'curl', 'minisign', 'systemctl', 'loginctl', 'useradd', 'cat',
-                   'apparmor_parser', 'bwrap')
+                   'apparmor_parser', 'bwrap', 'pkill')
         release = self.root / 'release'
         release.mkdir()
         self.candidate = release / 'happy-supervisor-linux-x86_64'
@@ -90,6 +90,9 @@ class InstallTests(unittest.TestCase):
             'STATE=/var/lib/happy-supervisor': f'STATE={self.state}',
             'UNIT=/etc/systemd/system/happy-supervisor.service': f'UNIT={self.unit}',
             'APPARMOR_PROFILE=/etc/apparmor.d/happy-supervisor-bwrap': f'APPARMOR_PROFILE={self.profile}',
+            'SYSTEM_DIR=/opt/happy-system': f'SYSTEM_DIR={self.root}/opt-happy-system',
+            'SYSTEM_PROFILE=/etc/profile.d/happy-system.sh': f'SYSTEM_PROFILE={self.root}/profile-happy-system.sh',
+            'CRON_DENY=/etc/cron.deny': f'CRON_DENY={self.root}/cron.deny',
             '[ ! -d /run/systemd/system ]': f'[ ! -d {systemd} ]',
         }.items():
             assert source.count(original) == 1, original
@@ -257,6 +260,21 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(self.bin.exists() or self.unit.exists() or self.state.exists())
         self.assertIn(['systemctl', 'disable', '--now', 'happy-supervisor'], events)
         self.assertIn(['userdel', '-r', 'happy-workload'], events)
+
+    def test_uninstall_removes_happy_system_its_prefix_and_its_cron_entry(self):
+        self.fresh()
+        self.run_install('--system')
+        prefix = self.root / 'opt-happy-system/npm'
+        prefix.mkdir(parents=True)
+        (self.root / 'profile-happy-system.sh').write_text('PATH=...')
+        (self.root / 'cron.deny').write_text('daemon\nhappy-system\n')
+        self.stubs('userdel')
+        events = self.run_install('--uninstall')
+        self.assertLess(events.index(['pkill', '-KILL', '-u', 'happy-system']),
+                        events.index(['userdel', '-r', 'happy-system']))
+        self.assertFalse((self.root / 'opt-happy-system').exists())
+        self.assertFalse((self.root / 'profile-happy-system.sh').exists())
+        self.assertEqual((self.root / 'cron.deny').read_text(), 'daemon\n')
 
 
 class ReleaseNotesTests(unittest.TestCase):

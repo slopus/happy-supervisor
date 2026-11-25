@@ -99,10 +99,18 @@ fn default_env(identity: &Identity) -> BTreeMap<String, String> {
     } else {
         &["PATH", "HOME", "USER", "LANG", "TMPDIR"]
     };
-    keys.iter()
+    let mut env: BTreeMap<String, String> = keys
+        .iter()
         .filter_map(|key| Some((key.to_string(), std::env::var(key).ok()?)))
         .chain(identity.workload_env())
-        .collect()
+        .collect();
+    if let (Some(dir), Some(path)) = (identity.shared_bin(), env.get_mut("PATH"))
+        && !path.split(':').any(|entry| entry == dir)
+    {
+        path.push(':');
+        path.push_str(dir);
+    }
+    env
 }
 
 /// The architecture the binary was built for: the machine's, unless it runs translated.

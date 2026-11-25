@@ -584,8 +584,9 @@ enforced by the operating system, as the same user.
 { "mode": "system" }
 ```
 
-`system` runs unconfined as the account that installs system-wide software, root on Linux and
-Homebrew's owner on macOS (policy.md, System access). A node replies `permission_denied` unless
+`system` runs unconfined as the account that installs system-wide software, `happy-system` on
+Linux (root only if the administrator chose it) and Homebrew's owner on macOS (policy.md, System
+access). A node replies `permission_denied` unless
 an administrator enabled it there; NodeInfo `identity.system` says whether it did. A node older
 than `system` replies `invalid_params`. The full policy rules are in policy.md. A node that cannot enforce
 sandboxing replies to sandboxed commands with `sandbox_unavailable`. It never falls back to raw.

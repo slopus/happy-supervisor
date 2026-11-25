@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use happy_supervisor::client::{self, RunExit};
 use happy_supervisor::identity::{self, Identity};
-use happy_supervisor::state::StateDir;
+use happy_supervisor::state::{StateDir, SystemAccess};
 use happy_supervisor::{Error, ErrorKind, enroll, helper, node_info, sandbox, serve};
 
 /// The argument that makes this binary an isolated command's SSH `ProxyCommand` (proxy.md).
@@ -88,15 +88,20 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SystemAction {
-    /// Run system access as `--user`, else root on Linux and Homebrew's owner on macOS (root
-    /// without Homebrew).
+    /// Run system access as `--user`, else on Linux as `happy-system`, which this creates, and
+    /// on macOS as Homebrew's owner (root without Homebrew). `--user root` is root-equivalent:
+    /// system commands can then read this node's credentials.
     Enable {
         #[arg(long)]
         user: Option<String>,
+        /// A directory to put first in system commands' `PATH`; repeatable.
+        #[arg(long)]
+        path: Vec<String>,
         #[command(flatten)]
         state: ServiceState,
     },
-    /// Refuse system access from the next request on.
+    /// Refuse system access from the next request on, and on Linux stop every process of
+    /// `happy-system`.
     Disable(ServiceState),
     /// Print the account system access runs as, or that it is disabled.
     Status(ServiceState),
@@ -165,6 +170,16 @@ fn open_state(
     Ok(state)
 }
 
+/// What `system enable` and `system status` say of enabled system access.
+fn enabled(access: &SystemAccess) -> String {
+    match access.user.as_str() {
+        "root" => "system access enabled: it runs as root, which is root-equivalent: system \
+                   commands can read this node's credentials"
+            .to_owned(),
+        user => format!("system access enabled: it runs as {user}"),
+    }
+}
+
 /// The join token, from `--token-file` or else `HAPPY_JOIN_TOKEN`.
 fn join_token(file: Option<&str>) -> happy_supervisor::Result<String> {
     if let Some(file) = file {
@@ -231,17 +246,16 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
             | SystemAction::Status(state)) = &action;
             let state = StateDir::existing(state.state_dir.clone())?;
             match action {
-                SystemAction::Enable { user, .. } => {
-                    let access = identity::enable_system(&state, user)?;
-                    println!("system access enabled: it runs as {}", access.user);
+                SystemAction::Enable { user, path, .. } => {
+                    let access = identity::enable_system(&state, user, path)?;
+                    println!("{}", enabled(&access));
                 }
                 SystemAction::Disable(_) => {
-                    state.check_protected()?;
-                    state.store_system(None)?;
+                    identity::disable_system(&state)?;
                     println!("system access disabled");
                 }
                 SystemAction::Status(_) => match state.system()? {
-                    Some(access) => println!("system access enabled: it runs as {}", access.user),
+                    Some(access) => println!("{}", enabled(&access)),
                     None => println!("system access disabled"),
                 },
             }

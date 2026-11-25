@@ -33,7 +33,7 @@ supervisor running as root runs every command, file operation and watch as that 
 ([docs/policy.md](docs/policy.md), Workload user). On Linux a supervisor running as root
 refuses to start without one; [docs/install.md](docs/install.md) sets it up. `info` prints this
 machine's NodeInfo as JSON. `system enable` lets the control plane run chosen commands as the
-account that installs software, root on Linux ([docs/policy.md](docs/policy.md), System access). On Windows, `install-sandbox` creates the sandbox's accounts, groups
+account that installs software, `happy-system` on Linux ([docs/policy.md](docs/policy.md), System access). On Windows, `install-sandbox` creates the sandbox's accounts, groups
 and firewall filters; without it the sandbox reports unavailable.
 
 The contract:

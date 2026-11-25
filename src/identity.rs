@@ -107,6 +107,20 @@ impl Identity {
         Vec::new()
     }
 
+    /// On Linux with system access as `happy-system`, the directory of the programs it installs
+    /// with `npm install -g`, which NodeInfo `defaultEnv` appends to `PATH` so every command
+    /// finds them.
+    pub fn shared_bin(&self) -> Option<&'static str> {
+        #[cfg(target_os = "linux")]
+        if self
+            .system()
+            .is_ok_and(|system| system.user == crate::system_account::USER)
+        {
+            return Some(crate::system_account::PREFIX_BIN);
+        }
+        None
+    }
+
     /// NodeInfo `identity`.
     pub fn info(&self) -> IdentityInfo {
         IdentityInfo {
@@ -214,11 +228,17 @@ impl System {
     }
 }
 
-/// `happy-supervisor system enable`: records the account system access runs as, `user` or
-/// else root on Linux, where `apt-get` and `npm -g` need it, and on macOS Homebrew's owner,
-/// with Homebrew's directories for `PATH`: `brew` refuses to run as root, and Homebrew's
-/// `npm -g` installs into its prefix. Root on a Mac without Homebrew. Needs root.
-pub fn enable_system(state: &StateDir, user: Option<String>) -> Result<SystemAccess> {
+/// `happy-supervisor system enable`: records the account system access runs as, with `path` and
+/// the account's own directories for `PATH`. Without `user`, on Linux that is `happy-system`,
+/// which this creates with an npm prefix it owns (system_account.rs); root only when named, since
+/// root can read the node's credentials. On macOS it is Homebrew's owner, with Homebrew's
+/// directories, because `brew` refuses to run as root and Homebrew's `npm -g` installs into its
+/// prefix; root on a Mac without Homebrew. Needs root.
+pub fn enable_system(
+    state: &StateDir,
+    user: Option<String>,
+    path: Vec<String>,
+) -> Result<SystemAccess> {
     let (supervisor_user, root) = current();
     if cfg!(windows) || !root {
         return Err(denied(format!(
@@ -226,6 +246,15 @@ pub fn enable_system(state: &StateDir, user: Option<String>) -> Result<SystemAcc
              {supervisor_user:?}"
         )));
     }
+    if let Some(bad) = path
+        .iter()
+        .find(|dir| !dir.starts_with('/') || dir.contains(':'))
+    {
+        return Err(Error::invalid_params(format!(
+            "--path {bad:?} is not an absolute directory without ':'"
+        )));
+    }
+    state.check_protected()?;
     let homebrew = if cfg!(target_os = "macos") {
         homebrew(HOMEBREW)
     } else {
@@ -233,16 +262,40 @@ pub fn enable_system(state: &StateDir, user: Option<String>) -> Result<SystemAcc
     };
     let user = match user {
         Some(user) => user,
+        #[cfg(target_os = "linux")]
+        None => crate::system_account::USER.to_owned(),
+        #[cfg(not(target_os = "linux"))]
         None => user_name(homebrew.as_ref().map_or(0, |brew| brew.owner))?,
     };
+    let mut entries = homebrew.map(|brew| brew.path).unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    if user == crate::system_account::USER {
+        crate::system_account::provision()?;
+        entries.push(crate::system_account::PREFIX_BIN.to_owned());
+    }
+    for dir in path {
+        if !entries.contains(&dir) {
+            entries.push(dir);
+        }
+    }
     let access = SystemAccess {
         user,
-        path: homebrew.map(|brew| brew.path).unwrap_or_default(),
+        path: entries,
     };
     System::resolve(access.clone(), &supervisor_user)?;
-    state.check_protected()?;
     state.store_system(Some(&access))?;
     Ok(access)
+}
+
+/// `happy-supervisor system disable`: refuses system access from the next request on, then, on
+/// Linux, kills every process of `happy-system`, so nothing a system command left behind keeps
+/// running. Needs root.
+pub fn disable_system(state: &StateDir) -> Result<()> {
+    state.check_protected()?;
+    state.store_system(None)?;
+    #[cfg(target_os = "linux")]
+    crate::system_account::kill_processes()?;
+    Ok(())
 }
 
 /// Homebrew's repository and prefix: Apple silicon's, then Intel's.
@@ -278,6 +331,7 @@ fn homebrew(candidates: &[(&str, &str)]) -> Option<Homebrew> {
 }
 
 /// The name of `uid`.
+#[cfg(not(target_os = "linux"))]
 fn user_name(uid: u32) -> Result<String> {
     #[cfg(unix)]
     return nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))

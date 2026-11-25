@@ -510,7 +510,8 @@ async fn system_access_runs_as_the_enabled_account_only_while_enabled() {
 
     assert_eq!(
         node.install.system(&["enable", "--user", "root"]),
-        "system access enabled: it runs as root\n"
+        "system access enabled: it runs as root, which is root-equivalent: system commands can \
+         read this node's credentials\n"
     );
     let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
     assert_eq!(
@@ -636,7 +637,7 @@ async fn system_access_installs_packages() {
     let (installs, account) = if cfg!(target_os = "linux") {
         (
             ["apt-get install -y hello", "npm install -g cowsay"],
-            "root".to_string(),
+            String::new(),
         )
     } else {
         (
@@ -669,6 +670,9 @@ async fn system_access_installs_packages() {
         assert_eq!(err.kind, ErrorKind::PermissionDenied);
     }
 
+    if cfg!(target_os = "linux") {
+        return happy_system_installs(&node, env).await;
+    }
     let enabled = node.install.system(&["enable"]);
     eprintln!("{enabled}");
     assert_eq!(
@@ -693,4 +697,92 @@ async fn system_access_installs_packages() {
     assert_eq!(exit, ExitStatus::Exited { code: 0 });
     assert!(output.starts_with("Hello, world!\n"), "{output}");
     assert!(output.contains("< installed >"), "{output}");
+}
+
+/// The rest of [`system_access_installs_packages`] on Linux, where system access runs as
+/// `happy-system` unless root is named.
+async fn happy_system_installs(node: &Node, env: Json) {
+    let credentials = node.install.path("state/private/credentials.json");
+    std::fs::write(&credentials, r#"{"nodeToken":"nt_secret"}"#).unwrap();
+    std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let enabled = node.install.system(&["enable"]);
+    eprintln!("{enabled}");
+    assert_eq!(enabled, "system access enabled: it runs as happy-system\n");
+    let account = nix::unistd::User::from_name("happy-system")
+        .unwrap()
+        .unwrap();
+    assert!(env.get("NPM_CONFIG_PREFIX").is_none());
+
+    let read = format!("cat {}", credentials.display());
+    let (exit, output) = node
+        .sh_in("token", &read, system(), false, env.clone())
+        .await;
+    eprintln!("system `{read}`: {exit:?}\n{output}");
+    assert_eq!(exit, ExitStatus::Exited { code: 1 });
+    assert!(output.contains("Permission denied"), "{output}");
+
+    let npm = "npm install -g cowsay";
+    let (exit, output) = node.sh_in("npm", npm, system(), false, env.clone()).await;
+    eprintln!("system `{npm}`: {exit:?}\n{output}");
+    assert_eq!(exit, ExitStatus::Exited { code: 0 });
+    let installed = std::fs::metadata("/opt/happy-system/npm/lib/node_modules/cowsay").unwrap();
+    assert_eq!(installed.uid(), account.uid.as_raw());
+
+    let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
+    let path = &info.default_env["PATH"];
+    assert!(path.ends_with(":/opt/happy-system/npm/bin"), "{path}");
+    let mut raw_env = env.clone();
+    raw_env["PATH"] = json!(format!(
+        "{path}:{}",
+        std::env::var("HS_TEST_PATH").unwrap_or_default()
+    ));
+    let (exit, output) = node
+        .sh_in("cowsay", "id -un; cowsay installed", raw(), false, raw_env)
+        .await;
+    eprintln!("raw `cowsay installed`: {exit:?}\n{output}");
+    assert_eq!(exit, ExitStatus::Exited { code: 0 });
+    assert!(output.starts_with(&format!("{USER}\n")), "{output}");
+    assert!(output.contains("< installed >"), "{output}");
+
+    let apt = "apt-get install -y hello";
+    let (exit, output) = node.sh_in("apt", apt, system(), false, env.clone()).await;
+    eprintln!("system `{apt}` as happy-system: {exit:?}\n{output}");
+    assert_ne!(exit, ExitStatus::Exited { code: 0 });
+    assert!(output.contains("are you root?"), "{output}");
+
+    let mut events = node.ctl.events();
+    let _: Json = node
+        .ctl
+        .command(
+            "exec.start",
+            json!({ "execId": "left", "argv": ["/bin/sleep", "600"], "cwd": "/", "env": env,
+                    "access": system() }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        node.install.system(&["disable"]),
+        "system access disabled\n"
+    );
+    let exit = loop {
+        match tokio::time::timeout(WAIT, events.next()).await.unwrap() {
+            Some(Event::ExecExit(exit)) if exit.exec_id.as_str() == "left" => break exit.exit,
+            Some(_) => {}
+            None => panic!("the events ended"),
+        }
+    };
+    eprintln!("a happy-system process at `system disable`: {exit:?}");
+    assert_eq!(exit, ExitStatus::Signaled { signal: 9 });
+
+    let enabled = node.install.system(&["enable", "--user", "root"]);
+    eprintln!("{enabled}");
+    assert!(
+        enabled.starts_with("system access enabled: it runs as root, which is root-equivalent"),
+        "{enabled}"
+    );
+    let apt = "apt-get install -y hello && hello";
+    let (exit, output) = node.sh_in("apt-root", apt, system(), false, env).await;
+    eprintln!("system `{apt}` as root: {exit:?}\n{output}");
+    assert_eq!(exit, ExitStatus::Exited { code: 0 });
+    assert!(output.ends_with("Hello, world!\n"), "{output}");
 }

@@ -299,14 +299,29 @@ system-wide software on this machine, so `apt-get install`, `npm install -g` and
 work. It is off unless an administrator enables it, and the control plane asks for it per
 command, file operation or watch.
 
-* `sudo happy-supervisor system enable [--user <name>] --state-dir <dir>` records the account
-  in `private/system`, which only root can read or write. `system disable` removes it, and
-  `system status` prints it. Each takes the service's state directory (install.md) and refuses
-  one that does not exist. `install.sh --system` runs `system enable` after joining.
-* The account is root on Linux. On macOS it is the owner of Homebrew (`/opt/homebrew`, else
-  `/usr/local/Homebrew`), because `brew` refuses to run as root and Homebrew's `npm -g` installs
-  into its prefix; without Homebrew it is root. `--user` names another account. Root on macOS
-  with Homebrew (for `installer -pkg`) needs `--user root`, and then `brew` does not work.
+* `sudo happy-supervisor system enable [--user <name>] [--path <dir>]... --state-dir <dir>`
+  records the account, and the directories to put first in its commands' `PATH`, in
+  `private/system`, which only root can read or write. `system disable` removes it, and `system
+  status` prints it. Each takes the service's state directory (install.md) and refuses one that
+  does not exist. `install.sh --system` runs `system enable` after joining.
+* On Linux the account is `happy-system`, which `system enable` creates when it is missing: a
+  system user with a home and no login shell, owning the npm prefix `/opt/happy-system/npm`,
+  which its `~/.npmrc` names, so `npm install -g` works without root. `/etc/profile.d/happy-system.sh`
+  appends `/opt/happy-system/npm/bin` to the `PATH` of every user but root, and NodeInfo
+  `defaultEnv` appends it to `PATH` too, so every command finds what it installs; appended, so
+  nothing it installs shadows a system program. The prefix is not under `/usr/local`, whose
+  directories root searches first. `/etc/cron.deny` names the account, and `system disable` kills
+  every process it has, so nothing it left behind keeps running. `apt-get` needs root, so it does
+  not work as `happy-system`. An administrator can give the account a package manager of its own,
+  such as Homebrew on Linux under `/home/linuxbrew/.linuxbrew` owned by `happy-system`, with
+  `--path` for its `bin`.
+* `--user root` runs system access as root on Linux, so `apt-get` works. It is
+  root-equivalent: a system command can then read the node's credentials (below), and `system
+  enable` and `system status` say so.
+* On macOS the account is the owner of Homebrew (`/opt/homebrew`, else `/usr/local/Homebrew`),
+  because `brew` refuses to run as root and Homebrew's `npm -g` installs into its prefix; without
+  Homebrew it is root. `--user` names another account. Root on macOS with Homebrew (for
+  `installer -pkg`) needs `--user root`, and then `brew` does not work.
 * Only a supervisor running as root can run it, since only root can become another account
   without giving one to its workload user. A node installed without sudo refuses it. No sudoers
   entry and no setuid program is involved, so the workload user, which every raw command runs
@@ -329,9 +344,11 @@ command, file operation or watch.
   keep a custom state path out of such directories.
 * The supervisor logs each system operation (its command and program, or its path) with the
   account it ran as.
-* Enabling it hands the control plane the machine. As root, a system command can read the node
-  token and the proxy CA key in `private/`, rewrite `private/system` so a later `system
-  disable` does not hold, and replace the supervisor. Turn it off in the control plane as well,
-  and after a node that ran system commands has it disabled, rotate its token (`node.update`).
-  Homebrew's owner on macOS cannot read `private/`.
+* `happy-system`, and Homebrew's owner on macOS, cannot read `private/`, so the node token and
+  the proxy CA key stay the supervisor's. As root (`--user root`), a system command can read
+  them, rewrite `private/system` so a later `system disable` does not hold, and replace the
+  supervisor: that hands the control plane the machine. Turn it off in the control plane as
+  well, and after a node that ran root system commands has it disabled, rotate its token
+  (`node.update`). On macOS, Homebrew's owner is usually the person who uses the Mac, whose own
+  files system commands can then read.
 * Not supported on Windows, where the node refuses it.

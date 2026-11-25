@@ -173,7 +173,7 @@ Who the supervisor runs as, and who its work runs as (policy.md, Workload user).
 | `supervisorUser` | string | The supervisor process's user name (its uid on Unix if it has none). |
 | `workloadUser` | string \| null | With `--workload-user`, the user every command, file operation and watch runs as. Never root: the node does not start with a root workload user. `null` when work runs as `supervisorUser`. |
 | `root` | bool | The supervisor runs as root (Unix) or with an elevated administrator token (Windows). With `workloadUser` null, its work does too. On Linux `root` with `workloadUser` null never happens: the supervisor refuses to start that way. |
-| `system` | `{ "user": string }` \| null | The account `{ "mode": "system" }` work runs as (policy.md, System access), such as `{ "user": "root" }`. `null` when the node refuses system access: it was not enabled, the supervisor is not root, or the account no longer exists. Read again at every collection, but `node.ready` is sent only when a session starts, not when one resumes (api.md, Sessions), so a control plane that shows it calls `node.info` after a resume. The node checks `private/system` on every request whatever it last reported. Newer than the key registry, so its keys travel as text. |
+| `system` | `{ "user": string }` \| null | The account `{ "mode": "system" }` work runs as (policy.md, System access), such as `{ "user": "happy-system" }`. `null` when the node refuses system access: it was not enabled, the supervisor is not root, or the account no longer exists. Read again at every collection, but `node.ready` is sent only when a session starts, not when one resumes (api.md, Sessions), so a control plane that shows it calls `node.info` after a resume. The node checks `private/system` on every request whatever it last reported. Newer than the key registry, so its keys travel as text. |
 | `tempDir` | string \| null | The work user's own temp directory, without a trailing separator. macOS: its `DARWIN_USER_TEMP_DIR` (`/var/folders/6p/y937…/T`), which the OS derives from the uid, read at startup by running `/usr/bin/getconf DARWIN_USER_TEMP_DIR` as that user. `null` on Linux and Windows, or when it cannot be read. A policy's `filesystem.writeTemp` makes it writable (policy.md). It is newer than the key registry, so it travels as text (api.md). |
 
 So raw and sandboxed work runs as root exactly when `workloadUser` is null and `root` is true,
@@ -197,7 +197,9 @@ The environment a command would usually get on this machine, for the control pla
 `exec.start`. It holds `PATH`, `HOME` (`USERPROFILE` on Windows), `USER` (`USERNAME` on
 Windows), `LANG` and `TMPDIR` (`TEMP` and `TMP` on Windows) when set in the supervisor's
 environment, and also `SystemRoot` on Windows. With a workload user, `HOME` and `USER` are that
-user's home directory and name. Nothing else of the supervisor's environment is reported.
+user's home directory and name. On Linux with system access as `happy-system`, `PATH` ends with
+`/opt/happy-system/npm/bin`, where its `npm install -g` puts programs (policy.md, System
+access). Nothing else of the supervisor's environment is reported.
 
 ### `collectedAtMs`
 

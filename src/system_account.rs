@@ -16,8 +16,27 @@ pub const PREFIX_BIN: &str = "/opt/happy-system/npm/bin";
 const PROFILE: &str = "/etc/profile.d/happy-system.sh";
 /// The prefix's parent, root's, which the account may not change.
 const DIR: &str = "/opt/happy-system";
-/// Where cron and at look for users they refuse.
-const DENY: [&str; 2] = ["/etc/cron.deny", "/etc/at.deny"];
+/// Where cron and at look for the users they allow and refuse.
+const CRON: Scheduler = Scheduler {
+    allow: "/etc/cron.allow",
+    deny: "/etc/cron.deny",
+    create: true,
+};
+const AT: Scheduler = Scheduler {
+    allow: "/etc/at.allow",
+    deny: "/etc/at.deny",
+    create: false,
+};
+
+/// A scheduler's allow and deny files. With an allow file, only the users it names may use the
+/// scheduler. Without one, everyone but those the deny file names may; without either, cron
+/// (Debian's, and cronie as Debian builds it) lets everyone, and at only root, so `create` says
+/// whether a missing deny file is created.
+struct Scheduler {
+    allow: &'static str,
+    deny: &'static str,
+    create: bool,
+}
 
 /// Appended, not prepended, so a program the account installs never shadows one of the system's
 /// for another user; root's `PATH` does not get it at all.
@@ -41,15 +60,37 @@ pub fn provision() -> Result<()> {
     let user = lookup()?.ok_or_else(|| io(format!("{USER} was not created")))?;
     unprivileged(&user)?;
     let (uid, gid) = (user.uid.as_raw(), user.gid.as_raw());
-    root_dir(Path::new(DIR))?;
-    std::fs::create_dir_all(PREFIX).map_err(|err| io(format!("cannot create {PREFIX}: {err}")))?;
-    std::os::unix::fs::chown(PREFIX, Some(uid), Some(gid))
-        .map_err(|err| io(format!("cannot give {PREFIX} to {USER}: {err}")))?;
+    root_dir(Path::new(DIR), 0o755)?;
+    prefix(uid, gid)?;
     let npmrc = user.dir.join(".npmrc");
     write_as(&npmrc, &format!("prefix={PREFIX}\n"), uid, gid)
         .map_err(|err| io(format!("cannot write {}: {err}", npmrc.display())))?;
     write(Path::new(PROFILE), PROFILE_SCRIPT)?;
-    DENY.iter().try_for_each(|path| deny(Path::new(path)))
+    deny(&CRON)?;
+    deny(&AT)
+}
+
+/// Creates [`PREFIX`], the account's, in [`DIR`], which only root may change, or makes sure of
+/// it: a directory, not a link, that is root's or the account's.
+fn prefix(uid: u32, gid: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    match std::fs::symlink_metadata(PREFIX) {
+        Ok(meta) if meta.is_dir() && (meta.uid() == 0 || meta.uid() == uid) => {}
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{PREFIX} must be a directory of root's or {USER}'s"),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(PREFIX)
+            .map_err(|err| io(format!("cannot create {PREFIX}: {err}")))?,
+        Err(err) => return Err(io(format!("cannot read {PREFIX}: {err}"))),
+    }
+    // Not a link (above), in a directory only root may change: chown reaches this directory.
+    std::os::unix::fs::lchown(PREFIX, Some(uid), Some(gid))
+        .map_err(|err| io(format!("cannot give {PREFIX} to {USER}: {err}")))
 }
 
 /// Refuses an existing account that is root, in root's group, or in any group but its own: one
@@ -71,27 +112,58 @@ fn unprivileged(user: &nix::unistd::User) -> Result<()> {
     Ok(())
 }
 
-/// Creates `dir` or makes sure of it: a directory, root's, that no one else may write, under
-/// parents that only root may write either.
-fn root_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)))
-        .map_err(|err| io(format!("cannot create {}: {err}", dir.display())))?;
-    for path in dir.ancestors() {
+/// Creates `dir` or makes sure of it: a directory, root's, with `mode`, whose parents exist
+/// and only root may change. Checks before it changes anything, and refuses rather than repairs:
+/// a parent or an existing `dir` that is a link, not root's, or writable by a group other than
+/// root's or by others (unless sticky).
+pub(crate) fn root_dir(dir: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    let unsafe_dir = |path: &Path, why: String| {
+        Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} must be a directory that only root may change ({why})",
+                path.display()
+            ),
+        )
+    };
+    let check = |path: &Path, meta: &std::fs::Metadata| {
+        let mode = meta.mode();
+        if !meta.is_dir() {
+            Err(unsafe_dir(path, "it is not a directory".to_owned()))
+        } else if meta.uid() != 0 {
+            Err(unsafe_dir(path, format!("its owner is uid {}", meta.uid())))
+        } else if (mode & 0o020 != 0 && meta.gid() != 0)
+            || (mode & 0o002 != 0 && mode & 0o1000 == 0)
+        {
+            Err(unsafe_dir(path, format!("its mode is {:o}", mode & 0o7777)))
+        } else {
+            Ok(())
+        }
+    };
+    for path in dir.ancestors().skip(1) {
         let meta = std::fs::symlink_metadata(path)
             .map_err(|err| io(format!("cannot read {}: {err}", path.display())))?;
-        if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                format!(
-                    "{} must be a directory that only root may write",
-                    path.display()
-                ),
-            ));
-        }
+        check(path, &meta)?;
     }
-    Ok(())
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            check(dir, &meta)?;
+            if meta.mode() & 0o022 != 0 {
+                return Err(unsafe_dir(
+                    dir,
+                    format!("its mode is {:o}", meta.mode() & 0o7777),
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .map_err(|err| io(format!("cannot create {}: {err}", dir.display())))?,
+        Err(err) => return Err(io(format!("cannot read {}: {err}", dir.display()))),
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+        .map_err(|err| io(format!("cannot set the mode of {}: {err}", dir.display())))
 }
 
 /// Kills every process of the account, and those it starts meanwhile. Linux; needs root.
@@ -99,6 +171,7 @@ pub fn kill_processes() -> Result<()> {
     let Some(user) = lookup()? else {
         return Ok(());
     };
+    unprivileged(&user)?;
     let uid = user.uid.as_raw();
     for _ in 0..50 {
         let pids = processes_of(uid)?;
@@ -192,24 +265,41 @@ fn write_as(path: &Path, contents: &str, uid: u32, gid: u32) -> std::io::Result<
     written
 }
 
-/// Names the account in the deny file at `path`, so it cannot leave cron or at jobs that
-/// outlive `system disable`.
-fn deny(path: &Path) -> Result<()> {
-    let current = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(io(format!("cannot read {}: {err}", path.display()))),
+/// Keeps the account from scheduling jobs that outlive `system disable`, without changing whom
+/// else the scheduler lets in: refuses if its allow file names the account, else adds it to the
+/// deny file, if the scheduler reads one.
+fn deny(scheduler: &Scheduler) -> Result<()> {
+    let read = |path: &str| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io(format!("cannot read {path}: {err}"))),
     };
-    if current.lines().any(|line| line.trim() == USER) {
+    let names = |text: &str| text.lines().any(|line| line.trim() == USER);
+    if let Some(allowed) = read(scheduler.allow)? {
+        if names(&allowed) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} lets {USER} schedule jobs; remove it there",
+                    scheduler.allow
+                ),
+            ));
+        }
         return Ok(());
     }
-    let mut text = current;
+    let text = match read(scheduler.deny)? {
+        Some(text) if names(&text) => return Ok(()),
+        Some(text) => text,
+        None if scheduler.create => String::new(),
+        None => return Ok(()),
+    };
+    let mut text = text;
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     text.push_str(USER);
     text.push('\n');
-    write(path, &text)
+    write(Path::new(scheduler.deny), &text)
 }
 
 /// Kills `pid` if it still has `uid`. Through a pidfd, which holds on to the process, so a
@@ -275,6 +365,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_account_is_denied_without_changing_whom_else_a_scheduler_lets_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| -> &'static str {
+            Box::leak(
+                dir.path()
+                    .join(name)
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+                    .into_boxed_str(),
+            )
+        };
+        let scheduler = |name: &str, create| Scheduler {
+            allow: path(&format!("{name}.allow")),
+            deny: path(&format!("{name}.deny")),
+            create,
+        };
+        let at = scheduler("at", false);
+        deny(&at).unwrap();
+        assert!(
+            !Path::new(at.deny).exists(),
+            "without either file only root may"
+        );
+        let cron = scheduler("cron", true);
+        deny(&cron).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cron.deny).unwrap(),
+            "happy-system\n"
+        );
+        std::fs::write(at.deny, "nobody").unwrap();
+        deny(&at).unwrap();
+        deny(&at).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(at.deny).unwrap(),
+            "nobody\nhappy-system\n"
+        );
+        let allowed = scheduler("allowed", true);
+        std::fs::write(allowed.allow, "alice\n").unwrap();
+        deny(&allowed).unwrap();
+        assert!(
+            !Path::new(allowed.deny).exists(),
+            "an allow file already leaves it out"
+        );
+        std::fs::write(allowed.allow, "alice\nhappy-system\n").unwrap();
+        let path = allowed.allow;
+        assert_eq!(
+            deny(&allowed).unwrap_err().message,
+            format!("{path} lets happy-system schedule jobs; remove it there")
+        );
+    }
+
+    #[test]
     fn a_process_is_killed_only_while_it_has_the_uid() {
         use std::os::unix::process::ExitStatusExt as _;
         let uid = nix::unistd::getuid().as_raw();
@@ -296,15 +438,17 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let mine = dir.path().join("happy-system");
-        let err = root_dir(&mine).unwrap_err();
+        let err = root_dir(&mine, 0o755).unwrap_err();
         assert_eq!(err.kind, ErrorKind::PermissionDenied);
+        let parent = dir.path().display();
+        let uid = nix::unistd::getuid();
         assert_eq!(
             err.message,
             format!(
-                "{} must be a directory that only root may write",
-                mine.display()
+                "{parent} must be a directory that only root may change (its owner is uid {uid})"
             )
         );
+        assert!(!mine.exists(), "nothing is created under an unsafe parent");
     }
 
     #[test]

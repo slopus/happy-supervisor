@@ -388,20 +388,25 @@ which takes package names and nothing else. An account named with `--user` other
 * The supervisor answers only a process of the command's own session (the command leads it)
   whose user is `happy-system`, by the socket's peer credentials, so a process that called
   `setsid`, or that the command left running after its exit, cannot install. It answers four
-  requests at a time and waits 10 seconds at most for one.
+  requests per socket and sixteen in all at a time, and waits 10 seconds at most for a whole
+  request.
 * It checks each name itself, whatever reaches the socket: lowercase letters, digits, `+`, `.`
   and `-`; 2 to 128 characters; starting with a letter or digit; not ending in `-` or `.deb`; and
-  exactly the name of a package in apt's lists (`apt-cache --all-names pkgnames`), so `apt-get`
-  never reads it as a pattern, a version, a release, an architecture, a file or a removal.
+  exactly the name of a real package in apt's lists (`apt-cache pkgnames`, so not a virtual
+  one), so `apt-get`, which takes a package's own name first, does not read it as a pattern of
+  the packages in those lists, a version, a release, an architecture, a file or a removal.
 * Then it runs `/usr/bin/apt-get install -y -q --no-remove [--no-install-recommends] <names>`
   with a fixed environment (`PATH`, `HOME=/root`, `LANG`, `DEBIAN_FRONTEND=noninteractive`),
   standard input closed, `/` as working directory and its output in a pipe of the supervisor's,
   one at a time, and logs the names. Just before it starts, under the same lock that closing
   the socket takes, it checks again that the command is still running, that the asking process
   is still in its session, and that `private/system` still names `happy-system`, so a request
-  waiting when the command exits or `system disable` runs never starts. An `apt-get` that
-  already started finishes, since stopping dpkg midway can leave packages broken. Output the
-  shim does not take within 30 seconds is dropped, so `apt-get` never waits for it.
+  waiting when the command exits or `system disable` runs does not start. `system disable` runs
+  in another process, so an install whose check passed just before it removed `private/system`
+  can still start just after. An `apt-get` that started finishes, since stopping dpkg midway can
+  leave packages broken. Output the shim does not take within 30 seconds is dropped, so
+  `apt-get` never waits for it, and output that something `apt-get` started writes more than 2
+  seconds after it exits is dropped too.
 * So a system command can install, as root, any package of the repositories the administrator
   configured, whose maintainer scripts then run as root and may change the machine's
   configuration. Enabling system access trusts those repositories with that. A command cannot add

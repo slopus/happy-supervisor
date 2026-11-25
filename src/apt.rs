@@ -37,10 +37,15 @@ const APT_FAILED: u8 = 100;
 const MAX_REQUEST: usize = 64 << 10;
 const MAX_PACKAGES: usize = 256;
 const MAX_FRAME: usize = 64 << 10;
-/// Connections one socket answers at once; more are closed unanswered.
+/// Connections one socket answers at once, and all of them together; more are closed
+/// unanswered.
 const MAX_CONNECTIONS: usize = 4;
-/// How long the supervisor waits for a request.
+const MAX_ALL_CONNECTIONS: usize = 16;
+/// How long the supervisor waits for the whole request.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long, after `apt-get` exits, the supervisor still sends output that something it started
+/// writes; later output is dropped.
+const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
 /// How long the supervisor waits for the shim to take output, before it stops sending it and
 /// lets `apt-get` finish without it.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -301,9 +306,23 @@ struct Shared {
 /// One of a socket's [`MAX_CONNECTIONS`], given back when dropped.
 struct Slot(Arc<Shared>);
 
+/// Connections being answered, of every socket.
+static ALL_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+impl Slot {
+    fn take(shared: &Arc<Shared>) -> Option<Slot> {
+        let mine = shared.connections.fetch_add(1, Ordering::AcqRel);
+        let all = ALL_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
+        // Built first, so dropping it gives both back.
+        let slot = Slot(shared.clone());
+        (mine < MAX_CONNECTIONS && all < MAX_ALL_CONNECTIONS).then_some(slot)
+    }
+}
+
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.connections.fetch_sub(1, Ordering::AcqRel);
+        ALL_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -366,11 +385,9 @@ impl AptGate {
                 return;
             };
             while let Ok((stream, _)) = listener.accept().await {
-                if shared.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
-                    shared.connections.fetch_sub(1, Ordering::AcqRel);
+                let Some(slot) = Slot::take(&shared) else {
                     continue;
-                }
-                let slot = Slot(shared.clone());
+                };
                 let peer = stream.peer_cred().ok();
                 let Ok(stream) = stream.into_std() else {
                     continue;
@@ -415,20 +432,10 @@ fn answer(
     shared: &Shared,
     session: u32,
 ) {
-    let timeouts = stream
-        .set_nonblocking(false)
-        .and_then(|()| stream.set_read_timeout(Some(READ_TIMEOUT)))
-        .and_then(|()| stream.set_write_timeout(Some(WRITE_TIMEOUT)));
-    let mut body = Vec::new();
     // The whole request first, so a refusal is read rather than reset.
-    if timeouts.is_err()
-        || (&mut stream)
-            .take(MAX_REQUEST as u64 + 1)
-            .read_to_end(&mut body)
-            .is_err()
-    {
+    let Ok(body) = read_request(&mut stream) else {
         return;
-    }
+    };
     let checked = if !in_session(peer, shared.uid, session) {
         Err("only the system command's own processes may install".to_owned())
     } else if body.len() > MAX_REQUEST {
@@ -444,7 +451,11 @@ fn answer(
     };
     let reply = match checked {
         Ok((packages, no_recommends)) => {
-            let still = || shared.enabled.as_ref()() && in_session(peer, shared.uid, session);
+            let still = || {
+                leader_runs(session)
+                    && in_session(peer, shared.uid, session)
+                    && shared.enabled.as_ref()()
+            };
             install(&packages, no_recommends, &mut stream, &shared.open, still)
         }
         Err(why) => Reply::Refused(why),
@@ -455,11 +466,44 @@ fn answer(
     };
 }
 
-/// Refuses a name that is not exactly a package in apt's lists, so `apt-get` never reads it as
-/// a pattern.
+/// The request, at most [`MAX_REQUEST`] and one byte, within [`READ_TIMEOUT`] in all.
+fn read_request(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + READ_TIMEOUT;
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while body.len() <= MAX_REQUEST {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(body)
+}
+
+/// Whether the process that leads `session`, the command, still runs: not yet a zombie. The
+/// exec reaps it only after dropping the gate, so its ID is not anyone else's meanwhile.
+fn leader_runs(session: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{session}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .is_some_and(|state| !matches!(state, 'Z' | 'X' | 'x'))
+    })
+}
+
+/// Refuses a name that is not exactly a package in apt's lists, so `apt-get`, which takes a
+/// package's own name first, does not read it as a pattern of the packages in those lists.
 fn known(name: &PackageName) -> std::result::Result<(), String> {
     let output = std::process::Command::new("/usr/bin/apt-cache")
-        .args(["--all-names", "pkgnames", name.as_str()])
+        .args(["pkgnames", name.as_str()])
         .env_clear()
         .env("PATH", APT_PATH)
         .env("LANG", "C.UTF-8")
@@ -468,10 +512,11 @@ fn known(name: &PackageName) -> std::result::Result<(), String> {
         .stderr(std::process::Stdio::null())
         .output()
         .map_err(|err| format!("cannot run /usr/bin/apt-cache: {err}"))?;
-    if output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .any(|line| line == name.as_str().as_bytes())
+    if output.status.success()
+        && output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .any(|line| line == name.as_str().as_bytes())
     {
         Ok(())
     } else {
@@ -494,7 +539,7 @@ fn install(
     use std::process::{Command, Stdio};
     let names: Vec<&str> = packages.iter().map(PackageName::as_str).collect();
     let _one = APT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (mut output, input) = match std::io::pipe() {
+    let (output, input) = match std::io::pipe() {
         Ok(pipe) => pipe,
         Err(err) => return Reply::Refused(format!("cannot run apt-get: {err}")),
     };
@@ -526,25 +571,54 @@ fn install(
         Ok(child) => child,
         Err(err) => return Reply::Refused(format!("cannot run /usr/bin/apt-get: {err}")),
     };
-    // Once the shim stops taking output, the rest is read and dropped, so apt-get never waits.
-    let mut sending = true;
-    let mut chunk = [0u8; 16 << 10];
-    loop {
-        match output.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                if sending && frame(stream, OUTPUT, &chunk[..n]).is_err() {
-                    sending = false;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    match child.wait() {
+    match forward_output(output, stream, || child.wait()) {
         Ok(status) => Reply::Exited(status.code().unwrap_or(APT_FAILED as i32)),
         Err(err) => Reply::Refused(format!("waiting for apt-get failed: {err}")),
     }
+}
+
+/// Sends what arrives on `output` to the shim as [`OUTPUT`] frames, until `wait` returns and then
+/// for [`DRAIN_AFTER_EXIT`] at most, so something `apt-get` started that keeps the pipe open
+/// holds up neither the reply nor the next install. A thread reads the pipe to its end, dropping
+/// what the shim does not take, so no writer ever waits on it.
+fn forward_output<T>(
+    mut output: std::io::PipeReader,
+    stream: &UnixStream,
+    wait: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let sink = Arc::new(Mutex::new(stream.try_clone().ok()));
+    let (done, ended) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let sink = sink.clone();
+        move || {
+            let mut chunk = [0u8; 16 << 10];
+            loop {
+                let n = match output.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(stream) = sink.as_mut()
+                    && frame(stream, OUTPUT, &chunk[..n]).is_err()
+                {
+                    *sink = None;
+                }
+            }
+            drop(done);
+        }
+    };
+    let read = std::thread::Builder::new()
+        .name("apt-output".to_owned())
+        .spawn(reader);
+    let waited = wait();
+    if read.is_ok() {
+        let _ = ended.recv_timeout(DRAIN_AFTER_EXIT);
+    }
+    // The reply comes next, so no output may follow it.
+    *sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    waited
 }
 
 #[cfg(test)]
@@ -616,6 +690,25 @@ mod tests {
         assert!(!spawned.get(), "a closed gate does not even check");
         let open = Mutex::new(true);
         assert_eq!(install(&hello, false, &mut stream, &open, || false), ended);
+    }
+
+    #[test]
+    fn output_after_the_exit_waits_a_little_then_is_dropped() {
+        let (supervisor, mut shim) = UnixStream::pair().unwrap();
+        let (output, mut input) = std::io::pipe().unwrap();
+        // Something apt-get started, which keeps the pipe open.
+        let keeper = input.try_clone().unwrap();
+        input.write_all(b"done\n").unwrap();
+        drop(input);
+        let started = std::time::Instant::now();
+        assert_eq!(forward_output(output, &supervisor, || Ok(7)).unwrap(), 7);
+        assert!(started.elapsed() >= DRAIN_AFTER_EXIT);
+        let mut keeper = keeper;
+        keeper.write_all(b"late\n").unwrap();
+        drop((supervisor, keeper));
+        let mut bytes = Vec::new();
+        shim.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0, 0, 0, 5, b'd', b'o', b'n', b'e', b'\n']);
     }
 
     #[test]

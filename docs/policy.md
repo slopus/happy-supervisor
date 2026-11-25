@@ -274,8 +274,8 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
 (node-info.md), so a control plane can refuse to share a node whose work would run as root.
 
 * The node refuses to start if the user does not exist, is root (uid 0), or the supervisor is
-  not root. On Linux it also refuses to start as root without a workload user, so work there
-  never runs as root (install.md). A Linux supervisor that is not root runs work as itself.
+  not root. On Linux it also refuses to start as root without a workload user, so raw and
+  sandboxed work there never runs as root (install.md); only system access does (below). A Linux supervisor that is not root runs work as itself.
 * A command enters its `cwd` as that user. A raw file operation runs in the sandbox helper, as
   that user and without a policy. A `tty` command's terminal belongs to that user.
 * A watch's OS watch runs in a helper process as that user, so it can watch only what that user
@@ -291,3 +291,33 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
   makes its rewrites relative to that directory, never by path, and gives each rewritten file
   the owner and mode of the one it replaces.
 * Not supported yet: a workload user on Windows, where the node does not start with one.
+
+## System access
+
+`{ "mode": "system" }` access carries no policy and runs as the account that installs
+system-wide software on this machine, so `apt-get install`, `npm install -g` and `brew install`
+work. It is off unless an administrator enables it, and the control plane asks for it per
+command, file operation or watch.
+
+* `sudo happy-supervisor system enable [--user <name>] [--state-dir <dir>]` records the account
+  in `private/system`, which only root can read or write. `system disable` removes it, and
+  `system status` prints it. `install.sh --system` runs `system enable` after joining.
+* The account is root on Linux. On macOS it is the owner of Homebrew (`/opt/homebrew`, else
+  `/usr/local/Homebrew`), because `brew` refuses to run as root and Homebrew's `npm -g` installs
+  into its prefix; without Homebrew it is root. `--user` names another account. Root on macOS
+  with Homebrew (for `installer -pkg`) needs `--user root`, and then `brew` does not work.
+* Only a supervisor running as root can run it, since only root can become another account
+  without giving one to its workload user. A node installed without sudo refuses it. No sudoers
+  entry and no setuid program is involved, so the workload user, which every raw command runs
+  as, gains nothing.
+* The node reads `private/system` on every system request, so `system disable` refuses the next
+  one without a restart; running commands keep running. A refusal is `permission_denied` and
+  says why: the supervisor is not root, system access is not enabled, or its account no longer
+  exists. NodeInfo `identity.system` names the account, or is `null` when the node refuses it.
+* A system command, file operation or watch is unconfined and runs as that account, like raw
+  access as the workload user (above). A command's environment is `env` with the account's
+  `HOME`, `USER` and `LOGNAME`, on macOS its `TMPDIR`, and Homebrew's `bin` and `sbin` at the
+  front of `PATH` (api.md, `exec.start`).
+* The supervisor logs each system operation (its command and program, or its path) with the
+  account it ran as.
+* Not supported on Windows, where the node refuses it.

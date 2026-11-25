@@ -597,6 +597,9 @@ pub enum Access {
     Sandboxed {
         policy: Policy,
     },
+    /// Unconfined, as the account that installs system-wide software (NodeInfo
+    /// `identity.system`). A node where it is not enabled refuses it.
+    System {},
 }
 
 /// The params of a request that carries `access`: the operation's own fields plus `access`.
@@ -1694,6 +1697,16 @@ pub struct IdentityInfo {
     /// policy's `filesystem.writeTemp` makes writable. `null` elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_dir: Option<String>,
+    /// The account `{"mode": "system"}` work runs as. `null` when this node refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemInfo>,
+}
+
+/// NodeInfo's `identity.system`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInfo {
+    pub user: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2173,8 +2186,21 @@ mod tests {
                 supervisor_user: "root".to_string(),
                 workload_user: Some("happy-workload".to_string()),
                 root: true,
-                temp_dir: None
+                temp_dir: None,
+                system: None
             }
+        );
+        // Newer than the key registry, so its keys travel as text.
+        let mut json = node_info_json();
+        json["identity"]["system"] = json!({ "user": "root" });
+        let parsed: NodeInfo = from_cbor(&to_cbor(&cbor(json))).unwrap();
+        let encoded = to_cbor(&parsed);
+        assert_eq!(crate::wire::text_keys(&encoded), ["system", "user"]);
+        assert_eq!(
+            from_cbor::<NodeInfo>(&encoded).unwrap().identity.system,
+            Some(SystemInfo {
+                user: "root".to_string()
+            })
         );
         assert_eq!(
             info.limits,
@@ -2279,6 +2305,14 @@ mod tests {
         );
         assert!(
             rejects::<Access>(json!({ "mode": "raw", "policy": policy_json() }))
+                .contains("unknown field `policy`")
+        );
+        assert_eq!(
+            round_trip::<Access>(json!({ "mode": "system" })),
+            Access::System {}
+        );
+        assert!(
+            rejects::<Access>(json!({ "mode": "system", "policy": policy_json() }))
                 .contains("unknown field `policy`")
         );
         assert!(rejects::<Access>(json!({ "mode": "root" })).contains("unknown variant `root`"));

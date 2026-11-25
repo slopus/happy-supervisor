@@ -61,6 +61,15 @@ jobs:
           bin=$(cargo test --all-features --test workload --no-run --message-format=json \
             | jq -r 'select(.target.name == "workload" and .executable != null) | .executable')
           sudo "$bin" --nocapture
+      # System access (policy.md) for real: apt-get and npm -g on Linux, brew and npm -g on macOS
+      # are refused as raw and before `system enable`, then install. The runner is thrown away.
+      - name: system access installs packages, as root
+        if: runner.os != 'Windows'
+        run: |
+          bin=$(cargo test --all-features --test workload --no-run --message-format=json \
+            | jq -r 'select(.target.name == "workload" and .executable != null) | .executable')
+          sudo HS_TEST_PATH="$(dirname "$(command -v npm)")" "$bin" --ignored --nocapture \
+            system_access_installs_packages
       # limits.memoryBytes and processes need a cgroup delegated to the supervisor: each node runs
       # in a user scope with Delegate=yes, as an installed user service would (docs/install.md).
       - name: limits, in a delegated cgroup

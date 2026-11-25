@@ -21,6 +21,7 @@ HAPPY_JOIN_TOKEN=<join token> happy-supervisor join --url https://control.exampl
 happy-supervisor run [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor serve --listen 127.0.0.1:7777 --token-file <file> [--state-dir <dir>] [--workload-user <user>]
 happy-supervisor info [--state-dir <dir>] [--workload-user <user>]
+happy-supervisor system enable [--user <user>] | disable | status [--state-dir <dir>]   # as root
 happy-supervisor install-sandbox        # Windows, once, as an administrator
 ```
 
@@ -31,7 +32,8 @@ programs that drive the node with `happy_supervisor::Controller`. With `--worklo
 supervisor running as root runs every command, file operation and watch as that user
 ([docs/policy.md](docs/policy.md), Workload user). On Linux a supervisor running as root
 refuses to start without one; [docs/install.md](docs/install.md) sets it up. `info` prints this
-machine's NodeInfo as JSON. On Windows, `install-sandbox` creates the sandbox's accounts, groups
+machine's NodeInfo as JSON. `system enable` lets the control plane run chosen commands as the
+account that installs software, root on Linux ([docs/policy.md](docs/policy.md), System access). On Windows, `install-sandbox` creates the sandbox's accounts, groups
 and firewall filters; without it the sandbox reports unavailable.
 
 The contract:

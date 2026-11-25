@@ -148,6 +148,25 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(self.profile.exists())
         self.assertIn('happy-supervisor 0.2.0-linux.1 is installed and running', self.output)
 
+    def test_system_enables_system_access_after_joining(self):
+        self.fresh()
+        events = self.run_install('--system')
+        candidate = [e for e in events if e[0] == 'candidate']
+        self.assertEqual(candidate[1], ['candidate', 'system', 'enable', '--state-dir', str(self.state)])
+        self.assertEqual(candidate[0][1], 'join')
+        self.assertLess(events.index(candidate[1]), events.index(['systemctl', 'restart', 'happy-supervisor']))
+
+    def test_system_without_sudo_refuses_before_downloading(self):
+        self.fresh(MOCK_UID='1000')
+        events = self.run_install('--system', success=False)
+        self.assertIn('--system needs a sudo install', self.output)
+        self.assertFalse(any(e[0] == 'curl' for e in events))
+
+    def test_a_default_install_leaves_system_access_off(self):
+        self.fresh()
+        events = self.run_install()
+        self.assertFalse(any(e[:2] == ['candidate', 'system'] for e in events))
+
     def test_where_apparmor_restricts_user_namespaces_bubblewrap_gets_a_profile(self):
         self.fresh(MOCK_RESTRICTED='1')
         events = self.run_install()

@@ -53,6 +53,11 @@ $env:HAPPY_JOIN_URL='…'; $env:HAPPY_JOIN_TOKEN='…'; irm https://get.happy.en
 * **Windows**, in an elevated PowerShell signed in as the user it runs as: `install-sandbox`, then
   a scheduled task that runs the supervisor as that user at logon, not elevated.
 
+`install.sh --system` (`sh -s -- --system`, with sudo only) also enables system access
+(docs/policy.md, System access): the control plane may run chosen commands as root on Linux and
+as Homebrew's owner on macOS, for `apt-get install`, `npm install -g` and `brew install`. NodeInfo
+then reports `identity.system`. `sudo happy-supervisor system enable|disable` changes it later.
+
 Run again without `HAPPY_JOIN_TOKEN` to upgrade a joined computer in place; `install.sh
 --uninstall` (or `$env:HAPPY_UNINSTALL='1'`) removes it. `HAPPY_SUPERVISOR_VERSION` pins a
 release and `HAPPY_INSTALL_BASE` serves releases from elsewhere.
@@ -147,3 +152,7 @@ triggers and `release.yml` do.
 * **0.2.6.** A policy may set `filesystem.writeTemp` to let a command write the work user's own
   temp directory, which NodeInfo reports as `identity.tempDir` (macOS: `DARWIN_USER_TEMP_DIR`).
   On macOS, file operations run under isolated policies.
+* **Unreleased.** System access: `{ "mode": "system" }` runs a command, file operation or watch
+  as the account that installs software (root on Linux, Homebrew's owner on macOS), once an
+  administrator runs `sudo happy-supervisor system enable` or installs with `install.sh
+  --system`. NodeInfo reports it as `identity.system`.

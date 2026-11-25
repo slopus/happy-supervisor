@@ -12,7 +12,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::exec::ExecManager;
 use crate::exec::TunnelRoute;
 use crate::fs::{self, FsRequest};
-use crate::identity::Identity;
+use crate::identity::{Identity, System, Workload};
 use crate::link::Outbox;
 use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::protocol::{
@@ -51,7 +51,7 @@ impl Node {
     /// Reads the installation ID and the joined name from `state`, resolves the workload user,
     /// loads the proxy CA (writing `public/ca-bundle.pem`) and probes the sandbox. Blocking.
     pub fn open(state: StateDir, outbox: Outbox) -> Result<Node> {
-        let identity = Identity::resolve(state.workload_user()?.as_deref())?;
+        let identity = Identity::open(&state)?;
         if identity.workload().is_some() {
             state.open_to_workload()?;
         }
@@ -91,7 +91,7 @@ impl Node {
             installation_id,
             name,
             sandbox,
-            exec: ExecManager::new(outbox.clone()).run_as(identity.workload().cloned()),
+            exec: ExecManager::new(outbox.clone()),
             identity: Arc::new(identity),
             watch: WatchManager::new(outbox),
             tunnels: TunnelManager::new(&proxy),
@@ -134,9 +134,30 @@ impl Node {
         self.exec.shutdown().await;
     }
 
-    async fn confine(&self, access: Access) -> Result<Confinement> {
+    /// What an operation runs under, and as whom. `what` names it in the log line every system
+    /// operation writes.
+    async fn confine(&self, access: Access, what: impl FnOnce() -> String) -> Result<Work> {
+        let workload = |confinement| Work {
+            confinement,
+            user: self.identity.workload().cloned(),
+            system: None,
+        };
         match access {
-            Access::Raw {} => Ok(Confinement::Raw),
+            Access::Raw {} => Ok(workload(Confinement::Raw)),
+            Access::System {} => {
+                let identity = self.identity.clone();
+                let system = tokio::task::spawn_blocking(move || identity.system())
+                    .await
+                    .map_err(|err| {
+                        Error::new(ErrorKind::Io, format!("system access failed: {err}"))
+                    })??;
+                tracing::info!("system access as {}: {}", system.user(), what());
+                Ok(Work {
+                    confinement: Confinement::Raw,
+                    user: system.account().cloned(),
+                    system: Some(system),
+                })
+            }
             Access::Sandboxed { policy } => {
                 self.sandbox.require_available()?;
                 let hidden = self.state.private_dir();
@@ -155,7 +176,7 @@ impl Node {
                 .map_err(|err| {
                     Error::new(ErrorKind::Io, format!("policy resolution failed: {err}"))
                 })??;
-                Ok(Confinement::Sandboxed(resolved))
+                Ok(workload(Confinement::Sandboxed(resolved)))
             }
         }
     }
@@ -248,12 +269,38 @@ impl Node {
     }
 
     async fn fs(&self, request: FsRequest, access: Access) -> Result<Value> {
-        let confinement = self.confine(access).await?;
-        let workload = self.identity.workload().cloned();
-        Ok(fs::handle_as(request, confinement, workload)
+        let Work {
+            confinement, user, ..
+        } = self.confine(access, || describe(&request)).await?;
+        Ok(fs::handle_as(request, confinement, user)
             .await?
             .into_value())
     }
+}
+
+/// A file operation and its path, for the log.
+fn describe(request: &FsRequest) -> String {
+    let (kind, path) = match request {
+        FsRequest::Stat(p) => ("fs.stat", &p.path),
+        FsRequest::List(p) => ("fs.list", &p.path),
+        FsRequest::Read(p) => ("fs.read", &p.path),
+        FsRequest::Write(p) => ("fs.write", &p.path),
+        FsRequest::Mkdir(p) => ("fs.mkdir", &p.path),
+        FsRequest::Remove(p) => ("fs.remove", &p.path),
+        FsRequest::Rename(p) => {
+            return format!("fs.rename {} {}", p.from.as_str(), p.to.as_str());
+        }
+    };
+    format!("{kind} {}", path.as_str())
+}
+
+/// An operation's confinement and user, decided once from its `access`.
+struct Work {
+    confinement: Confinement,
+    /// `None` runs it as the supervisor.
+    user: Option<Arc<Workload>>,
+    /// The account of `{"mode": "system"}`, whose environment a command gets.
+    system: Option<System>,
 }
 
 /// With a workload user, the sandbox's bridge connects to the proxy sockets as that user. They
@@ -316,11 +363,19 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
         }
         CommandKind::ExecStart => {
             let WithAccess { mut params, access } = parse::<WithAccess<ExecStartParams>>(params)?;
-            let mut confinement = node.confine(access).await?;
+            let what = || format!("exec.start {} {}", params.exec_id, params.argv.program());
+            let Work {
+                mut confinement,
+                user,
+                system,
+            } = node.confine(access, what).await?;
+            if let Some(system) = system {
+                system.apply_env(&mut params.env);
+            }
             let proxy = node
                 .command_proxy(&params.exec_id, params.proxy.take(), &mut confinement)
                 .await?;
-            to_value(node.exec.start(params, confinement, proxy).await?)
+            to_value(node.exec.start(params, confinement, proxy, user).await?)
         }
         CommandKind::ExecWrite => {
             node.exec.write(parse::<ExecWriteParams>(params)?).await?;
@@ -372,9 +427,11 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
         }
         CommandKind::WatchStart => {
             let WithAccess { params, access } = parse::<WithAccess<WatchStartParams>>(params)?;
-            let confinement = node.confine(access).await?;
-            let workload = node.identity.workload().cloned();
-            node.watch.start(params, confinement, workload).await?;
+            let what = || format!("watch.start {} {}", params.watch_id, params.path.as_str());
+            let Work {
+                confinement, user, ..
+            } = node.confine(access, what).await?;
+            node.watch.start(params, confinement, user).await?;
             to_value(Empty {})
         }
         CommandKind::TcpOpen => {

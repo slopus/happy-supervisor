@@ -49,8 +49,6 @@ struct Inner {
     outbox: Outbox,
     table: Mutex<Table>,
     memory_budget: u64,
-    /// Every command runs as this user (`--workload-user`).
-    workload: Option<Arc<Workload>>,
 }
 
 #[derive(Default)]
@@ -188,17 +186,8 @@ impl ExecManager {
                 outbox,
                 table: Mutex::default(),
                 memory_budget,
-                workload: None,
             }),
         }
-    }
-
-    /// Runs every command as `workload` (identity.rs). Call before the first start.
-    pub fn run_as(mut self, workload: Option<Arc<Workload>>) -> ExecManager {
-        Arc::get_mut(&mut self.inner)
-            .expect("run_as is called on a new ExecManager")
-            .workload = workload;
-        self
     }
 
     /// Starts a command. Sandboxed ones go through `sandbox::prepare` and the helper.
@@ -206,11 +195,14 @@ impl ExecManager {
     /// `proxy` is the command's running credential proxy when `exec.start` asked for one
     /// (`params.proxy` is then taken). Its `env()` replaces the same names in `params.env`. The
     /// command holds it until it exits, and a failed start drops it, which stops the proxy.
+    ///
+    /// `user` is who the command runs as (identity.rs); `None` runs it as the supervisor.
     pub async fn start(
         &self,
         params: ExecStartParams,
         confinement: Confinement,
         proxy: Option<CommandProxy>,
+        user: Option<Arc<Workload>>,
     ) -> Result<ExecStartResult> {
         let exec_id = params.exec_id.clone();
         let memory_reserved = match params.log {
@@ -223,7 +215,7 @@ impl ExecManager {
         // Spawning and registering run to completion on a blocking thread, so a cancelled
         // caller cannot leave a process running unregistered.
         let started = tokio::task::spawn_blocking(move || {
-            let result = inner.launch(params, &confinement, proxy, &runtime);
+            let result = inner.launch(params, &confinement, proxy, user.as_deref(), &runtime);
             if result.is_err() {
                 inner.fail(&exec_id);
             }
@@ -497,6 +489,7 @@ impl Inner {
         params: ExecStartParams,
         confinement: &Confinement,
         proxy: Option<CommandProxy>,
+        workload: Option<&Workload>,
         runtime: &tokio::runtime::Handle,
     ) -> Result<u32> {
         let ExecStartParams {
@@ -531,7 +524,6 @@ impl Inner {
             env.extend(proxy.env(&crate::helper::exe()?));
         }
         let program = resolve_program(argv.program(), &env)?;
-        let workload = self.workload.as_deref();
         let log = open_log(&log, confinement, workload)?;
         let cgroup = process::Cgroup::create(&limits)?;
         let bounds = Bounds {
@@ -1279,34 +1271,34 @@ mod tests {
         let manager = manager(45);
         let raw = || Confinement::Raw;
         manager
-            .start(sh("a", "sleep 30", 16), raw(), None)
+            .start(sh("a", "sleep 30", 16), raw(), None, None)
             .await
             .unwrap();
         manager
-            .start(sh("d", "printf 0123456789", 16), raw(), None)
+            .start(sh("d", "printf 0123456789", 16), raw(), None, None)
             .await
             .unwrap();
         exited(&manager, "d").await;
         manager
-            .start(sh("e", "printf abcdefghij", 16), raw(), None)
+            .start(sh("e", "printf abcdefghij", 16), raw(), None, None)
             .await
             .unwrap();
         exited(&manager, "e").await;
 
         let err = manager
-            .start(sh("big", "true", 30), raw(), None)
+            .start(sh("big", "true", 30), raw(), None, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::TooLarge);
         manager
-            .start(sh("f", "true", 16), raw(), None)
+            .start(sh("f", "true", 16), raw(), None, None)
             .await
             .unwrap();
         assert_eq!(log_of(&manager, "d").await, (vec![], 10, 0));
         assert_eq!(log_of(&manager, "e").await, (b"abcdefghij".to_vec(), 10, 1));
 
         let err = manager
-            .start(sh("big", "true", 1), raw(), None)
+            .start(sh("big", "true", 1), raw(), None, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::AlreadyExists);

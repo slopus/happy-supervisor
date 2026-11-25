@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use happy_supervisor::client::{self, RunExit};
-use happy_supervisor::identity::Identity;
+use happy_supervisor::identity::{self, Identity};
 use happy_supervisor::state::StateDir;
 use happy_supervisor::{Error, ErrorKind, enroll, helper, node_info, sandbox, serve};
 
@@ -69,6 +69,15 @@ enum Command {
     /// administrator, as the account that runs the supervisor.
     #[cfg(windows)]
     InstallSandbox(sandbox::windows::InstallArgs),
+    /// Enable, disable or show system access, `{"mode": "system"}`: commands and file operations
+    /// as the account that installs system-wide software (docs/policy.md, System access).
+    /// Enabling and disabling need root.
+    System {
+        #[command(subcommand)]
+        action: SystemAction,
+        #[arg(long, global = true)]
+        state_dir: Option<PathBuf>,
+    },
     /// Print this node's NodeInfo as JSON.
     Info {
         #[arg(long)]
@@ -77,6 +86,20 @@ enum Command {
         #[arg(long)]
         workload_user: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SystemAction {
+    /// Run system access as `--user`, else root on Linux and Homebrew's owner on macOS (root
+    /// without Homebrew).
+    Enable {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Refuse system access from the next request on.
+    Disable,
+    /// Print the account system access runs as, or that it is disabled.
+    Status,
 }
 
 fn main() -> ExitCode {
@@ -195,6 +218,24 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         }
         #[cfg(windows)]
         Command::InstallSandbox(_) => unreachable!("handled before the runtime starts"),
+        Command::System { action, state_dir } => {
+            let state = StateDir::open(state_dir)?;
+            match action {
+                SystemAction::Enable { user } => {
+                    let access = identity::enable_system(&state, user)?;
+                    println!("system access enabled: it runs as {}", access.user);
+                }
+                SystemAction::Disable => {
+                    state.store_system(None)?;
+                    println!("system access disabled");
+                }
+                SystemAction::Status => match state.system()? {
+                    Some(access) => println!("system access enabled: it runs as {}", access.user),
+                    None => println!("system access disabled"),
+                },
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Info {
             state_dir,
             workload_user,
@@ -204,7 +245,7 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
                 let installation_id = state.installation_id()?;
                 let name = state.credentials()?.map(|c| c.name);
                 let sandbox = sandbox::probe();
-                let identity = Identity::resolve(state.workload_user()?.as_deref())?;
+                let identity = Identity::open(&state)?;
                 Ok::<_, Error>(node_info::collect(
                     &installation_id,
                     name.as_deref(),

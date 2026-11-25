@@ -8,8 +8,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use happy_supervisor::protocol::{
-    AbsPath, Access, Bytes, Event, ExecOutput, ExitStatus, FsWriteParams, NodeInfo, WatchEvent,
-    WatchEventBody, WithAccess, WriteMode,
+    AbsPath, Access, Bytes, Event, ExecOutput, ExitStatus, FsReadResult, FsWriteParams, NodeInfo,
+    WatchEvent, WatchEventBody, WithAccess, WriteMode,
 };
 use happy_supervisor::{Controller, ErrorKind};
 use serde_json::{Value as Json, json};
@@ -162,9 +162,22 @@ impl Node {
         access: Json,
         tty: bool,
     ) -> (ExitStatus, String) {
+        let env = json!({ "PATH": "/usr/bin:/bin" });
+        self.sh_in(exec_id, script, access, tty, env).await
+    }
+
+    /// [`Node::sh`] with `env`.
+    async fn sh_in(
+        &self,
+        exec_id: &str,
+        script: &str,
+        access: Json,
+        tty: bool,
+        env: Json,
+    ) -> (ExitStatus, String) {
         let mut events = self.ctl.events();
         let mut params = json!({ "execId": exec_id, "argv": ["/bin/sh", "-c", script],
-                                 "cwd": "/", "env": { "PATH": "/usr/bin:/bin" }, "access": access });
+                                 "cwd": "/", "env": env, "access": access });
         if tty {
             params["tty"] = json!({ "rows": 24, "cols": 80 });
         }
@@ -394,4 +407,226 @@ async fn commands_and_file_operations_run_as_the_workload_user() {
             .all(|path| expected.contains(path) || *path == root),
         "{seen:?}"
     );
+}
+
+fn system() -> Json {
+    json!({ "mode": "system" })
+}
+
+impl Install {
+    /// `happy-supervisor system <args>` on this install's state directory: its output.
+    fn system(&self, args: &[&str]) -> String {
+        let output = std::process::Command::new(self.path("happy-supervisor"))
+            .arg("system")
+            .args(args)
+            .arg("--state-dir")
+            .arg(self.path("state"))
+            .output()
+            .unwrap();
+        let text =
+            String::from_utf8(output.stdout).unwrap() + &String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{text}");
+        text
+    }
+}
+
+impl Node {
+    /// The error `exec.start` replies to a system `id -u`.
+    async fn system_refused(&self, exec_id: &str) -> happy_supervisor::Error {
+        self.ctl
+            .call(
+                "exec.start",
+                happy_supervisor::wire::to_value(&json!({ "execId": exec_id,
+                    "argv": ["/usr/bin/id", "-u"], "cwd": "/", "env": {}, "access": system() })),
+            )
+            .await
+            .unwrap_err()
+    }
+}
+
+#[tokio::test]
+async fn system_access_runs_as_the_enabled_account_only_while_enabled() {
+    if !root() {
+        eprintln!("skipped: system access needs a supervisor running as root");
+        return;
+    }
+    let node = Node::start().await;
+    let not_enabled = "system access is not enabled on this node; an administrator enables it \
+                       with `sudo happy-supervisor system enable`";
+
+    let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
+    assert_eq!(info.identity.system, None);
+    let err = node.system_refused("before").await;
+    assert_eq!(
+        (err.kind, err.message.as_str()),
+        (ErrorKind::PermissionDenied, not_enabled)
+    );
+    assert_eq!(node.install.system(&["status"]), "system access disabled\n");
+
+    assert_eq!(
+        node.install.system(&["enable", "--user", "root"]),
+        "system access enabled: it runs as root\n"
+    );
+    let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
+    assert_eq!(
+        info.identity.system,
+        Some(happy_supervisor::protocol::SystemInfo {
+            user: "root".to_string()
+        })
+    );
+    let home = nix::unistd::User::from_name("root").unwrap().unwrap().dir;
+    assert_eq!(
+        node.sh(
+            "system",
+            "id -u; echo $HOME $USER $LOGNAME",
+            system(),
+            false
+        )
+        .await,
+        (
+            ExitStatus::Exited { code: 0 },
+            format!("0\n{} root root\n", home.display())
+        )
+    );
+    assert_eq!(
+        node.sh("raw", "id -u", raw(), false).await,
+        (
+            ExitStatus::Exited { code: 0 },
+            format!("{}\n", id(&["-u", USER]))
+        )
+    );
+    let secret = node.private().join("secret");
+    let read: FsReadResult = node
+        .ctl
+        .command(
+            "fs.read",
+            json!({ "path": secret.to_str().unwrap(), "access": system() }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.data.0, b"root's");
+    let planted = secret.with_file_name("planted");
+    let write = WithAccess {
+        params: FsWriteParams {
+            path: abs(&planted),
+            data: Bytes(b"as root".to_vec()),
+            mode: WriteMode::Create,
+        },
+        access: Access::System {},
+    };
+    let _: Json = node.ctl.command("fs.write", &write).await.unwrap();
+    assert_eq!(std::fs::metadata(&planted).unwrap().uid(), 0);
+
+    let state = node.install.path("state/private/system");
+    std::fs::write(
+        &state,
+        r#"{ "user": "root", "path": ["/hs/bin", "/usr/bin"] }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        node.sh("path", "echo $PATH", system(), false).await,
+        (
+            ExitStatus::Exited { code: 0 },
+            "/hs/bin:/usr/bin:/bin\n".to_string()
+        )
+    );
+    std::fs::write(&state, r#"{ "user": "hs-no-such-user", "path": [] }"#).unwrap();
+    let err = node.system_refused("gone").await;
+    assert_eq!(
+        (err.kind, err.message.as_str()),
+        (
+            ErrorKind::PermissionDenied,
+            "system access runs as \"hs-no-such-user\", which no longer exists; an administrator \
+             runs `sudo happy-supervisor system enable` again"
+        )
+    );
+
+    assert_eq!(
+        node.install.system(&["disable"]),
+        "system access disabled\n"
+    );
+    let err = node.system_refused("after").await;
+    assert_eq!(
+        (err.kind, err.message.as_str()),
+        (ErrorKind::PermissionDenied, not_enabled)
+    );
+    let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
+    assert_eq!(info.identity.system, None);
+}
+
+/// The installs system access is for, run for real: CI runs it as root on throwaway machines
+/// (`--ignored`). `HS_TEST_PATH` adds the directory of the runner's `npm` to `PATH`.
+#[tokio::test]
+#[ignore = "installs packages system-wide"]
+async fn system_access_installs_packages() {
+    assert!(root(), "system access needs a supervisor running as root");
+    let node = Node::start().await;
+    let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
+    let mut env = json!(info.default_env);
+    if let Ok(extra) = std::env::var("HS_TEST_PATH") {
+        env["PATH"] = json!(format!("{}:{extra}", env["PATH"].as_str().unwrap()));
+    }
+    env["DEBIAN_FRONTEND"] = json!("noninteractive");
+    env["HOMEBREW_NO_AUTO_UPDATE"] = json!("1");
+    env["HOMEBREW_NO_INSTALL_CLEANUP"] = json!("1");
+    let (installs, account) = if cfg!(target_os = "linux") {
+        (
+            ["apt-get install -y hello", "npm install -g cowsay"],
+            "root".to_string(),
+        )
+    } else {
+        (
+            ["brew install hello", "npm install -g cowsay"],
+            std::env::var("SUDO_USER").unwrap(),
+        )
+    };
+    let check = "hello && cowsay installed";
+
+    for (n, install) in installs.iter().enumerate() {
+        let (exit, output) = node
+            .sh_in(&format!("raw-{n}"), install, raw(), false, env.clone())
+            .await;
+        eprintln!("raw `{install}`: {exit:?}\n{output}");
+        assert_ne!(exit, ExitStatus::Exited { code: 0 }, "raw `{install}`");
+        let err = node
+            .ctl
+            .call(
+                "exec.start",
+                happy_supervisor::wire::to_value(&json!({ "execId": format!("off-{n}"),
+                    "argv": ["/bin/sh", "-c", install], "cwd": "/", "env": env,
+                    "access": system() })),
+            )
+            .await
+            .unwrap_err();
+        eprintln!(
+            "system `{install}` before enabling: {:?} {}",
+            err.kind, err.message
+        );
+        assert_eq!(err.kind, ErrorKind::PermissionDenied);
+    }
+
+    let enabled = node.install.system(&["enable"]);
+    eprintln!("{enabled}");
+    assert_eq!(
+        enabled,
+        format!("system access enabled: it runs as {account}\n")
+    );
+    for (n, install) in installs.iter().enumerate() {
+        let (exit, output) = node
+            .sh_in(
+                &format!("system-{n}"),
+                install,
+                system(),
+                false,
+                env.clone(),
+            )
+            .await;
+        eprintln!("system `{install}`: {exit:?}\n{output}");
+        assert_eq!(exit, ExitStatus::Exited { code: 0 }, "system `{install}`");
+    }
+    let (exit, output) = node.sh_in("check", check, system(), false, env).await;
+    eprintln!("system `{check}`: {exit:?}\n{output}");
+    assert_eq!(exit, ExitStatus::Exited { code: 0 });
+    assert!(output.starts_with("Hello, world!\n"), "{output}");
+    assert!(output.contains("< installed >"), "{output}");
 }

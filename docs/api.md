@@ -578,7 +578,16 @@ Every exec, file and watch command carries `access`. It is one of two shapes:
 
 `raw` runs with the supervisor's full rights, or with its workload user's when it has one
 (policy.md, Workload user; NodeInfo `identity`). `sandboxed` runs confined by the policy,
-enforced by the operating system, as the same user. The full policy rules are in policy.md. A node that cannot enforce
+enforced by the operating system, as the same user.
+
+```json
+{ "mode": "system" }
+```
+
+`system` runs unconfined as the account that installs system-wide software, root on Linux and
+Homebrew's owner on macOS (policy.md, System access). A node replies `permission_denied` unless
+an administrator enabled it there; NodeInfo `identity.system` says whether it did. A node older
+than `system` replies `invalid_params`. The full policy rules are in policy.md. A node that cannot enforce
 sandboxing replies to sandboxed commands with `sandbox_unavailable`. It never falls back to raw.
 
 ## Node
@@ -626,7 +635,9 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
 * `cwd` is absolute and must exist. Under a sandbox it must be readable by the policy.
 * `env` is the **whole** environment. Nothing from the supervisor's own environment is passed.
   NodeInfo's `defaultEnv` holds the usual variables for this machine, for the control plane
-  to copy.
+  to copy. The one exception is `system` access: the node sets `HOME`, `USER` and `LOGNAME` to
+  the system account's, on macOS also its `TMPDIR`, and puts Homebrew's `bin` and `sbin` at the
+  front of `PATH` when they are missing (policy.md, System access).
 * `stdin: true` keeps the process's stdin open for `exec.write`. `false` gives it an empty,
   closed stdin.
 * `timeout` is optional. Without it the process runs until it exits or is killed. With it,

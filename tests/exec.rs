@@ -89,7 +89,7 @@ impl Node {
 
     async fn start_with(&self, params: Value, confinement: Confinement) -> Result<u32, Error> {
         let params: ExecStartParams = serde_json::from_value(params).unwrap();
-        Ok(self.exec.start(params, confinement, None).await?.pid)
+        Ok(self.exec.start(params, confinement, None, None).await?.pid)
     }
 
     /// Waits for the process's `exec.exit`.
@@ -720,7 +720,10 @@ async fn a_sandboxed_command_runs_through_the_helper() {
     params["stdin"] = json!(true);
     params["log"] = json!({ "kind": "file", "path": format!("{work_path}/sb.log") });
     let params: ExecStartParams = serde_json::from_value(params).unwrap();
-    node.exec.start(params, confinement(), None).await.unwrap();
+    node.exec
+        .start(params, confinement(), None, None)
+        .await
+        .unwrap();
     node.write("sb", b"from stdin", true).await.unwrap();
     assert_eq!(node.exit("sb").await.exit, ExitStatus::Exited { code: 0 });
     assert_eq!(node.streamed("sb", Stream::Stdout), "inside\nfrom stdin");

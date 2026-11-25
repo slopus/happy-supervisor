@@ -2,12 +2,12 @@
 //! Identity). With a workload user, every command, file operation and watch runs with that
 //! user's uid, gid and supplementary groups, never the supervisor's.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[cfg(unix)]
-use crate::error::ErrorKind;
-use crate::error::{Error, Result};
-use crate::protocol::IdentityInfo;
+use crate::error::{Error, ErrorKind, Result};
+use crate::protocol::{IdentityInfo, SystemInfo};
+use crate::state::{StateDir, SystemAccess};
 
 /// The supervisor's user and, with `--workload-user`, the user its work runs as. Resolved once
 /// at startup.
@@ -17,9 +17,19 @@ pub struct Identity {
     root: bool,
     workload: Option<Arc<Workload>>,
     temp_dir: Option<String>,
+    /// The state directory whose `private/system` enables system access. `None` refuses it.
+    state: Option<StateDir>,
 }
 
 impl Identity {
+    /// [`Identity::resolve`] with the workload user `state` names, and system access as `state`
+    /// enables it.
+    pub fn open(state: &StateDir) -> Result<Identity> {
+        let mut identity = Identity::resolve(state.workload_user()?.as_deref())?;
+        identity.state = Some(state.clone());
+        Ok(identity)
+    }
+
     /// The supervisor's own user, and the workload user named, if any. The node refuses to
     /// start when that user does not exist, is root, or cannot be switched to because the
     /// supervisor is not root, and on Linux when the supervisor is root and names none.
@@ -38,7 +48,35 @@ impl Identity {
             root,
             workload,
             temp_dir,
+            state: None,
         })
+    }
+
+    /// The account `{"mode": "system"}` work runs as, read from `private/system` on every call,
+    /// so `system disable` takes effect on the next request. A refusal is `permission_denied`
+    /// and says why.
+    pub fn system(&self) -> Result<System> {
+        if cfg!(windows) {
+            return Err(denied("system access is not supported on Windows"));
+        }
+        if !self.root {
+            return Err(denied(format!(
+                "system access needs a supervisor running as root (a sudo install); this one \
+                 runs as {:?}",
+                self.supervisor_user
+            )));
+        }
+        let access = match &self.state {
+            Some(state) => state.system()?,
+            None => None,
+        };
+        let access = access.ok_or_else(|| {
+            denied(
+                "system access is not enabled on this node; an administrator enables it with \
+                 `sudo happy-supervisor system enable`",
+            )
+        })?;
+        System::resolve(access, &self.supervisor_user)
     }
 
     pub fn workload(&self) -> Option<&Arc<Workload>> {
@@ -76,8 +114,178 @@ impl Identity {
             workload_user: self.workload.as_ref().map(|w| w.name().to_owned()),
             root: self.root,
             temp_dir: self.temp_dir.clone(),
+            system: self
+                .system()
+                .ok()
+                .map(|system| SystemInfo { user: system.user }),
         }
     }
+}
+
+fn denied(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::PermissionDenied, message)
+}
+
+/// The account that installs system-wide software, as `private/system` names it (policy.md,
+/// System access).
+#[derive(Debug)]
+pub struct System {
+    user: String,
+    /// The user the work runs as. `None` is root, which the supervisor is.
+    account: Option<Arc<Workload>>,
+    home: String,
+    path: Vec<String>,
+}
+
+impl System {
+    #[cfg(unix)]
+    fn resolve(access: SystemAccess, supervisor_user: &str) -> Result<System> {
+        let user = nix::unistd::User::from_name(&access.user)
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("cannot look up the system user {:?}: {err}", access.user),
+                )
+            })?
+            .ok_or_else(|| {
+                denied(format!(
+                    "system access runs as {:?}, which no longer exists; an administrator runs \
+                     `sudo happy-supervisor system enable` again",
+                    access.user
+                ))
+            })?;
+        let account = if user.uid.is_root() {
+            None
+        } else {
+            Some(Arc::new(Workload::resolve(
+                &user.name,
+                supervisor_user,
+                true,
+            )?))
+        };
+        Ok(System {
+            home: user.dir.to_string_lossy().into_owned(),
+            user: access.user,
+            account,
+            path: access.path,
+        })
+    }
+
+    #[cfg(windows)]
+    fn resolve(_access: SystemAccess, _supervisor_user: &str) -> Result<System> {
+        Err(denied("system access is not supported on Windows"))
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    /// The user to run as; `None` runs as the supervisor, which is root.
+    pub fn account(&self) -> Option<&Arc<Workload>> {
+        self.account.as_ref()
+    }
+
+    /// Gives a command the account's environment (api.md, Access): its `HOME`, `USER` and
+    /// `LOGNAME`, on macOS its `TMPDIR`, and the recorded directories at the front of `PATH`,
+    /// so package managers use the account's caches and find Homebrew.
+    pub fn apply_env(&self, env: &mut BTreeMap<String, String>) {
+        env.insert("HOME".to_owned(), self.home.clone());
+        for key in ["USER", "LOGNAME"] {
+            env.insert(key.to_owned(), self.user.clone());
+        }
+        if let Some(temp) = temp_dir(self.account.as_deref()) {
+            env.insert("TMPDIR".to_owned(), temp);
+        }
+        let path = env.get("PATH").map_or("", String::as_str);
+        let mut entries: Vec<&str> = self
+            .path
+            .iter()
+            .map(String::as_str)
+            .filter(|dir| !path.split(':').any(|entry| entry == *dir))
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        if !path.is_empty() {
+            entries.push(path);
+        }
+        let joined = entries.join(":");
+        env.insert("PATH".to_owned(), joined);
+    }
+}
+
+/// `happy-supervisor system enable`: records the account system access runs as, `user` or
+/// else root on Linux, where `apt-get` and `npm -g` need it, and on macOS Homebrew's owner,
+/// with Homebrew's directories for `PATH`: `brew` refuses to run as root, and Homebrew's
+/// `npm -g` installs into its prefix. Root on a Mac without Homebrew. Needs root.
+pub fn enable_system(state: &StateDir, user: Option<String>) -> Result<SystemAccess> {
+    let (supervisor_user, root) = current();
+    if cfg!(windows) || !root {
+        return Err(denied(format!(
+            "enabling system access needs root (sudo) on Linux or macOS; this runs as \
+             {supervisor_user:?}"
+        )));
+    }
+    let homebrew = if cfg!(target_os = "macos") {
+        homebrew(HOMEBREW)
+    } else {
+        None
+    };
+    let user = match user {
+        Some(user) => user,
+        None => user_name(homebrew.as_ref().map_or(0, |brew| brew.owner))?,
+    };
+    let access = SystemAccess {
+        user,
+        path: homebrew.map(|brew| brew.path).unwrap_or_default(),
+    };
+    System::resolve(access.clone(), &supervisor_user)?;
+    state.store_system(Some(&access))?;
+    Ok(access)
+}
+
+/// Homebrew's repository and prefix: Apple silicon's, then Intel's.
+const HOMEBREW: &[(&str, &str)] = &[
+    ("/opt/homebrew", "/opt/homebrew"),
+    ("/usr/local/Homebrew", "/usr/local"),
+];
+
+/// An installed Homebrew: who owns it, and its `bin` and `sbin`.
+#[derive(Debug, PartialEq, Eq)]
+struct Homebrew {
+    owner: u32,
+    path: Vec<String>,
+}
+
+/// The first of `candidates` whose repository holds `bin/brew`.
+fn homebrew(candidates: &[(&str, &str)]) -> Option<Homebrew> {
+    #[cfg(unix)]
+    for (repository, prefix) in candidates {
+        use std::os::unix::fs::MetadataExt as _;
+        let repository = std::path::Path::new(repository);
+        if !repository.join("bin/brew").is_file() {
+            continue;
+        }
+        let owner = std::fs::metadata(repository).ok()?.uid();
+        return Some(Homebrew {
+            owner,
+            path: vec![format!("{prefix}/bin"), format!("{prefix}/sbin")],
+        });
+    }
+    let _ = candidates;
+    None
+}
+
+/// The name of `uid`.
+fn user_name(uid: u32) -> Result<String> {
+    #[cfg(unix)]
+    return nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.name)
+        .ok_or_else(|| Error::invalid_params(format!("uid {uid} has no user name; pass --user")));
+    #[cfg(windows)]
+    Err(denied(format!("no user names on Windows (uid {uid})")))
 }
 
 /// `DARWIN_USER_TEMP_DIR` of the work user, as `getconf` run as that user prints it (the OS
@@ -449,6 +657,80 @@ mod tests {
             .to_owned();
         assert!(dir.starts_with("/var/folders/") || dir.starts_with("/private/var/folders/"));
         assert!(dir.ends_with("/T"), "{dir}");
+    }
+
+    #[test]
+    fn homebrew_is_the_first_repository_with_brew() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository = tmp.path().join("Homebrew");
+        std::fs::create_dir_all(repository.join("bin")).unwrap();
+        std::fs::write(repository.join("bin/brew"), "").unwrap();
+        let repository = repository.to_str().unwrap();
+        assert_eq!(
+            homebrew(&[("/hs-no-such-dir", "/a"), (repository, "/usr/local")]),
+            Some(Homebrew {
+                owner: nix::unistd::geteuid().as_raw(),
+                path: vec!["/usr/local/bin".to_string(), "/usr/local/sbin".to_string()],
+            })
+        );
+        assert_eq!(homebrew(&[("/hs-no-such-dir", "/a")]), None);
+    }
+
+    #[test]
+    fn a_system_command_gets_the_accounts_environment() {
+        let system = System {
+            user: "admin".to_string(),
+            account: None,
+            home: "/Users/admin".to_string(),
+            path: vec![
+                "/opt/homebrew/bin".to_string(),
+                "/opt/homebrew/sbin".to_string(),
+            ],
+        };
+        let mut env = BTreeMap::from([
+            (
+                "PATH".to_string(),
+                "/usr/bin:/opt/homebrew/sbin".to_string(),
+            ),
+            ("HOME".to_string(), "/home/happy-workload".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+        ]);
+        system.apply_env(&mut env);
+        let temp = env.remove("TMPDIR");
+        assert_eq!(cfg!(target_os = "macos"), temp.is_some(), "{temp:?}");
+        assert_eq!(
+            env,
+            BTreeMap::from([
+                (
+                    "PATH".to_string(),
+                    "/opt/homebrew/bin:/usr/bin:/opt/homebrew/sbin".to_string()
+                ),
+                ("HOME".to_string(), "/Users/admin".to_string()),
+                ("USER".to_string(), "admin".to_string()),
+                ("LOGNAME".to_string(), "admin".to_string()),
+                ("LANG".to_string(), "C.UTF-8".to_string()),
+            ])
+        );
+        let mut empty = BTreeMap::new();
+        system.apply_env(&mut empty);
+        assert_eq!(empty["PATH"], "/opt/homebrew/bin:/opt/homebrew/sbin");
+    }
+
+    #[test]
+    fn a_supervisor_that_is_not_root_refuses_system_access() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let (me, _) = current();
+        let err = Identity::resolve(None).unwrap().system().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::PermissionDenied);
+        assert_eq!(
+            err.message,
+            format!(
+                "system access needs a supervisor running as root (a sudo install); this one \
+                 runs as {me:?}"
+            )
+        );
     }
 
     #[test]

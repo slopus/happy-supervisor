@@ -11,6 +11,7 @@ use crate::error::{Error, ErrorKind, Result};
 const INSTALLATION_ID: &str = "installation-id";
 const CREDENTIALS: &str = "credentials.json";
 const WORKLOAD_USER: &str = "workload-user";
+const SYSTEM: &str = "system";
 
 /// A running node's hold on its state directory. Released on drop, or when the process ends.
 #[derive(Debug)]
@@ -169,6 +170,52 @@ impl StateDir {
         }
         sync_dir(&dir)
     }
+
+    /// `private/system`, which `happy-supervisor system enable` writes: the account
+    /// `{"mode": "system"}` work runs as. `None` when system access is not enabled.
+    pub fn system(&self) -> Result<Option<SystemAccess>> {
+        let path = self.private_dir().join(SYSTEM);
+        let text = match std::fs::read(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io_error(&path, err)),
+        };
+        serde_json::from_slice(&text)
+            .map(Some)
+            .map_err(|err| io_error(&path, err))
+    }
+
+    /// Enables system access with `access`, atomically and owner-only, or disables it.
+    pub fn store_system(&self, access: Option<&SystemAccess>) -> Result<()> {
+        let dir = self.private_dir();
+        let path = dir.join(SYSTEM);
+        match access {
+            Some(access) => {
+                let json = serde_json::to_vec_pretty(access).expect("system access serializes");
+                let temp = write_temp(&dir, &json, 0o600)?;
+                if let Err(err) = std::fs::rename(&temp, &path) {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(io_error(&path, err));
+                }
+            }
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(io_error(&path, err)),
+            },
+        }
+        sync_dir(&dir)
+    }
+}
+
+/// `private/system`: who `{"mode": "system"}` work runs as (policy.md, System access).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemAccess {
+    /// The account's user name, `root` included.
+    pub user: String,
+    /// Directories put at the front of a system command's `PATH`: Homebrew's `bin` and `sbin`.
+    pub path: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +378,26 @@ mod tests {
         );
         drop(held);
         assert!(state.lock().is_ok());
+    }
+
+    #[test]
+    fn system_access_is_stored_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateDir::open(Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(state.system().unwrap(), None);
+        let access = SystemAccess {
+            user: "admin".to_string(),
+            path: vec!["/opt/homebrew/bin".to_string()],
+        };
+        state.store_system(Some(&access)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("private/system")).unwrap(),
+            "{\n  \"user\": \"admin\",\n  \"path\": [\n    \"/opt/homebrew/bin\"\n  ]\n}"
+        );
+        assert_eq!(state.system().unwrap(), Some(access));
+        state.store_system(None).unwrap();
+        state.store_system(None).unwrap();
+        assert_eq!(state.system().unwrap(), None);
     }
 
     fn credentials(token: &str) -> Credentials {

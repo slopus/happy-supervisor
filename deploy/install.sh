@@ -14,6 +14,10 @@
 # 23.10 and later), loads a profile that lets bubblewrap create them. Where it cannot, it refuses
 # and says why. A user install refuses when bubblewrap is missing.
 #
+# With --system (`sh -s -- --system`, sudo only) the control plane may also run chosen commands as
+# the account that installs software: root on Linux, Homebrew's owner on macOS (docs/policy.md,
+# System access). `sudo happy-supervisor system enable|disable` changes that later.
+#
 # Run again without HAPPY_JOIN_TOKEN to upgrade a joined computer in place (the same sudo or not).
 # Uninstall (removes the service, its state, the binary and, for a system install, the
 # happy-workload user):
@@ -94,6 +98,19 @@ service_start() {
   else
     launchctl load -w "$UNIT"
   fi
+}
+
+system=
+case "${1:-}" in
+  "" | --uninstall) ;;
+  --system)
+    [ -n "$root" ] || fail "--system needs a sudo install: system access runs as root or another account, which only a supervisor running as root can switch to"
+    system=1
+    ;;
+  *) fail "unknown option $1: the options are --system and --uninstall" ;;
+esac
+enable_system() {
+  [ -z "$system" ] || "$BIN" system enable --state-dir "$STATE"
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -228,6 +245,7 @@ if [ -n "$upgrade" ]; then
   service_stop
   install -m 755 "$work/$file" "$BIN.new"
   mv -f "$BIN.new" "$BIN"
+  enable_system
   service_start
   echo "happy-supervisor upgraded to $version"
   exit 0
@@ -303,6 +321,7 @@ mv -f "$BIN.new" "$BIN"
 # shellcheck disable=SC2086 # $workload is two words or none.
 HAPPY_JOIN_TOKEN="$HAPPY_JOIN_TOKEN" "$BIN" join --url "$HAPPY_JOIN_URL" \
   ${HAPPY_NODE_NAME:+--name "$HAPPY_NODE_NAME"} --state-dir "$STATE" $workload
+enable_system
 
 mkdir -p "$(dirname "$UNIT")"
 if [ "$os" = linux ]; then

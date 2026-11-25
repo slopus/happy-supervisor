@@ -42,7 +42,7 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | `NodeCa` (the CA and `public/ca-bundle.pem`), `ProxyManager` (what every command proxy shares: streams, CA, resolver, the `net.denied` sink; `on_event`, `session_lost`), `egress::start` → `CommandProxy` (one command's HTTP and SOCKS5 proxies in `http`, `socks5`, its decisions and environment; proxy.md), `address` (the internal-address filter) | `proxy/*` | proxy track |
 | `TunnelManager` (`open` for `tcp.open`, `on_event`, `session_lost`): one task per tunnel moving bytes between its loopback socket and its stream | `tunnel` | proxy track |
 | `connect::main` (`happy-supervisor __connect <host> <port>`, the SSH `ProxyCommand` of an isolated command: one connection through the SOCKS5 proxy in `ALL_PROXY`, over stdio) | `connect` | Linux track |
-| `Identity` (the supervisor's user, whether it is root, and the `Workload` user every command and file operation runs as; `Workload::apply` makes a child that user), NodeInfo `identity` | `identity` | scaffold |
+| `Identity` (the supervisor's user, whether it is root, the `Workload` user every raw and sandboxed command and file operation runs as, and `System`, the account of system access read from `private/system`; `Workload::apply` makes a child that user), NodeInfo `identity` | `identity` | scaffold |
 | `node_info::collect(installation_id, name, &SandboxInfo, &Identity) -> NodeInfo` | `node_info/*` | node-info track |
 | `Node`, `dispatch(&Node, kind, body) -> Option<Result<Value>>`: a reply for every command kind, `None` for a `proxy.*` or `tcp.*` stream message | `dispatch` | scaffold wires kinds to the functions above |
 

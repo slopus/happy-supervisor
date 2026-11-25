@@ -101,6 +101,16 @@ that is not root runs its work as itself, which is already a separate user.
 The state directory's private part, credentials included, stays `0700` root, so neither raw nor
 sandboxed work can read it (policy.md, Fixed rules).
 
+6. Optionally, let the control plane run chosen commands as root, for `apt-get install` and
+   `npm install -g` (policy.md, System access):
+
+   ```
+   sudo happy-supervisor system enable --state-dir /var/lib/happy-supervisor
+   ```
+
+   It takes effect at once, without a restart, and `system disable` turns it off the same way.
+   A system command is root, so it can read the credentials too.
+
 ## Containers
 
 The supervisor may be a container's entry point, as `happy-supervisor run` or `serve`. bubblewrap
@@ -153,6 +163,11 @@ so scale it to zero for a revoked node.
 
 Run the supervisor as the user whose files its commands should see, for example from a
 LaunchAgent, or as root with `--workload-user`. Sandboxed commands need `/usr/bin/sandbox-exec`.
+
+A root supervisor can also run system access (policy.md, System access): `sudo happy-supervisor
+system enable --state-dir <dir>` makes it run as Homebrew's owner, so `brew install` and
+Homebrew's `npm install -g` work, or as root without Homebrew. A LaunchAgent install already runs
+raw commands as its user, who can run `brew` if they own Homebrew.
 
 ## Windows
 

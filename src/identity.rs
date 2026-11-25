@@ -105,7 +105,7 @@ fn temp_dir(_workload: Option<&Workload>) -> Option<String> {
 }
 
 /// One absolute path on one line, without its trailing separator.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn parse_temp_dir(out: &str) -> Option<String> {
     let line = out.strip_suffix('\n').unwrap_or(out);
     let path = line.trim_end_matches('/');

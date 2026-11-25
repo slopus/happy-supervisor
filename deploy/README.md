@@ -156,7 +156,7 @@ triggers and `release.yml` do.
 * **0.2.6.** A policy may set `filesystem.writeTemp` to let a command write the work user's own
   temp directory, which NodeInfo reports as `identity.tempDir` (macOS: `DARWIN_USER_TEMP_DIR`).
   On macOS, file operations run under isolated policies.
-* **Unreleased.** System access: `{ "mode": "system" }` runs a command, file operation or watch
+* **0.2.7.** System access: `{ "mode": "system" }` runs a command, file operation or watch
   as the account that installs software (root on Linux, Homebrew's owner on macOS), once an
   administrator runs `sudo happy-supervisor system enable` or installs with `install.sh
   --system`. NodeInfo reports it as `identity.system`.

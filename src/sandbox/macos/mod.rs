@@ -74,6 +74,7 @@ fn run_true() -> std::result::Result<(), String> {
     let text = |err: Error| err.to_string();
     let io = |err: std::io::Error| err.to_string();
     let policy = Policy {
+        write_temp: false,
         read: rules(Default::Deny, &["/usr/bin/true"], &[]),
         write: rules(Default::Deny, &[], &[]),
         network: Network::Host {
@@ -148,15 +149,16 @@ pub fn prepare(plan: &Plan, _job: &Job) -> Result<Prepared> {
 }
 
 /// The network a profile allows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Net {
     Host {
         local_bind: bool,
         unix_sockets: bool,
     },
-    /// Outbound TCP to the command proxy's two loopback ports and nothing else.
+    /// Outbound TCP to the command proxy's two loopback ports and nothing else; with no
+    /// proxy (a file operation or watch), nothing at all.
     Isolated {
-        proxy_ports: [u16; 2],
+        proxy_ports: Vec<u16>,
         local_bind: bool,
         unix_sockets: bool,
     },
@@ -181,15 +183,17 @@ impl Net {
                     unix_sockets,
                     ..
                 },
-                Some(NetPlan { http, socks }),
+                proxies,
             ) => Ok(Net::Isolated {
-                proxy_ports: [loopback_port(http)?, loopback_port(socks)?],
+                proxy_ports: match proxies {
+                    Some(NetPlan { http, socks }) => {
+                        vec![loopback_port(http)?, loopback_port(socks)?]
+                    }
+                    None => Vec::new(),
+                },
                 local_bind,
                 unix_sockets,
             }),
-            (Network::Isolated { .. }, None) => Err(Error::sandbox_unavailable(
-                "isolated networking needs the command proxy",
-            )),
         }
     }
 }
@@ -419,6 +423,7 @@ mod tests {
 
     fn repo_policy() -> ResolvedPolicy {
         let policy = Policy {
+            write_temp: false,
             read: rules(
                 Default::Deny,
                 &["/usr", "/Users/me/repo"],
@@ -446,7 +451,7 @@ mod tests {
 
     fn isolated(local_bind: bool, unix_sockets: bool) -> Net {
         Net::Isolated {
-            proxy_ports: [3128, 1080],
+            proxy_ports: vec![3128, 1080],
             local_bind,
             unix_sockets,
         }
@@ -505,6 +510,7 @@ mod tests {
         std::fs::create_dir(home.join(".ssh")).unwrap();
         let at = |rel: &str| home.join(rel).to_str().unwrap().to_string();
         let policy = Policy {
+            write_temp: false,
             read: rules(Default::Allow, &[&at(".ssh/known_hosts")], &[&at(".ssh")]),
             write: rules(Default::Allow, &[&at(".ssh/known_hosts")], &[&at(".ssh")]),
             network: Network::Host {
@@ -592,6 +598,19 @@ mod tests {
 (deny mach-lookup (global-name "com.apple.dnssd.service"))
 "#
         );
+        // A file operation has no proxy: isolated is then no network at all.
+        assert_eq!(
+            network_text(Net::Isolated {
+                proxy_ports: Vec::new(),
+                local_bind: false,
+                unix_sockets: false,
+            }),
+            r#"; network
+(deny network*)
+(deny network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+(deny mach-lookup (global-name "com.apple.dnssd.service"))
+"#
+        );
     }
 
     #[test]
@@ -615,14 +634,18 @@ mod tests {
             )
             .unwrap(),
             Net::Isolated {
-                proxy_ports: [5001, 5002],
+                proxy_ports: vec![5001, 5002],
                 local_bind: false,
                 unix_sockets: true,
             }
         );
         assert_eq!(
-            Net::new(&isolated, None).unwrap_err(),
-            Error::sandbox_unavailable("isolated networking needs the command proxy")
+            Net::new(&isolated, None).unwrap(),
+            Net::Isolated {
+                proxy_ports: Vec::new(),
+                local_bind: false,
+                unix_sockets: true,
+            }
         );
         assert_eq!(
             Net::new(
@@ -659,6 +682,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let policy = Policy {
+            write_temp: false,
             read: rules(Default::Allow, &[], &[]),
             write: rules(
                 Default::Deny,

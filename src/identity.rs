@@ -16,6 +16,7 @@ pub struct Identity {
     supervisor_user: String,
     root: bool,
     workload: Option<Arc<Workload>>,
+    temp_dir: Option<String>,
 }
 
 impl Identity {
@@ -31,15 +32,24 @@ impl Identity {
             None => None,
             Some(name) => Some(Arc::new(Workload::resolve(name, &supervisor_user, root)?)),
         };
+        let temp_dir = temp_dir(workload.as_deref());
         Ok(Identity {
             supervisor_user,
             root,
             workload,
+            temp_dir,
         })
     }
 
     pub fn workload(&self) -> Option<&Arc<Workload>> {
         self.workload.as_ref()
+    }
+
+    /// The work user's own temp directory, NodeInfo `identity.tempDir`: on macOS its
+    /// `DARWIN_USER_TEMP_DIR`, where the developer tools' shims cache their lookups whatever
+    /// `TMPDIR` says. `None` elsewhere, or when it could not be read.
+    pub fn temp_dir(&self) -> Option<&str> {
+        self.temp_dir.as_deref()
     }
 
     /// What NodeInfo `defaultEnv` says differently with a workload user: its `HOME` and `USER`.
@@ -65,8 +75,45 @@ impl Identity {
             supervisor_user: self.supervisor_user.clone(),
             workload_user: self.workload.as_ref().map(|w| w.name().to_owned()),
             root: self.root,
+            temp_dir: self.temp_dir.clone(),
         }
     }
+}
+
+/// `DARWIN_USER_TEMP_DIR` of the work user, as `getconf` run as that user prints it (the OS
+/// derives it from the uid and creates it), without its trailing separator.
+#[cfg(target_os = "macos")]
+fn temp_dir(workload: Option<&Workload>) -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new("/usr/bin/getconf");
+    command
+        .arg("DARWIN_USER_TEMP_DIR")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    run_as(&mut command, workload, None).ok()?;
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_temp_dir(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn temp_dir(_workload: Option<&Workload>) -> Option<String> {
+    None
+}
+
+/// One absolute path on one line, without its trailing separator.
+#[cfg(any(target_os = "macos", test))]
+fn parse_temp_dir(out: &str) -> Option<String> {
+    let line = out.strip_suffix('\n').unwrap_or(out);
+    let path = line.trim_end_matches('/');
+    let normal = path
+        .split('/')
+        .skip(1)
+        .all(|c| !matches!(c, "" | "." | ".."));
+    (path.starts_with('/') && normal && !path.contains(['\n', '\0'])).then(|| path.to_owned())
 }
 
 /// On Linux, work never runs as root (SECURITY.md).
@@ -378,6 +425,30 @@ mod tests {
         assert_eq!(info.root, uid.is_root());
         let name = nix::unistd::User::from_uid(uid).unwrap().unwrap().name;
         assert_eq!(info.supervisor_user, name);
+    }
+
+    #[test]
+    fn a_temp_dir_is_one_normalized_absolute_path() {
+        assert_eq!(
+            parse_temp_dir("/var/folders/6p/y937xtys6_716zvck3p0g3hw0000cj/T/\n").as_deref(),
+            Some("/var/folders/6p/y937xtys6_716zvck3p0g3hw0000cj/T")
+        );
+        assert_eq!(parse_temp_dir("/tmp").as_deref(), Some("/tmp"));
+        for bad in ["", "\n", "/", "T/", "/var/../tmp/", "/var//T/", "/a\n/b\n"] {
+            assert_eq!(parse_temp_dir(bad), None, "{bad:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_temp_dir_is_the_user_temp_dir() {
+        let dir = Identity::resolve(None)
+            .unwrap()
+            .temp_dir()
+            .unwrap()
+            .to_owned();
+        assert!(dir.starts_with("/var/folders/") || dir.starts_with("/private/var/folders/"));
+        assert!(dir.ends_with("/T"), "{dir}");
     }
 
     #[test]

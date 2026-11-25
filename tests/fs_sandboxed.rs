@@ -326,3 +326,55 @@ async fn a_sandboxed_rename_moves_a_symlink_not_its_target() {
     );
     assert_eq!(std::fs::read(tree.path("secret/key")).unwrap(), b"hunter2");
 }
+
+/// A file operation never gets a command proxy, so an isolated policy is no network at all, and
+/// the operation still runs (the cluster sends isolated policies with every restricted call).
+#[tokio::test]
+async fn an_isolated_policy_still_reads_and_writes_files() {
+    use happy_supervisor::policy::{Default, HostRules, Network};
+
+    require_sandbox();
+    let tree = Tree::new();
+    let mut read = sandbox::baseline_read();
+    read.push(tree.path("granted").to_str().unwrap().to_string());
+    let mut policy = allow_list(
+        read,
+        [tree.path("granted/out").to_str().unwrap().to_string()],
+        false,
+        false,
+    );
+    policy.network = Network::Isolated {
+        egress: HostRules {
+            default: Default::Deny,
+            allow: vec![],
+            deny: vec![],
+        },
+        ports: Some(vec![]),
+        local_bind: false,
+        unix_sockets: false,
+    };
+    let confinement = || {
+        Confinement::Sandboxed(
+            ResolvedPolicy::resolve(&policy, &tree.path("granted/.state")).unwrap(),
+        )
+    };
+    let request = FsRequest::Read(FsReadParams {
+        path: abs(&tree.path("granted/readme")),
+        offset: 0,
+        length: None,
+    });
+    match fs::handle(request, confinement()).await.unwrap() {
+        FsResponse::Read(FsReadResult { data, .. }) => assert_eq!(data.into_vec(), b"public"),
+        other => panic!("read answered {other:?}"),
+    }
+    let request = FsRequest::Write(FsWriteParams {
+        path: abs(&tree.path("granted/out/result")),
+        data: Bytes::new(b"new".to_vec()),
+        mode: WriteMode::Overwrite,
+    });
+    fs::handle(request, confinement()).await.unwrap();
+    assert_eq!(
+        std::fs::read(tree.path("granted/out/result")).unwrap(),
+        b"new"
+    );
+}

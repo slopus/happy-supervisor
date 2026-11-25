@@ -57,6 +57,7 @@ fn paths(list: &[&Path]) -> Vec<PathBuf> {
 
 fn policy() -> P {
     P(Policy {
+        write_temp: false,
         read: RuleSet {
             default: Default::Deny,
             allow: sandbox::baseline_read()
@@ -153,8 +154,13 @@ fn run(policy: &P, state: &Path, proxies: Proxies, argv: &[&str]) -> Outcome {
     if net.is_some() {
         env.insert("http_proxy".to_string(), format!("http://{}", proxies.http));
     }
+    let mut resolved = ResolvedPolicy::resolve(&policy.0, state).unwrap();
+    // As the dispatcher does: `writeTemp` grants the user's temp directory.
+    if policy.0.write_temp {
+        resolved.allow_write_temp(Path::new(&temp_dir())).unwrap();
+    }
     let job = Job {
-        policy: ResolvedPolicy::resolve(&policy.0, state).unwrap(),
+        policy: resolved,
         op: JobOp::Exec {
             argv: Argv::try_from(argv.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
             cwd: AbsPath::try_from("/").unwrap(),
@@ -868,6 +874,42 @@ fn programs_run_on_the_baseline() {
             "{argv:?}"
         );
     }
+}
+
+/// The supervisor user's `DARWIN_USER_TEMP_DIR`, as NodeInfo `identity.tempDir` reports it.
+fn temp_dir() -> String {
+    happy_supervisor::identity::Identity::resolve(None)
+        .unwrap()
+        .temp_dir()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn write_temp_grants_the_user_temp_dir() {
+    let tree = Tree::new();
+    let proxies = Proxies {
+        http: "127.0.0.1:9".parse().unwrap(),
+        socks: "127.0.0.1:9".parse().unwrap(),
+    };
+    let file = format!("{}/hs-write-temp-{}", temp_dir(), std::process::id());
+    let script = sh(format!("echo x > {file} && rm {file} && echo wrote"));
+    let argv: Vec<&str> = script.iter().map(String::as_str).collect();
+    assert_eq!(run(&policy(), &tree.path("state"), proxies, &argv), Denied);
+    let mut granted = policy();
+    granted.0.write_temp = true;
+    assert_eq!(
+        run(&granted, &tree.path("state"), proxies, &argv),
+        ok("wrote\n")
+    );
+    // An isolated exec gets it too.
+    let mut isolated = policy().isolated();
+    isolated.0.write_temp = true;
+    assert_eq!(
+        run(&isolated, &tree.path("state"), proxies, &argv),
+        ok("wrote\n")
+    );
+    assert!(!Path::new(&file).exists());
 }
 
 fn user_name() -> String {

@@ -574,6 +574,7 @@ fn run_true(bwrap: &Bwrap) -> Result<()> {
             Error::sandbox_unavailable("there is no `true` program to test the sandbox with")
         })?;
     let policy = Policy {
+        write_temp: false,
         read: RuleSet {
             default: Default::Deny,
             allow: super::baseline_read()

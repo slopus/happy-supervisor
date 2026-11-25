@@ -586,6 +586,8 @@ impl<'de> Deserialize<'de> for Bytes {
 // ---------------------------------------------------------------------------------------------
 // Access
 
+// One per operation, parsed once at the dispatcher: boxing the policy would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Access {
@@ -1688,6 +1690,10 @@ pub struct IdentityInfo {
     pub workload_user: Option<String>,
     /// The supervisor runs as root (Unix) or with an elevated administrator token (Windows).
     pub root: bool,
+    /// The work user's own temp directory (macOS: its `DARWIN_USER_TEMP_DIR`), which a
+    /// policy's `filesystem.writeTemp` makes writable. `null` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2166,7 +2172,8 @@ mod tests {
             IdentityInfo {
                 supervisor_user: "root".to_string(),
                 workload_user: Some("happy-workload".to_string()),
-                root: true
+                root: true,
+                temp_dir: None
             }
         );
         assert_eq!(

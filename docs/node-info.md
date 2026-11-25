@@ -161,7 +161,7 @@ What this node can enforce for `{ "mode": "sandboxed" }` commands (policy.md).
 `baselineRead` by platform, keeping only paths that exist:
 
 * Linux: `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/etc`, `/proc`, `/sys/devices/system/cpu`, `/opt`. (`/proc` because `/proc/self` resolves to one process and its children would lose it.)
-* macOS: `/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/private/etc`, `/private/var/db/timezone`, `/private/var/select`, `/dev/fd`, `/dev/tty`, `/opt/homebrew`, and the app bundle of the selected developer directory (`/Applications/Xcode.app` by default). `/bin/sh` reads `/private/var/select/sh`. `/usr/bin/git`, `/usr/bin/python3` and the other developer shims run their tool from the Xcode bundle (Command Line Tools live under `/Library`). The shims also cache their lookups in `TMPDIR`. They work without writing it, only slower.
+* macOS: `/usr`, `/bin`, `/sbin`, `/System`, `/Library`, `/private/etc`, `/private/var/db/timezone`, `/private/var/select`, `/dev/fd`, `/dev/tty`, `/opt/homebrew`, and the app bundle of the selected developer directory (`/Applications/Xcode.app` by default). `/bin/sh` reads `/private/var/select/sh`. `/usr/bin/git`, `/usr/bin/python3` and the other developer shims run their tool from the Xcode bundle (Command Line Tools live under `/Library`). The shims cache their lookups in the user's `DARWIN_USER_TEMP_DIR` whatever `TMPDIR` says, and a policy cannot redirect it. They work without writing it, but each call then prints two errors and takes seconds longer; `filesystem.writeTemp` (policy.md) and `identity.tempDir` exist for this.
 * Windows: empty.
 
 ### `identity`
@@ -173,6 +173,7 @@ Who the supervisor runs as, and who its work runs as (policy.md, Workload user).
 | `supervisorUser` | string | The supervisor process's user name (its uid on Unix if it has none). |
 | `workloadUser` | string \| null | With `--workload-user`, the user every command, file operation and watch runs as. Never root: the node does not start with a root workload user. `null` when work runs as `supervisorUser`. |
 | `root` | bool | The supervisor runs as root (Unix) or with an elevated administrator token (Windows). With `workloadUser` null, its work does too. On Linux `root` with `workloadUser` null never happens: the supervisor refuses to start that way. |
+| `tempDir` | string \| null | The work user's own temp directory, without a trailing separator. macOS: its `DARWIN_USER_TEMP_DIR` (`/var/folders/6p/y937…/T`), which the OS derives from the uid, read at startup by running `/usr/bin/getconf DARWIN_USER_TEMP_DIR` as that user. `null` on Linux and Windows, or when it cannot be read. A policy's `filesystem.writeTemp` makes it writable (policy.md). It is newer than the key registry, so it travels as text (api.md). |
 
 So work runs as root exactly when `workloadUser` is null and `root` is true, which only macOS and
 Windows allow.

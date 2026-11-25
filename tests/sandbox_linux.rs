@@ -78,6 +78,7 @@ impl Tree {
 
     fn resolve(&self, read: RuleSet, write: RuleSet, network: Network) -> ResolvedPolicy {
         let policy = Policy {
+            write_temp: false,
             read,
             write,
             network,

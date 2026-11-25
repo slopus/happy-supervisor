@@ -573,6 +573,9 @@ Every exec, file and watch command carries `access`. It is one of two shapes:
     "network": { "mode": "host", "localBind": false, "unixSockets": false } } }
 ```
 
+`filesystem.writeTemp: true`, optional, also makes the work user's temp directory writable
+(policy.md, `writeTemp`).
+
 `raw` runs with the supervisor's full rights, or with its workload user's when it has one
 (policy.md, Workload user; NodeInfo `identity`). `sandboxed` runs confined by the policy,
 enforced by the operating system, as the same user. The full policy rules are in policy.md. A node that cannot enforce

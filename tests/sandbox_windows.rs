@@ -121,6 +121,7 @@ impl Grants {
             deny: deny.to_vec(),
         };
         Policy {
+            write_temp: false,
             read: rules(Default::Deny, &self.read, &self.read_deny),
             write: rules(self.write_default, &self.write, &self.write_deny),
             network: match self.net {

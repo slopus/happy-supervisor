@@ -22,8 +22,8 @@ Seatbelt on macOS, and a restricted token with ACLs and a firewall on Windows.
 }
 ```
 
-Every field shown is required. There is no implicit grant and no implicit denial except the two
-fixed rules in "Fixed rules".
+Every field shown is required except `filesystem.writeTemp` (below). There is no implicit grant
+and no implicit denial except the two fixed rules in "Fixed rules".
 
 ## Filesystem
 
@@ -51,6 +51,20 @@ Paths are absolute and normalized (no `.` or `..` or empty components, no NUL); 
 separator is ignored. Each list holds at most 1024 paths. Paths are matched after resolving
 symlinks in the policy's own entries when they exist; a path that does not exist is matched by
 name.
+
+### `writeTemp`
+
+`filesystem.writeTemp` is optional and defaults to `false`. With `true`, the work user's own temp
+directory, NodeInfo `identity.tempDir` (node-info.md), is writable as if it were in
+`write.allow`: a `write.deny` entry at the same path still wins, deeper entries still apply, a
+`read.deny` that decides it is the usual contradiction (`invalid_params`), and inside the state
+directory it grants nothing. On a node whose `tempDir` is `null` it grants nothing. A node older
+than this field refuses it as an unknown key (api.md, Encoding), so send it only to a node that
+reports `tempDir`.
+
+It exists for macOS, where the developer tools' shims (`/usr/bin/git`, `/usr/bin/python3`) and
+other system code write to `DARWIN_USER_TEMP_DIR` whatever `TMPDIR` says, and the policy
+author cannot know that path.
 
 ### Paths that do not exist
 
@@ -139,6 +153,8 @@ How isolated networking works (proxy.md, "Egress proxy"):
   it cannot connect to its own listeners. The macOS probe lists this in `gaps`.
 * UDP (including direct DNS) and other protocols have no route in isolated mode. Name resolution
   happens in the proxy.
+* A file operation or watch has no proxy: under an isolated policy it has no network at all, and
+  still runs. Only an exec gets the two proxies.
 * Hosts listed in the command's credential `proxy.hosts` (proxy.md) go to the control plane, which
   can inject credentials. They must also pass `egress` step 1; their addresses are the control
   plane's to resolve and check.

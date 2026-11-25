@@ -83,6 +83,9 @@ impl Network {
 pub struct Policy {
     pub read: RuleSet,
     pub write: RuleSet,
+    /// `filesystem.writeTemp`: the work user's own temp directory (NodeInfo `identity.tempDir`)
+    /// is writable, as if it were in `write.allow`. Nothing where the node reports none.
+    pub write_temp: bool,
     pub network: Network,
 }
 
@@ -98,6 +101,13 @@ struct PolicyWire {
 struct FilesystemWire {
     read: RuleSet,
     write: RuleSet,
+    /// Optional, and omitted when false, so a policy without it means what it always did.
+    #[serde(
+        default,
+        rename = "writeTemp",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    write_temp: bool,
 }
 
 impl TryFrom<PolicyWire> for Policy {
@@ -107,6 +117,7 @@ impl TryFrom<PolicyWire> for Policy {
         let policy = Policy {
             read: wire.filesystem.read,
             write: wire.filesystem.write,
+            write_temp: wire.filesystem.write_temp,
             network: wire.network,
         };
         policy.validate()?;
@@ -120,6 +131,7 @@ impl From<Policy> for PolicyWire {
             filesystem: FilesystemWire {
                 read: policy.read,
                 write: policy.write,
+                write_temp: policy.write_temp,
             },
             network: policy.network,
         }
@@ -588,6 +600,21 @@ impl ResolvedPolicy {
         &self.state_dir
     }
 
+    /// Makes `dir`, the work user's temp directory, writable as a `write.allow` entry would
+    /// (`filesystem.writeTemp`): a deny entry at the same path still wins, a deeper one still
+    /// applies, and a `read.deny` that decides it is the same contradiction. A directory inside
+    /// the state directory is not allowed.
+    pub fn allow_write_temp(&mut self, dir: &Path) -> Result<()> {
+        let dir = resolve_path(dir);
+        if dir.starts_with(&self.state_dir) {
+            return Ok(());
+        }
+        self.write.entries.entry(dir).or_insert(true);
+        check_contradiction(&self.read, &self.write)?;
+        self.layers = self.compute_layers();
+        Ok(())
+    }
+
     /// Lets the operation read one existing file the policy did not list: the CA bundle of a
     /// command with a credential proxy (proxy.md). A missing file, or one inside the state
     /// directory, is not allowed.
@@ -666,6 +693,7 @@ where
     let mut readable: Vec<PathBuf> = read.into_iter().map(|p| p.as_ref().to_path_buf()).collect();
     readable.extend(write.iter().cloned());
     Policy {
+        write_temp: false,
         read: RuleSet {
             default: Default::Deny,
             allow: readable,
@@ -697,6 +725,7 @@ mod tests {
 
     fn policy(read: RuleSet, write: RuleSet) -> Policy {
         Policy {
+            write_temp: false,
             read,
             write,
             network: host_network(),
@@ -810,6 +839,7 @@ mod tests {
         assert_eq!(
             parsed,
             Policy {
+                write_temp: false,
                 read: rules(Default::Allow, &[], &["/home/me/.ssh", "/home/me/.aws"]),
                 write: rules(
                     Default::Deny,
@@ -832,6 +862,13 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_value(&parsed).unwrap(), literal);
+
+        // `writeTemp` is optional: absent is false, and false is not written.
+        let mut with_temp = literal.clone();
+        with_temp["filesystem"]["writeTemp"] = true.into();
+        let parsed: Policy = serde_json::from_value(with_temp.clone()).unwrap();
+        assert!(parsed.write_temp);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), with_temp);
 
         let host: Network = serde_json::from_value(
             serde_json::json!({ "mode": "host", "localBind": true, "unixSockets": true }),
@@ -1055,6 +1092,48 @@ mod tests {
         assert!(!resolved.can_read(&private.join("proxy-ca.key")));
         let paths: Vec<PathBuf> = resolved.layers().into_iter().map(|l| l.path).collect();
         assert_eq!(paths, [private, bundle]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_temp_dir_becomes_writable_unless_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (state, temp) = (root.join("state"), root.join("T"));
+        std::fs::create_dir(&temp).unwrap();
+        let p = policy(
+            rules(Default::Allow, &[], &[]),
+            rules(Default::Deny, &[], &[temp.join("denied").to_str().unwrap()]),
+        );
+        let mut resolved = ResolvedPolicy::resolve(&p, &state).unwrap();
+        assert!(!resolved.can_write(&temp.join("xcrun_db")));
+        resolved.allow_write_temp(&temp).unwrap();
+        assert!(resolved.can_write(&temp.join("xcrun_db")));
+        assert!(!resolved.can_write(&temp.join("denied/a")));
+        assert!(!resolved.can_write(&root.join("other")));
+
+        // A deny entry at the temp dir itself still wins.
+        let p = policy(
+            rules(Default::Allow, &[], &[]),
+            rules(Default::Deny, &[], &[temp.to_str().unwrap()]),
+        );
+        let mut resolved = ResolvedPolicy::resolve(&p, &state).unwrap();
+        resolved.allow_write_temp(&temp).unwrap();
+        assert!(!resolved.can_write(&temp.join("xcrun_db")));
+
+        // So does the state directory, and a read denial is the usual contradiction.
+        let mut resolved = ResolvedPolicy::resolve(&p, &state).unwrap();
+        resolved.allow_write_temp(&state.join("T")).unwrap();
+        assert!(!resolved.can_write(&state.join("T/x")));
+        let p = policy(
+            rules(Default::Allow, &[], &[temp.to_str().unwrap()]),
+            rules(Default::Deny, &[], &[]),
+        );
+        let mut resolved = ResolvedPolicy::resolve(&p, &state).unwrap();
+        assert_eq!(
+            resolved.allow_write_temp(&temp).unwrap_err().kind,
+            ErrorKind::InvalidParams
+        );
     }
 
     fn hosts(default: Default, allow: &[&str], deny: &[&str]) -> HostRules {

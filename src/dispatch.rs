@@ -1,6 +1,7 @@
 //! The message boundary: parses each command's body, resolves `access` once, and calls the
 //! module that owns the command. Stream messages from the control plane go to the proxy.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -139,12 +140,21 @@ impl Node {
             Access::Sandboxed { policy } => {
                 self.sandbox.require_available()?;
                 let hidden = self.state.private_dir();
-                let resolved =
-                    tokio::task::spawn_blocking(move || ResolvedPolicy::resolve(&policy, &hidden))
-                        .await
-                        .map_err(|err| {
-                            Error::new(ErrorKind::Io, format!("policy resolution failed: {err}"))
-                        })??;
+                let temp = policy
+                    .write_temp
+                    .then(|| self.identity.temp_dir().map(PathBuf::from))
+                    .flatten();
+                let resolved = tokio::task::spawn_blocking(move || {
+                    let mut resolved = ResolvedPolicy::resolve(&policy, &hidden)?;
+                    if let Some(temp) = temp {
+                        resolved.allow_write_temp(&temp)?;
+                    }
+                    Ok::<_, Error>(resolved)
+                })
+                .await
+                .map_err(|err| {
+                    Error::new(ErrorKind::Io, format!("policy resolution failed: {err}"))
+                })??;
                 Ok(Confinement::Sandboxed(resolved))
             }
         }

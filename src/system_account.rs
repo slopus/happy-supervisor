@@ -41,9 +41,8 @@ pub fn provision() -> Result<()> {
     std::os::unix::fs::chown(PREFIX, Some(uid), Some(gid))
         .map_err(|err| io(format!("cannot give {PREFIX} to {USER}: {err}")))?;
     let npmrc = user.dir.join(".npmrc");
-    write(&npmrc, &format!("prefix={PREFIX}\n"))?;
-    std::os::unix::fs::chown(&npmrc, Some(uid), Some(gid))
-        .map_err(|err| io(format!("cannot give {} to {USER}: {err}", npmrc.display())))?;
+    write_as(&npmrc, &format!("prefix={PREFIX}\n"), uid, gid)
+        .map_err(|err| io(format!("cannot write {}: {err}", npmrc.display())))?;
     write(Path::new(PROFILE), PROFILE_SCRIPT)?;
     deny_cron()
 }
@@ -118,6 +117,37 @@ fn write(path: &Path, contents: &str) -> Result<()> {
         .map_err(|err| io(format!("cannot write {}: {err}", path.display())))
 }
 
+/// Writes `contents` to `path`, in a directory the account owns, as a new file of the account's
+/// that replaces whatever `path` is. Never through a link the account put there, which would
+/// have root write, and give the account, any file it points at.
+fn write_as(path: &Path, contents: &str, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let partial = path.with_extension("happy-supervisor");
+    let create = || {
+        std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o644)
+            .open(&partial)
+    };
+    let mut file = match create() {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&partial)?;
+            create()?
+        }
+        file => file?,
+    };
+    let written = std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+        .and_then(|()| file.write_all(contents.as_bytes()))
+        .and_then(|()| std::fs::rename(&partial, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    written
+}
+
 /// Keeps the account from leaving cron jobs that outlive `system disable`.
 fn deny_cron() -> Result<()> {
     let current = match std::fs::read_to_string(CRON_DENY) {
@@ -164,6 +194,28 @@ fn io(message: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_npmrc_replaces_a_link_instead_of_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "root's\n").unwrap();
+        let npmrc = dir.path().join(".npmrc");
+        std::os::unix::fs::symlink(&target, &npmrc).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".npmrc.happy-supervisor")).unwrap();
+        let (uid, gid) = (
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        );
+        write_as(&npmrc, "prefix=/opt/happy-system/npm\n", uid, gid).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "root's\n");
+        assert!(std::fs::symlink_metadata(&npmrc).unwrap().is_file());
+        assert_eq!(
+            std::fs::read_to_string(&npmrc).unwrap(),
+            "prefix=/opt/happy-system/npm\n"
+        );
+        assert!(!dir.path().join(".npmrc.happy-supervisor").exists());
+    }
 
     #[test]
     fn a_process_is_the_accounts_by_any_of_its_uids() {

@@ -143,6 +143,32 @@ which is what makes a new version healthy.
 
 ## Release keys
 
-`release::RELEASE_KEYS` holds the release key that the publish trigger signs with (minisign key ID
-`349DDAD36F92423A`; deploy/README.md, Google Cloud). Boot never updates itself, so to change
-these keys, every node needs a new boot from an installer.
+`release::RELEASE_KEYS` (`boot/src/release.rs`) is a fixed list of minisign public keys. A build
+verifies when any one of them signed its `SHA256SUMS`. The first is the release key that the
+publish trigger signs with (minisign key ID `349DDAD36F92423A`; deploy/README.md, Google Cloud).
+
+Boot never updates itself, so the list it was built with is the list a node trusts until an
+installer replaces boot. A second, backup key lets the release key be replaced (lost, leaked,
+rotated) without that: sign releases with the backup key instead, and every boot already trusts
+them.
+
+The backup key is made offline, by the key's owner, on a machine that never holds the release
+key, and its secret key never goes online:
+
+```
+minisign -G -p happy-supervisor-backup.pub -s happy-supervisor-backup.key
+```
+
+minisign asks for a password for the secret key. Keep `happy-supervisor-backup.key` and its
+password offline. The public key is the second line of `happy-supervisor-backup.pub` (it starts
+with `RW`). Add it as the second entry of `RELEASE_KEYS`, and it takes effect for every boot
+built from then on:
+
+```rust
+pub const RELEASE_KEYS: &[&str] = &[
+    "RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr",
+    "RW…the backup public key…",
+];
+```
+
+Boots built before that trust the release key alone.

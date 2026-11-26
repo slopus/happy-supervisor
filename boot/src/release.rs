@@ -7,8 +7,10 @@ use std::path::Path;
 
 use crate::minisign::{self, PublicKey};
 
-/// The release keys this boot trusts, compiled in: it never runs a build no key here signed.
-/// The first is the release key the publish trigger signs with (deploy/README.md, Google Cloud).
+/// The release keys this boot trusts, compiled in: a build runs when any one of them signed it,
+/// and never otherwise. The first is the release key the publish trigger signs with
+/// (deploy/README.md, Google Cloud). An offline backup key goes after it (docs/boot.md, Release
+/// keys), so the primary can be replaced without a new boot on every node.
 pub const RELEASE_KEYS: &[&str] = &["RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr"];
 
 /// [`RELEASE_KEYS`], parsed.
@@ -130,6 +132,35 @@ mod tests {
         assert_eq!(FILE, "happy-supervisor-macos-aarch64");
         #[cfg(all(windows, target_arch = "x86_64"))]
         assert_eq!(FILE, "happy-supervisor-windows-x86_64.exe");
+    }
+
+    #[test]
+    fn a_build_signed_by_any_one_trusted_key_verifies() {
+        let (primary, backup, stranger) = (Signer::new(), Signer::new(), Signer::new());
+        let keys = [primary.public(), backup.public()];
+        let sums = format!("{}  {FILE}\n", hex(&sha256(b"supervisor")));
+        for signer in [&primary, &backup] {
+            let sig = signer.sign(sums.as_bytes(), "happy-supervisor 1.0.0");
+            assert_eq!(
+                expected(&keys, "1.0.0", sums.as_bytes(), &sig),
+                Ok(sha256(b"supervisor"))
+            );
+        }
+        let sig = stranger.sign(sums.as_bytes(), "happy-supervisor 1.0.0");
+        assert_eq!(
+            expected(&keys, "1.0.0", sums.as_bytes(), &sig),
+            Err(
+                "SHA256SUMS of 1.0.0: signature: made with a key that is not the release key"
+                    .to_owned()
+            )
+        );
+        // Every compiled-in key parses, and no two share a key ID.
+        let compiled = release_keys();
+        assert_eq!(compiled.len(), RELEASE_KEYS.len());
+        let mut ids: Vec<String> = compiled.iter().map(PublicKey::id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), RELEASE_KEYS.len());
     }
 
     #[test]

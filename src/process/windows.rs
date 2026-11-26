@@ -25,6 +25,12 @@ use crate::protocol::{ExitStatus, KillSignal, LimitSupport, Limits};
 /// The exit code of processes ended by `exec.kill` or a timeout.
 const KILLED_EXIT_CODE: u32 = 1;
 
+/// Starts `command` and drops it. Windows has no parent-death signal, so any thread may start a
+/// command; Unix starts them on a thread of their own (`unix::spawn`).
+pub(crate) fn spawn(mut command: Command) -> io::Result<Child> {
+    command.spawn()
+}
+
 /// Creates the child suspended, so it cannot start anything before [`Tree::adopt`] puts it in
 /// its Job Object and lets it run.
 pub(crate) fn isolate(command: &mut Command) {

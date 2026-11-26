@@ -1046,11 +1046,10 @@ fn spawn_raw(
         pty.give_to(workload)?;
     }
     crate::identity::run_as(&mut command, workload, Some(cwd.as_path()))?;
-    let child = command.spawn().map_err(|err| {
+    let child = process::spawn(command).map_err(|err| {
         let message = format!("cannot run {}: {err}", program.display());
         Error::new(Error::from(err).kind, message)
     })?;
-    drop(command);
     let spawned = adopt(child, bounds.limits)?;
     #[cfg(unix)]
     return Ok(Spawned {
@@ -1150,8 +1149,9 @@ fn spawn_helper(
     }
     crate::identity::run_as(&mut command, workload, None)?;
     process::limit(&mut command, limits);
-    let child = command.spawn();
-    drop((status_writer, command));
+    // bubblewrap's `--die-with-parent` would end it with the thread that started it.
+    let child = process::spawn(command);
+    drop(status_writer);
     let Spawned {
         mut child, tree, ..
     } = adopt(child?, limits)?;

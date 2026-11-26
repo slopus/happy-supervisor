@@ -179,6 +179,12 @@ Every command, raw or sandboxed, is its own process group (Unix, `setsid` in the
 `KILL_ON_JOB_CLOSE` (Windows). Kill and timeout signal the whole group. When the supervisor exits
 normally it kills every running group.
 
+On Unix every command is forked by one thread, the spawner (`process::spawn`), which lives as
+long as the supervisor. bubblewrap's `--die-with-parent` (`PR_SET_PDEATHSIG`) fires when the
+thread that forked it exits, not the process, and `exec.start` runs on a tokio blocking thread,
+which exits after 10 s unused: a command started there was killed 10 s after the pool last used
+that thread, whatever its timeout.
+
 The supervisor waits for every child it starts. Processes whose parent exits are reparented to
 PID 1, which the host's init is, but a container's entry point may be the supervisor itself.
 bubblewrap's own init, PID 1 of the sandbox, outlives the bubblewrap the supervisor waits for by a

@@ -14,11 +14,11 @@ mod windows;
 pub(crate) use cgroups::Cgroup;
 #[cfg(unix)]
 pub(crate) use unix::{
-    Tree, default_interrupt, exit_status, isolate, limit, limit_support, wait_exit,
+    Tree, default_interrupt, exit_status, isolate, limit, limit_support, spawn, wait_exit,
 };
 #[cfg(windows)]
 pub(crate) use windows::{
-    Tree, exit_status, isolate, job_limits, limit_support, status_preamble, wait_exit,
+    Tree, exit_status, isolate, job_limits, limit_support, spawn, status_preamble, wait_exit,
 };
 
 /// Takes over the cgroup delegated to the supervisor, for `memoryBytes` and `processes` on

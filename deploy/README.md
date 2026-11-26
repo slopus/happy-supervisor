@@ -165,3 +165,7 @@ triggers and `release.yml` do.
   `--user root`. `system disable` kills its processes, and `install.sh --uninstall` removes it.
   Its `apt-get install <names>` and bare `apt-get update` ask the supervisor, which runs them as
   root, with package names only, for that command's processes while it runs.
+* **Unreleased.** `fs.read` takes `beneath`, a directory the path must resolve under through no
+  symlink, reading only a regular file, and reports `file`, which a later range passes back to
+  fail if the path now opens another or a changed file. Both travel as text, so older control
+  planes and nodes ignore them.

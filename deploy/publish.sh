@@ -26,7 +26,10 @@ latest=${2:-${LATEST:+--latest}}
 bucket=gs://${RELEASE_BUCKET:?set RELEASE_BUCKET to the bucket behind get.happy.engineering}
 base=${RELEASE_BASE:-https://get.happy.engineering}
 all=(happy-supervisor-linux-x86_64 happy-supervisor-linux-aarch64 happy-supervisor-macos-aarch64
-	happy-supervisor-macos-x86_64 happy-supervisor-windows-x86_64.exe)
+	happy-supervisor-macos-x86_64 happy-supervisor-windows-x86_64.exe
+	happy-supervisor-boot-linux-x86_64 happy-supervisor-boot-linux-aarch64
+	happy-supervisor-boot-macos-aarch64 happy-supervisor-boot-macos-x86_64
+	happy-supervisor-boot-windows-x86_64.exe)
 
 version=$(cat "$dir/VERSION")
 [[ $version =~ ^[0-9A-Za-z.+-]+$ ]] || { echo "bad version: $version" >&2; exit 1; }

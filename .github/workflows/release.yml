@@ -1,7 +1,8 @@
 name: release
 # A release, started by a push to main that changes deploy/VERSION (deploy/README.md, Releasing):
-# the full test suite (ci.yml) on every OS, then the five binaries, each built and started on its
-# own OS and architecture, SHA256SUMS over exactly those five and a build provenance attestation.
+# the full test suite (ci.yml) on every OS, then the five supervisor binaries and the five
+# happy-supervisor-boot binaries (docs/boot.md), each built and started on its own OS and
+# architecture, SHA256SUMS over exactly those ten and a build provenance attestation.
 # `stage` puts them in Google Cloud under the commit, where the approval-gated publish trigger
 # verifies, signs and publishes them at https://get.happy.engineering. Once the signed SHA256SUMS
 # is served there, `github-release` makes the same files GitHub Release v<version>.
@@ -106,12 +107,17 @@ jobs:
           set -euo pipefail
           if [[ $RUNNER_OS == Linux ]]; then
             cargo zigbuild --locked --release --bin happy-supervisor --target "$TARGET"
+            cargo zigbuild --locked --release -p happy-supervisor-boot --target "$TARGET"
           else
             cargo build --locked --release --bin happy-supervisor --target "$TARGET"
+            cargo build --locked --release -p happy-supervisor-boot --target "$TARGET"
           fi
           mkdir -p out
           bin=out/happy-supervisor-$NAME$EXE
           cp "target/$TARGET/release/happy-supervisor$EXE" "$bin"
+          boot=out/happy-supervisor-boot-$NAME$EXE
+          cp "target/$TARGET/release/happy-supervisor-boot$EXE" "$boot"
+          [[ $("$boot" --version) == "happy-supervisor-boot $HAPPY_SUPERVISOR_VERSION" ]]
           # The binary as shipped starts here, reports the release version and describes this
           # machine.
           "$bin" info --state-dir "$RUNNER_TEMP/state" > "$RUNNER_TEMP/info.json"
@@ -143,7 +149,7 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          [ "$(ls happy-supervisor-* | wc -l)" = 5 ]
+          [ "$(ls happy-supervisor-* | wc -l)" = 10 ]
           sha256sum happy-supervisor-* > SHA256SUMS
           cat SHA256SUMS
       - id: attest

@@ -64,7 +64,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> {
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|arg| arg == "--version") {
-        println!("happy-supervisor-boot {}", env!("CARGO_PKG_VERSION"));
+        println!("happy-supervisor-boot {}", happy_supervisor_boot::VERSION);
         return ExitCode::SUCCESS;
     }
     match parse(args).and_then(run) {

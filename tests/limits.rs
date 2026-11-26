@@ -310,19 +310,37 @@ async fn limits_hold_under_boot_and_after_it_restarts_the_supervisor() {
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("token");
     std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
-    let boot = r#"export HAPPY_SUPERVISOR_BOOT=$$
-for i in 1 2; do "$0" serve --listen 127.0.0.1:0 --token-file "$1" --state-dir "$2"; done"#;
+    // In a file: systemd-run expands `$` in its arguments.
+    let boot = dir.path().join("boot.sh");
+    std::fs::write(
+        &boot,
+        r#"bin=$1 token=$2 state=$3
+export HAPPY_SUPERVISOR_BOOT=$$
+for i in 1 2; do "$bin" serve --listen 127.0.0.1:0 --token-file "$token" --state-dir "$state"; done
+"#,
+    )
+    .unwrap();
     let mut child = Command::new("systemd-run")
-        .args(["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"])
-        .args(["/bin/sh", "-c", boot, BIN])
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "-p",
+            "Delegate=yes",
+            "--",
+            "/bin/sh",
+        ])
+        .arg(&boot)
+        .arg(BIN)
         .arg(&token)
         .arg(dir.path().join("state"))
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(dir.path().join("log")).unwrap())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
     let shell = child.id().unwrap();
+    let log = || std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let nested = ["/bin/sh", "-c", "/bin/echo nested & wait"];
     for round in ["first", "restarted"] {
@@ -336,7 +354,11 @@ for i in 1 2; do "$0" serve --listen 127.0.0.1:0 --token-file "$1" --state-dir "
             .await
             .unwrap();
         let cgroup = std::fs::read_to_string(format!("/proc/{shell}/cgroup")).unwrap();
-        assert!(cgroup.trim_end().ends_with("/boot"), "{round}: {cgroup}");
+        assert!(
+            cgroup.trim_end().ends_with("/boot"),
+            "{round}: boot is in {cgroup}; the node's log:\n{}",
+            log()
+        );
         let info: NodeInfo = ctl.command("node.info", ()).await.unwrap();
         assert!(info.limits.memory_bytes && info.limits.processes, "{round}");
         let (exit, output, _) = run(
@@ -353,15 +375,15 @@ for i in 1 2; do "$0" serve --listen 127.0.0.1:0 --token-file "$1" --state-dir "
             "{round}"
         );
         if round == "first" {
-            // The supervisor exits, and the stand-in for boot starts the next one.
-            let _: Json = ctl
+            // The supervisor exits, and the stand-in for boot starts the next one. The reply
+            // may be lost with the session.
+            let _: Result<Json, _> = ctl
                 .command(
                     "exec.start",
                     json!({ "execId": "stop", "argv": ["/bin/sh", "-c", "kill -TERM $PPID"],
                             "cwd": "/", "env": env(), "access": raw() }),
                 )
-                .await
-                .unwrap();
+                .await;
         }
     }
 }

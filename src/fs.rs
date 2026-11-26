@@ -289,6 +289,7 @@ fn read(params: &FsReadParams) -> Result<FsReadResult> {
     Ok(FsReadResult {
         data: Bytes::new(data),
         size,
+        file: None,
     })
 }
 

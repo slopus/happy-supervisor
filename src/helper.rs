@@ -546,6 +546,7 @@ mod tests {
             FsResponse::Read(FsReadResult {
                 data: Bytes(b"hi".to_vec()),
                 size: 2,
+                file: None,
             })
         );
         assert_eq!(

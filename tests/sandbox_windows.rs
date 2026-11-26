@@ -786,6 +786,8 @@ fn file_operations_run_as_the_sandbox() {
                 path: abs(&tree.path(rel)),
                 offset: 0,
                 length: None,
+                beneath: None,
+                file: None,
             })
         };
         let write = |rel: &str| {

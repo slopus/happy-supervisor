@@ -9,8 +9,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use happy_supervisor::fs::{self, FsRequest, FsResponse};
 use happy_supervisor::policy::Confinement;
 use happy_supervisor::protocol::{
-    AbsPath, Bytes, DirEntry, FileKind, FsListResult, FsMkdirParams, FsPathParams, FsReadParams,
-    FsReadResult, FsRemoveParams, FsRenameParams, FsStat, FsWriteParams, WriteMode,
+    AbsPath, Bytes, DirEntry, FileId, FileKind, FsListResult, FsMkdirParams, FsPathParams,
+    FsReadParams, FsReadResult, FsRemoveParams, FsRenameParams, FsStat, FsWriteParams, WriteMode,
 };
 use happy_supervisor::{Error, ErrorKind};
 
@@ -47,9 +47,11 @@ fn read(path: &Path, offset: u64, length: Option<u64>) -> Result<(Vec<u8>, u64),
         path: abs(path),
         offset,
         length,
+        beneath: None,
+        file: None,
     });
     match fs::perform(&request)? {
-        FsResponse::Read(FsReadResult { data, size }) => Ok((data.into_vec(), size)),
+        FsResponse::Read(FsReadResult { data, size, .. }) => Ok((data.into_vec(), size)),
         other => panic!("read answered {other:?}"),
     }
 }
@@ -519,14 +521,15 @@ async fn handle_runs_raw_requests() {
         path: abs(&file),
         offset: 4,
         length: None,
+        beneath: None,
+        file: None,
     });
-    assert_eq!(
-        fs::handle(read, Confinement::Raw).await,
-        Ok(FsResponse::Read(FsReadResult {
-            data: Bytes::new(b"handle".to_vec()),
-            size: 10,
-        }))
-    );
+    match fs::handle(read, Confinement::Raw).await {
+        Ok(FsResponse::Read(FsReadResult { data, size, .. })) => {
+            assert_eq!((data.into_vec(), size), (b"handle".to_vec(), 10))
+        }
+        other => panic!("read answered {other:?}"),
+    }
 }
 
 fn rename(from: &Path, to: &Path) -> Result<FsResponse, Error> {
@@ -565,5 +568,255 @@ fn rename_moves_and_replaces_a_file() {
         )),
         "{}",
         err.message
+    );
+}
+
+// `fs.read` with `root` and `file`: the control plane's check of a path and its read are
+// separate calls, and what runs on the node can swap the path between them.
+
+/// `ws/src/notes.txt` (9 bytes) inside the workspace, `secret` (7 bytes) and `outside/secret`
+/// beside it.
+fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (tmp, base) = tempdir();
+    let ws = base.join("ws");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::create_dir(base.join("outside")).unwrap();
+    std::fs::write(ws.join("src/notes.txt"), b"workspace").unwrap();
+    std::fs::write(base.join("secret"), b"hunter2").unwrap();
+    std::fs::write(base.join("outside/secret"), b"hunter2").unwrap();
+    (tmp, base, ws)
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+// The Windows runner is an administrator, who may create symlinks.
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path) {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    } else {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+}
+
+fn read_in(
+    root: &Path,
+    path: &Path,
+    offset: u64,
+    length: Option<u64>,
+    file: Option<FileId>,
+) -> Result<FsReadResult, Error> {
+    let request = FsRequest::Read(FsReadParams {
+        path: abs(path),
+        offset,
+        length,
+        beneath: Some(abs(root)),
+        file,
+    });
+    match fs::perform(&request)? {
+        FsResponse::Read(read) => Ok(read),
+        other => panic!("read answered {other:?}"),
+    }
+}
+
+fn through_a_symlink(path: &Path) -> Error {
+    Error::new(
+        ErrorKind::PermissionDenied,
+        format!("{} is or passes through a symbolic link", path.display()),
+    )
+}
+
+#[tokio::test]
+async fn read_beneath_root_refuses_a_file_swapped_for_a_symlink_after_the_check() {
+    let (_tmp, base, ws) = workspace();
+    let notes = ws.join("src/notes.txt");
+    // The check the control plane makes first: no component is a symlink.
+    let mut at = ws.clone();
+    for part in ["src", "notes.txt"] {
+        let entry = list(&at)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == part)
+            .unwrap();
+        assert_eq!(
+            entry.kind,
+            if part == "src" {
+                FileKind::Directory
+            } else {
+                FileKind::File
+            }
+        );
+        at = at.join(part);
+    }
+    std::fs::remove_file(&notes).unwrap();
+    symlink(&base.join("secret"), &notes);
+
+    assert_eq!(read(&notes, 0, None).unwrap().0, b"hunter2");
+    assert_eq!(
+        read_in(&ws, &notes, 0, None, None),
+        Err(through_a_symlink(&notes))
+    );
+}
+
+#[test]
+fn read_beneath_root_refuses_a_symlink_in_a_middle_component() {
+    let (_tmp, base, ws) = workspace();
+    symlink(&base.join("outside"), &ws.join("link"));
+    let secret = ws.join("link/secret");
+    assert_eq!(read(&secret, 0, None).unwrap().0, b"hunter2");
+    assert_eq!(
+        read_in(&ws, &secret, 0, None, None),
+        Err(through_a_symlink(&secret))
+    );
+}
+
+#[test]
+fn read_beneath_root_refuses_dot_dot_and_paths_outside_it() {
+    let (_tmp, base, ws) = workspace();
+    let up = ws.join("src").join("..").join("..").join("secret");
+    assert_eq!(
+        read_in(&ws, &up, 0, None, None),
+        Err(Error::invalid_params(format!(
+            "{} has `..` beneath {}",
+            up.display(),
+            ws.display()
+        )))
+    );
+    let outside = base.join("secret");
+    assert_eq!(
+        read_in(&ws, &outside, 0, None, None),
+        Err(Error::invalid_params(format!(
+            "{} is not beneath {}",
+            outside.display(),
+            ws.display()
+        )))
+    );
+}
+
+#[test]
+fn read_beneath_root_reads_regular_files_only() {
+    let (_tmp, _base, ws) = workspace();
+    let notes = ws.join("src/notes.txt");
+    let read = read_in(&ws, &notes, 4, Some(3), None).unwrap();
+    assert_eq!((read.data.into_vec(), read.size), (b"spa".to_vec(), 9));
+    assert!(read.file.is_some());
+    for path in [&ws, &ws.join("src")] {
+        assert_eq!(
+            read_in(&ws, path, 0, None, None),
+            Err(Error::invalid_params(format!(
+                "{} is not a regular file",
+                path.display()
+            )))
+        );
+    }
+    for missing in [ws.join("src/gone"), ws.join("src/notes.txt/inside")] {
+        assert_eq!(
+            read_in(&ws, &missing, 0, None, None).map_err(|e| e.kind),
+            Err(ErrorKind::NotFound),
+            "{}",
+            missing.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_beneath_root_refuses_a_fifo_without_waiting_for_a_writer() {
+    let (_tmp, _base, ws) = workspace();
+    let fifo = ws.join("fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    assert_eq!(
+        read_in(&ws, &fifo, 0, None, None),
+        Err(Error::invalid_params(format!(
+            "{} is not a regular file",
+            fifo.display()
+        )))
+    );
+}
+
+#[test]
+fn ranged_read_with_file_refuses_a_same_size_swap() {
+    let (_tmp, base, ws) = workspace();
+    let notes = ws.join("src/notes.txt");
+    let first = read_in(&ws, &notes, 0, Some(4), None).unwrap();
+    assert_eq!(first.data.into_vec(), b"work");
+    let file = first.file.unwrap();
+    let again = read_in(&ws, &notes, 4, None, Some(file.clone())).unwrap();
+    assert_eq!(
+        (again.data.into_vec(), again.file),
+        (b"space".to_vec(), Some(file.clone()))
+    );
+
+    // Same size, swapped in by rename between two ranges.
+    std::fs::write(base.join("swap"), b"SECRET!!!").unwrap();
+    std::fs::rename(base.join("swap"), &notes).unwrap();
+    assert_eq!(
+        read_in(&ws, &notes, 4, None, None).unwrap().data.into_vec(),
+        b"ET!!!"
+    );
+    assert_eq!(
+        read_in(&ws, &notes, 4, None, Some(file)),
+        Err(Error::new(
+            ErrorKind::NotFound,
+            format!("{} is no longer the file read before", notes.display())
+        ))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ranged_read_with_file_refuses_a_rewrite_in_place_with_the_old_mtime() {
+    let (_tmp, _base, ws) = workspace();
+    let notes = ws.join("src/notes.txt");
+    let file = read_in(&ws, &notes, 0, Some(4), None)
+        .unwrap()
+        .file
+        .unwrap();
+    let modified = std::fs::metadata(&notes).unwrap().modified().unwrap();
+    // Past the kernel's coarse clock tick, so the change time moves.
+    std::thread::sleep(Duration::from_millis(20));
+    let rewritten = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&notes)
+        .unwrap();
+    std::io::Write::write_all(&mut &rewritten, b"WORKSPACE").unwrap();
+    rewritten.set_modified(modified).unwrap();
+    drop(rewritten);
+    assert_eq!(
+        std::fs::metadata(&notes).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(
+        read_in(&ws, &notes, 4, None, Some(file)).map_err(|e| e.kind),
+        Err(ErrorKind::NotFound)
+    );
+}
+
+#[test]
+fn read_without_root_checks_file_too() {
+    let (_tmp, base, ws) = workspace();
+    let notes = ws.join("src/notes.txt");
+    let request = |file| {
+        FsRequest::Read(FsReadParams {
+            path: abs(&notes),
+            offset: 0,
+            length: None,
+            beneath: None,
+            file,
+        })
+    };
+    let Ok(FsResponse::Read(FsReadResult {
+        file: Some(file), ..
+    })) = fs::perform(&request(None))
+    else {
+        panic!("read reports no file");
+    };
+    std::fs::rename(base.join("secret"), &notes).unwrap();
+    assert_eq!(
+        fs::perform(&request(Some(file))).map_err(|e| e.kind),
+        Err(ErrorKind::NotFound)
     );
 }

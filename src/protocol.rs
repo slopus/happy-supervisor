@@ -1510,7 +1510,19 @@ pub struct FsReadParams {
     pub offset: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<u64>,
+    /// Resolves `path` beneath this directory, through no symlink (api.md, `fs.read`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beneath: Option<AbsPath>,
+    /// Reads only if `path` is still the file an earlier read reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileId>,
 }
+
+/// One file as `fs.read` found it: its identity, size and change times. Opaque to the control
+/// plane, which only compares it whole.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FileId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1581,6 +1593,9 @@ pub struct FsListResult {
 pub struct FsReadResult {
     pub data: Bytes,
     pub size: u64,
+    /// The file read. A node older than `file` leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileId>,
 }
 
 // ---------------------------------------------------------------------------------------------

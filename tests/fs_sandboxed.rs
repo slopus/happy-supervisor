@@ -77,6 +77,8 @@ async fn read(tree: &Tree, rel: &str) -> Result<Vec<u8>, Error> {
         path: abs(&tree.path(rel)),
         offset: 0,
         length: None,
+        beneath: None,
+        file: None,
     });
     match fs::handle(request, tree.confinement(&[])).await? {
         FsResponse::Read(FsReadResult { data, .. }) => Ok(data.into_vec()),
@@ -362,6 +364,8 @@ async fn an_isolated_policy_still_reads_and_writes_files() {
         path: abs(&tree.path("granted/readme")),
         offset: 0,
         length: None,
+        beneath: None,
+        file: None,
     });
     match fs::handle(request, confinement()).await.unwrap() {
         FsResponse::Read(FsReadResult { data, .. }) => assert_eq!(data.into_vec(), b"public"),
@@ -376,5 +380,49 @@ async fn an_isolated_policy_still_reads_and_writes_files() {
     assert_eq!(
         std::fs::read(tree.path("granted/out/result")).unwrap(),
         b"new"
+    );
+}
+
+/// `root` and `file` reach the helper: a symlink inside the granted tree is refused beneath
+/// `root`, and a file swapped between two ranges is refused by `file`.
+#[tokio::test]
+async fn sandboxed_reads_beneath_root_refuse_symlinks_and_swaps() {
+    require_sandbox();
+    let tree = Tree::new();
+    std::os::unix::fs::symlink(tree.path("granted/readme"), tree.path("granted/link")).unwrap();
+    let read = |rel: &str, offset, file| {
+        let request = FsRequest::Read(FsReadParams {
+            path: abs(&tree.path(rel)),
+            offset,
+            length: Some(3),
+            beneath: Some(abs(&tree.path("granted"))),
+            file,
+        });
+        fs::handle(request, tree.confinement(&[]))
+    };
+    let link = tree.path("granted/link");
+    assert_eq!(
+        read("granted/link", 0, None).await,
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} is or passes through a symbolic link", link.display())
+        ))
+    );
+    let Ok(FsResponse::Read(FsReadResult {
+        data,
+        file: Some(file),
+        ..
+    })) = read("granted/readme", 0, None).await
+    else {
+        panic!("the read reports no file");
+    };
+    assert_eq!(data.into_vec(), b"pub");
+    std::fs::write(tree.path("swap"), b"PUBLIC").unwrap();
+    std::fs::rename(tree.path("swap"), tree.path("granted/readme")).unwrap();
+    assert_eq!(
+        read("granted/readme", 3, Some(file))
+            .await
+            .map_err(|e| e.kind),
+        Err(ErrorKind::NotFound)
     );
 }

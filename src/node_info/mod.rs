@@ -58,6 +58,7 @@ pub fn collect(
         name: name.unwrap_or(&hostname).to_string(),
         hostname,
         supervisor_version: crate::VERSION.to_string(),
+        boot: crate::boot::status(),
         os,
         cpu: CpuInfo {
             model: system

@@ -7,6 +7,8 @@
 #[cfg(all(feature = "node", target_os = "linux"))]
 pub mod apt;
 #[cfg(feature = "node")]
+pub mod boot;
+#[cfg(feature = "node")]
 pub mod client;
 #[cfg(feature = "node")]
 pub mod connect;

@@ -169,3 +169,8 @@ triggers and `release.yml` do.
   symlink, reading only a regular file, and reports `file`, which a later range passes back to
   fail if the path now opens another or a changed file. Both travel as text, so older control
   planes and nodes ignore them.
+* **Unreleased.** Under happy-supervisor-boot (docs/boot.md) the supervisor speaks boot's
+  channel on stdin and stdout: `node.upgrade` asks boot for another version, boot's status is
+  NodeInfo `boot` and the event `node.boot`, and the end of stdin stops it. On Linux it moves
+  boot into a `boot` leaf of the delegated cgroup. Without boot, `node.upgrade` is
+  `permission_denied` and nothing else changes.

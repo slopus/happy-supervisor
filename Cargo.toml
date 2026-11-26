@@ -27,6 +27,10 @@ required-features = ["testing"]
 name = "e2e_tunnels"
 required-features = ["testing"]
 
+[[test]]
+name = "boot"
+required-features = ["testing"]
+
 [features]
 default = ["node"]
 # The control plane's side of the link (api.md, Control-plane library): protocol types, the

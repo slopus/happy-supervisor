@@ -219,7 +219,13 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         Command::Run {
             state_dir,
             workload_user,
-        } => match client::run(open_state(state_dir, workload_user)?).await? {
+        } => match client::run({
+            // Before the state opens: with boot, its cgroup handoff needs to know (boot.md).
+            happy_supervisor::boot::attach();
+            open_state(state_dir, workload_user)?
+        })
+        .await?
+        {
             RunExit::Revoked => {
                 eprintln!("happy-supervisor: the control plane revoked this node's credential");
                 Ok(ExitCode::from(3))

@@ -19,7 +19,7 @@ use crate::policy::{Confinement, Network, ResolvedPolicy};
 use crate::protocol::{
     Access, CommandKind, Empty, ExecId, ExecKillParams, ExecListResult, ExecLogParams,
     ExecResizeParams, ExecStartParams, ExecSummary, ExecWriteParams, FsMkdirParams, FsPathParams,
-    FsReadParams, FsRemoveParams, FsRenameParams, FsWriteParams, NodeInfo, NodeUpdate,
+    FsReadParams, FsRemoveParams, FsRenameParams, FsWriteParams, NodeInfo, NodeUpdate, NodeUpgrade,
     ProxyMessage, ProxySpec, SandboxInfo, TcpMessage, TcpOpenParams, Value, WatchId,
     WatchStartParams, WatchStopParams, WithAccess,
 };
@@ -398,6 +398,11 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
         }
         CommandKind::NodeUpdate => {
             node.update(parse(params)?).await?;
+            to_value(Empty {})
+        }
+        CommandKind::NodeUpgrade => {
+            let NodeUpgrade { version } = parse(params)?;
+            crate::boot::upgrade(&version)?;
             to_value(Empty {})
         }
         CommandKind::ExecStart => {

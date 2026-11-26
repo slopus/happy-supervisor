@@ -607,6 +607,38 @@ stays open. A stored update is never lost. If the reply is lost, the session's r
 it, or the control plane should accept both the old and new token until the node next
 connects with the new one.
 
+### `node.upgrade`
+
+Params `{ "version": "0.2.9" }`. This asks happy-supervisor-boot to run that release instead
+(boot.md). `version` is a release version: `[0-9A-Za-z.+-]`, at most 64 bytes, starting with a
+letter or digit. Anything else is `invalid_params`. The node passes the request to boot and
+replies `{}`. The reply comes before the build is downloaded, so it does not mean the change
+worked. Boot reports how the change goes as `node.boot` events. The new version has to connect
+within 120 s and send `node.ready`. Otherwise boot starts the version before it again, and that
+version's `node.ready` carries `boot` with `state: "failed"` and the reason.
+
+A node that boot did not start, such as one run by hand or installed before boot existed,
+replies `permission_denied`. A node older than `node.upgrade` replies `unknown_kind`. Running the
+installer again puts either one under boot.
+
+An upgrade restarts the supervisor, and the supervisor kills its commands and watches when it
+exits. The node then starts a new session, whose `node.ready` has `previousSession: null`. Ask
+for an upgrade only when the node is idle.
+
+### `node.boot` (event)
+
+```json
+{ "bootVersion": "0.1.0", "running": "0.2.9", "previous": "0.2.8", "target": "0.3.0", "state": "downloading", "restarts": 0 }
+```
+
+The node sends this each time boot's status changes while the session is open, in the control
+lane. The fields are boot.md's status: `state` is `idle`, `downloading`, `verifying`, `starting`
+or `failed`, with `error` when it is `failed`. NodeInfo `boot` carries the latest status in
+each `node.ready` and `node.info`.
+
+`node.upgrade`, `node.boot` and the status's fields are newer than the key registry, so they
+travel as text, like `net.bindDenied`.
+
 ## Processes
 
 A process is identified by an `execId` the control plane chooses. That makes `exec.start` safe

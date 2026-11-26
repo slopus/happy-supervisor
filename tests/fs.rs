@@ -676,7 +676,9 @@ fn read_beneath_root_refuses_a_symlink_in_a_middle_component() {
 #[test]
 fn read_beneath_root_refuses_dot_dot_and_paths_outside_it() {
     let (_tmp, base, ws) = workspace();
-    let up = ws.join("src").join("..").join("..").join("secret");
+    // Joined as text: `PathBuf::push` drops `..` from a Windows verbatim (`\\?\`) path.
+    let sep = std::path::MAIN_SEPARATOR;
+    let up = PathBuf::from(format!("{}{sep}src{sep}..{sep}..{sep}secret", ws.display()));
     assert_eq!(
         read_in(&ws, &up, 0, None, None),
         Err(Error::invalid_params(format!(

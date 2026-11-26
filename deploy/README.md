@@ -55,6 +55,21 @@ $env:HAPPY_JOIN_URL='…'; $env:HAPPY_JOIN_TOKEN='…'; irm https://get.happy.en
 * **Windows**, in an elevated PowerShell signed in as the user it runs as: `install-sandbox`, then
   a scheduled task that runs the supervisor as that user at logon, not elevated.
 
+On Linux and macOS the service is happy-supervisor-boot (docs/boot.md). It runs the supervisor
+and changes its version when the control plane asks (api.md, `node.upgrade`). `install.sh` checks
+boot's binary against the signed `SHA256SUMS`. It installs boot as `happy-supervisor-boot` and runs
+`happy-supervisor-boot install` with the version. Boot downloads and verifies the supervisor into
+its boot directory:
+
+| | Boot | Boot directory | `happy-supervisor` |
+|---|---|---|---|
+| System install | `/usr/local/bin/happy-supervisor-boot` | `/usr/local/lib/happy-supervisor` | `/usr/local/bin/happy-supervisor` |
+| User install | `~/.local/bin/happy-supervisor-boot` | `~/.local/lib/happy-supervisor` | `~/.local/bin/happy-supervisor` |
+
+`happy-supervisor` is a script that runs `happy-supervisor-boot exec`, so the commands below run
+the version the service runs, and boot verifies it first. A release without boot cannot be
+installed this way. Windows does not run boot yet.
+
 `install.sh --system` (`sh -s -- --system`, with sudo only) also enables system access
 (docs/policy.md, System access): the control plane may run chosen commands as `happy-system` on
 Linux, which it creates with an npm prefix it owns, for `npm install -g`, and as Homebrew's owner
@@ -64,8 +79,9 @@ then reports `identity.system`. `sudo happy-supervisor system enable|disable --s
 changes it later, with the service's state directory: `/var/lib/happy-supervisor` on Linux,
 `"/Library/Application Support/happy-supervisor"` on macOS.
 
-Run again without `HAPPY_JOIN_TOKEN` to upgrade a joined computer in place; `install.sh
---uninstall` (or `$env:HAPPY_UNINSTALL='1'`) removes it. `HAPPY_SUPERVISOR_VERSION` pins a
+Run again without `HAPPY_JOIN_TOKEN` to upgrade a joined computer in place. That also moves a
+computer installed before boot onto it: the service is rewritten to run boot. `install.sh
+--uninstall` (or `$env:HAPPY_UNINSTALL='1'`) removes it, with boot and its directory. `HAPPY_SUPERVISOR_VERSION` pins a
 release and `HAPPY_INSTALL_BASE` serves releases from elsewhere.
 
 ## Releasing

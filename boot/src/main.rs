@@ -13,6 +13,9 @@ const USAGE: &str = "usage:
   happy-supervisor-boot install --dir <boot dir> [--base <url>] [--version <version>]
       Download, verify and make current a version (default: the latest release), and print
       the path of its binary.
+  happy-supervisor-boot exec --dir <boot dir> -- <supervisor arguments>...
+      Verify the current version and run it with these arguments, as `happy-supervisor` for an
+      administrator (`system enable`, `info`).
   happy-supervisor-boot --version";
 
 struct Args {
@@ -40,7 +43,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> {
             Some("--dir") => dir = Some(PathBuf::from(value()?)),
             Some("--base") => base = value()?,
             Some("--version") if command == "install" => version = Some(value()?),
-            Some("--") if command == "run" => {
+            Some("--") if command == "run" || command == "exec" => {
                 rest = args.by_ref().collect();
             }
             _ => {
@@ -87,6 +90,30 @@ fn run(args: Args) -> Result<ExitCode, String> {
             }
             let code = supervise::run(Config::new(store, fetcher, args.rest))?;
             Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+        }
+        "exec" => {
+            let io = |err: std::io::Error| format!("{}: {err}", args.dir.display());
+            let current = store
+                .state()
+                .map_err(io)?
+                .current
+                .ok_or_else(|| format!("{} has no current version", args.dir.display()))?;
+            let path = store.verified(&current)?;
+            let mut command = std::process::Command::new(&path);
+            command.args(&args.rest);
+            #[cfg(unix)]
+            {
+                let err = std::os::unix::process::CommandExt::exec(&mut command);
+                Err(format!("cannot run {}: {err}", path.display()))
+            }
+            #[cfg(not(unix))]
+            {
+                let status = command
+                    .status()
+                    .map_err(|err| format!("cannot run {}: {err}", path.display()))?;
+                let code = status.code().unwrap_or(1);
+                Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+            }
         }
         "install" => {
             let version = match args.version {

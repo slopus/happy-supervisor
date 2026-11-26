@@ -58,7 +58,31 @@ if sys.argv[1] == 'join':
     (state / 'private' / 'credentials.json').write_text('{}')
 '''
 
+# happy-supervisor-boot: `install` stores the release's supervisor as current and prints its path,
+# `exec` runs the current one.
+BOOT = r'''#!/usr/bin/python3
+import json, os, pathlib, shutil, sys
+root = pathlib.Path(os.environ['MOCK_ROOT'])
+args = sys.argv[1:]
+with (root / 'events').open('a') as out:
+    out.write(json.dumps(['boot', *args]) + '\n')
+boot_dir = pathlib.Path(args[args.index('--dir') + 1])
+if args[0] == 'install':
+    version = args[args.index('--version') + 1]
+    target = boot_dir / 'versions' / version / 'happy-supervisor'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(root / 'release' / 'happy-supervisor-linux-x86_64', target)
+    target.chmod(0o755)
+    (boot_dir / 'state.json').write_text(json.dumps({'current': version}))
+    print(target)
+elif args[0] == 'exec':
+    current = json.loads((boot_dir / 'state.json').read_text())['current']
+    binary = boot_dir / 'versions' / current / 'happy-supervisor'
+    os.execv(binary, [str(binary), *args[args.index('--') + 1:]])
+'''
+
 JOIN = ['join', '--url', 'https://cp.example/api/nodes/join']
+BASE = 'https://release.example'
 
 
 class InstallTests(unittest.TestCase):
@@ -67,6 +91,8 @@ class InstallTests(unittest.TestCase):
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(os.path.realpath(self.scratch.name))
         self.bin = self.root / 'bin/happy-supervisor'
+        self.boot = self.root / 'bin/happy-supervisor-boot'
+        self.boot_dir = self.root / 'lib/happy-supervisor'
         self.state = self.root / 'state'
         self.unit = self.root / 'happy-supervisor.service'
         self.profile = self.root / 'apparmor-profile'
@@ -78,15 +104,19 @@ class InstallTests(unittest.TestCase):
         release.mkdir()
         self.candidate = release / 'happy-supervisor-linux-x86_64'
         self.candidate.write_text(CANDIDATE)
-        digest = hashlib.sha256(self.candidate.read_bytes()).hexdigest()
-        (release / 'SHA256SUMS').write_text(f'{digest}  {self.candidate.name}\n')
+        boot = release / 'happy-supervisor-boot-linux-x86_64'
+        boot.write_text(BOOT)
+        (release / 'SHA256SUMS').write_text(''.join(
+            f'{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.name}\n' for f in (self.candidate, boot)))
         (release / 'SHA256SUMS.minisig').write_text('checked by the fake minisign')
         (release / 'latest').write_text('0.2.0-linux.1\n')
         systemd = self.root / 'systemd'
         systemd.mkdir()
         source = Path(__file__).with_name('install.sh').read_text()
         for original, replacement in {
-            'BIN=/usr/local/bin/happy-supervisor': f'BIN={self.bin}',
+            'BIN=/usr/local/bin/happy-supervisor\n': f'BIN={self.bin}\n',
+            'BOOT=/usr/local/bin/happy-supervisor-boot': f'BOOT={self.boot}',
+            'BOOT_DIR=/usr/local/lib/happy-supervisor': f'BOOT_DIR={self.boot_dir}',
             'STATE=/var/lib/happy-supervisor': f'STATE={self.state}',
             'UNIT=/etc/systemd/system/happy-supervisor.service': f'UNIT={self.unit}',
             'APPARMOR_PROFILE=/etc/apparmor.d/happy-supervisor-bwrap': f'APPARMOR_PROFILE={self.profile}',
@@ -111,7 +141,13 @@ class InstallTests(unittest.TestCase):
                     link.symlink_to(program)
         self.env = {'PATH': f'{self.stub}:{tools}', 'HOME': str(self.root / 'home'),
                     'MOCK_ROOT': str(self.root), 'TMPDIR': str(self.root),
-                    'HAPPY_INSTALL_BASE': 'https://release.example'}
+                    'HAPPY_INSTALL_BASE': BASE}
+
+    def wrapper(self, boot=None, boot_dir=None):
+        return ('#!/bin/sh\n'
+                '# happy-supervisor as the service runs it: the current version under happy-supervisor-boot,\n'
+                '# verified before it runs (docs/boot.md). Written by install.sh.\n'
+                f'exec "{boot or self.boot}" exec --dir "{boot_dir or self.boot_dir}" -- "$@"\n')
 
     def stubs(self, *names):
         for name in names:
@@ -141,9 +177,13 @@ class InstallTests(unittest.TestCase):
         self.assertIn(['join token', 'test-only-token'], events)
         self.assertNotIn('test-only-token', [arg for event in events if event[0] == 'candidate'
                                              for arg in event])
+        # Boot is the service; it was given the version, and happy-supervisor runs what it runs.
+        self.assertIn(['boot', 'install', '--dir', str(self.boot_dir), '--base', BASE, '--version', '0.2.0-linux.1'],
+                      events)
+        self.assertEqual(self.bin.read_text(), self.wrapper())
         unit = self.unit.read_text()
-        self.assertIn(f'ExecStart="{self.bin}" run --state-dir "{self.state}" --workload-user happy-workload\n',
-                      unit)
+        self.assertIn(f'ExecStart="{self.boot}" run --dir "{self.boot_dir}" --base "{BASE}" -- '
+                      f'run --state-dir "{self.state}" --workload-user happy-workload\n', unit)
         self.assertIn('WantedBy=multi-user.target', unit)
         self.assertIn('\nDelegate=yes\n', unit)
         self.assertEqual([e for e in events if e[0] == 'systemctl'],
@@ -207,7 +247,7 @@ class InstallTests(unittest.TestCase):
         self.fresh(MOCK_BAD_SIGNATURE='1')
         events = self.run_install(success=False)
         self.assertIn('SHA256SUMS is not signed by the release key', self.output)
-        self.assertFalse(self.bin.exists())
+        self.assertFalse(self.bin.exists() or self.boot.exists())
         self.assertFalse(any(e[0] in ('candidate', 'useradd') for e in events))
 
     def test_a_user_install_runs_as_the_user_without_a_workload_user(self):
@@ -218,7 +258,10 @@ class InstallTests(unittest.TestCase):
         self.assertIn(['candidate', *JOIN, '--state-dir', str(state)], events)
         self.assertFalse(any(e[0] == 'useradd' for e in events))
         unit = (home / '.config/systemd/user/happy-supervisor.service').read_text()
-        self.assertIn(f'ExecStart="{home}/.local/bin/happy-supervisor" run --state-dir "{state}"\n', unit)
+        boot, boot_dir = home / '.local/bin/happy-supervisor-boot', home / '.local/lib/happy-supervisor'
+        self.assertIn(f'ExecStart="{boot}" run --dir "{boot_dir}" --base "{BASE}" -- run --state-dir "{state}"\n',
+                      unit)
+        self.assertEqual((home / '.local/bin/happy-supervisor').read_text(), self.wrapper(boot, boot_dir))
         self.assertIn('WantedBy=default.target', unit)
         self.assertIn('\nDelegate=yes\n', unit)
         self.assertIn(['systemctl', '--user', 'restart', 'happy-supervisor'], events)
@@ -236,10 +279,19 @@ class InstallTests(unittest.TestCase):
         self.fresh()
         self.run_install()
         (self.root / 'events').unlink()
+        # As a computer installed before boot: the binary itself, and a service that runs it.
         self.bin.write_text('old')
+        self.unit.write_text(f'ExecStart="{self.bin}" run --state-dir "{self.state}"\n')
         del self.env['HAPPY_JOIN_TOKEN']
         events = self.run_install()
-        self.assertEqual(self.bin.read_bytes(), self.candidate.read_bytes())
+        self.assertEqual(self.bin.read_text(), self.wrapper())
+        self.assertIn(f'ExecStart="{self.boot}" run --dir "{self.boot_dir}" --base "{BASE}" -- '
+                      f'run --state-dir "{self.state}" --workload-user happy-workload\n', self.unit.read_text())
+        self.assertIn(['boot', 'install', '--dir', str(self.boot_dir), '--base', BASE, '--version', '0.2.0-linux.1'],
+                      events)
+        self.assertLess(events.index(['boot', 'install', '--dir', str(self.boot_dir), '--base', BASE,
+                                      '--version', '0.2.0-linux.1']),
+                        events.index(['systemctl', 'disable', '--now', 'happy-supervisor']))
         self.assertFalse(any(e[0] == 'candidate' for e in events))
         self.assertIn(['systemctl', 'restart', 'happy-supervisor'], events)
         self.assertIn('happy-supervisor upgraded to 0.2.0-linux.1', self.output)
@@ -247,6 +299,16 @@ class InstallTests(unittest.TestCase):
         self.env['HAPPY_JOIN_TOKEN'] = 'another'
         self.run_install(success=False)
         self.assertIn('this computer has already joined', self.output)
+
+    def test_a_release_without_boot_is_refused_before_anything_is_installed(self):
+        release = self.root / 'release'
+        (release / 'SHA256SUMS').write_text(
+            f'{hashlib.sha256(self.candidate.read_bytes()).hexdigest()}  {self.candidate.name}\n')
+        self.fresh()
+        events = self.run_install(success=False)
+        self.assertIn('release 0.2.0-linux.1 has no happy-supervisor-boot', self.output)
+        self.assertFalse(self.bin.exists() or self.boot.exists())
+        self.assertFalse(any(e[0] in ('boot', 'candidate') for e in events))
 
     def test_without_a_join_url_it_says_what_to_set(self):
         self.env.update(HAPPY_JOIN_TOKEN='test-only-token')
@@ -259,6 +321,7 @@ class InstallTests(unittest.TestCase):
         self.stubs('userdel')
         events = self.run_install('--uninstall')
         self.assertFalse(self.bin.exists() or self.unit.exists() or self.state.exists())
+        self.assertFalse(self.boot.exists() or self.boot_dir.exists())
         self.assertIn(['systemctl', 'disable', '--now', 'happy-supervisor'], events)
         self.assertIn(['userdel', '-r', 'happy-workload'], events)
 

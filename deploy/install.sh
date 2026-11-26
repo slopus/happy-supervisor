@@ -1,6 +1,12 @@
 #!/bin/sh
 # Installs happy-supervisor as this computer's service and joins it to a control plane.
 #
+# The service is happy-supervisor-boot (docs/boot.md), which this installs once and which downloads,
+# verifies and runs the supervisor, and changes its version when the control plane asks. Boot keeps
+# the supervisor's builds in its boot directory (/usr/local/lib/happy-supervisor, or
+# ~/.local/lib/happy-supervisor without sudo). happy-supervisor itself becomes a script that runs
+# the version boot runs, verified, for commands such as `happy-supervisor system enable`.
+#
 #   curl -fsSL https://get.happy.engineering/install.sh \
 #     | sudo HAPPY_JOIN_URL=<join url> HAPPY_JOIN_TOKEN=<token> [HAPPY_NODE_NAME=<name>] sh
 #
@@ -29,8 +35,8 @@
 # Optional: HAPPY_SUPERVISOR_VERSION (default: the latest release), HAPPY_INSTALL_BASE (where
 # releases are served). Before anything is written outside a temporary directory, the release's
 # SHA256SUMS is checked against the release key below with minisign (the computer's own, or a
-# pinned minisign 0.12 release whose archive hash is fixed here), and the binary against
-# SHA256SUMS.
+# pinned minisign 0.12 release whose archive hash is fixed here), and boot's binary against
+# SHA256SUMS. Boot checks the supervisor's binary the same way, against the keys compiled into it.
 set -eu
 
 BASE="${HAPPY_INSTALL_BASE:-https://get.happy.engineering}"
@@ -68,6 +74,8 @@ esac
 if [ "$(id -u)" = 0 ]; then
   root=1
   BIN=/usr/local/bin/happy-supervisor
+  BOOT=/usr/local/bin/happy-supervisor-boot
+  BOOT_DIR=/usr/local/lib/happy-supervisor
   if [ "$os" = linux ]; then
     STATE=/var/lib/happy-supervisor
     UNIT=/etc/systemd/system/happy-supervisor.service
@@ -79,6 +87,8 @@ else
   root=
   [ -n "${HOME:-}" ] || fail "HOME is not set"
   BIN="$HOME/.local/bin/happy-supervisor"
+  BOOT="$HOME/.local/bin/happy-supervisor-boot"
+  BOOT_DIR="$HOME/.local/lib/happy-supervisor"
   if [ "$os" = linux ]; then
     STATE="${XDG_STATE_HOME:-$HOME/.local/state}/happy-supervisor"
     UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/happy-supervisor.service"
@@ -87,6 +97,9 @@ else
     UNIT="$HOME/Library/LaunchAgents/$LABEL.plist"
   fi
 fi
+# A system install runs its work as the unprivileged user WORKLOAD_USER.
+workload=
+[ -z "$root" ] || workload="--workload-user $WORKLOAD_USER"
 units() {
   if [ -n "$root" ]; then systemctl "$@"; else systemctl --user "$@"; fi
 }
@@ -123,8 +136,8 @@ enable_system() {
 
 if [ "${1:-}" = "--uninstall" ]; then
   [ -f "$UNIT" ] && service_stop
-  rm -f "$UNIT" "$BIN"
-  rm -rf "$STATE"
+  rm -f "$UNIT" "$BIN" "$BOOT"
+  rm -rf "$STATE" "$BOOT_DIR"
   if [ -n "$root" ]; then
     if [ -f "$APPARMOR_PROFILE" ]; then
       apparmor_parser -R "$APPARMOR_PROFILE" 2>/dev/null || true
@@ -225,8 +238,8 @@ fi
 case "$version" in
   *[!0-9A-Za-z.+-]* | "") fail "bad version '$version'" ;;
 esac
-file="happy-supervisor-$os-$arch"
-echo "downloading happy-supervisor $version ($os-$arch)"
+file="happy-supervisor-boot-$os-$arch"
+echo "downloading happy-supervisor-boot $version ($os-$arch)"
 fetch "$BASE/releases/$version/SHA256SUMS" "$work/SHA256SUMS"
 fetch "$BASE/releases/$version/SHA256SUMS.minisig" "$work/SHA256SUMS.minisig"
 if command -v minisign >/dev/null 2>&1; then
@@ -253,22 +266,93 @@ fi
   fail "SHA256SUMS is not signed by the release key"
 expected=$(awk -v f="$file" '$2 == f || $2 == "*" f { print $1 }' "$work/SHA256SUMS")
 if [ -z "$expected" ]; then
+  if awk -v f="happy-supervisor-$os-$arch" '$2 == f || $2 == "*" f { found = 1 } END { exit !found }' "$work/SHA256SUMS"; then
+    fail "release $version has no happy-supervisor-boot, which this installer runs the supervisor with: install a later release"
+  fi
   builds=$(awk '{ sub(/^\*/, "", $2) } $2 !~ /^happy-supervisor-boot-/ { sub(/^happy-supervisor-/, "", $2); print $2 }' "$work/SHA256SUMS" | tr '\n' ' ')
   fail "release $version has no build for $os-$arch; it has: ${builds:-none}"
 fi
 fetch "$BASE/releases/$version/$file" "$work/$file"
 [ "$(sha256 "$work/$file")" = "$expected" ] || fail "checksum mismatch for $file"
 
+# happy-supervisor: the version boot runs, verified by boot before it runs.
+write_wrapper() {
+  mkdir -p "$(dirname "$BIN")"
+  cat >"$BIN.new" <<WRAPPER
+#!/bin/sh
+# happy-supervisor as the service runs it: the current version under happy-supervisor-boot,
+# verified before it runs (docs/boot.md). Written by install.sh.
+exec "$BOOT" exec --dir "$BOOT_DIR" -- "\$@"
+WRAPPER
+  chmod 755 "$BIN.new"
+  mv -f "$BIN.new" "$BIN"
+}
+# Boot in place, and the supervisor's version stored, verified and current. Prints its binary.
+install_boot() {
+  mkdir -p "$(dirname "$BOOT")"
+  install -m 755 "$work/$file" "$BOOT.new"
+  "$BOOT.new" install --dir "$BOOT_DIR" --base "$BASE" --version "$version" >"$work/supervisor" ||
+    { rm -f "$BOOT.new"; fail "happy-supervisor-boot could not install happy-supervisor $version"; }
+}
+
+# The service: boot, running the supervisor with this install's state and workload user.
+write_unit() {
+  mkdir -p "$(dirname "$UNIT")"
+  if [ "$os" = linux ]; then
+    wanted=default.target
+    [ -z "$root" ] || wanted=multi-user.target
+    cat >"$UNIT" <<UNIT
+[Unit]
+Description=happy-supervisor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart="$BOOT" run --dir "$BOOT_DIR" --base "$BASE" -- run --state-dir "$STATE"${workload:+ $workload}
+Restart=on-failure
+# Exit code 3: the control plane revoked the credential. Join again instead.
+RestartPreventExitStatus=3
+# The service's cgroup is the supervisor's, for limits.memoryBytes and processes (docs/install.md).
+Delegate=yes
+
+[Install]
+WantedBy=$wanted
+UNIT
+    # A user service outlives the user's logins only with lingering.
+    [ -n "$root" ] || loginctl enable-linger "$(id -un)" 2>/dev/null ||
+      echo "note: could not enable lingering; the service stops when you log out (loginctl enable-linger $(id -un) as an administrator)" >&2
+  else
+    args="<string>$BOOT</string><string>run</string><string>--dir</string><string>$BOOT_DIR</string>"
+    args="$args<string>--base</string><string>$BASE</string><string>--</string>"
+    args="$args<string>run</string><string>--state-dir</string><string>$STATE</string>"
+    [ -z "$root" ] || args="$args<string>--workload-user</string><string>$WORKLOAD_USER</string>"
+    cat >"$UNIT" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>$args</array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict>
+</plist>
+PLIST
+  fi
+}
+
 # Verified: only now does anything reach a system path, or the user's own.
 if [ -n "$upgrade" ]; then
-  install -m 755 "$work/$file" "$BIN.new"
+  install_boot
   # Before the service stops, so a release without `system` leaves the running one as it was.
-  enable_system "$BIN.new" || {
-    rm -f "$BIN.new"
+  enable_system "$(cat "$work/supervisor")" || {
+    rm -f "$BOOT.new"
     fail "could not enable system access; the running service is unchanged"
   }
   service_stop
-  mv -f "$BIN.new" "$BIN"
+  mv -f "$BOOT.new" "$BOOT"
+  write_wrapper
+  write_unit
   service_start
   echo "happy-supervisor upgraded to $version"
   exit 0
@@ -300,9 +384,7 @@ PROFILE
 fi
 
 # A system install runs its work as this unprivileged user.
-workload=
 if [ -n "$root" ]; then
-  workload="--workload-user $WORKLOAD_USER"
   if [ "$os" = linux ]; then
     if ! id -u "$WORKLOAD_USER" >/dev/null 2>&1; then
       nologin=/bin/false
@@ -336,9 +418,9 @@ if [ -n "$root" ]; then
   fi
 fi
 
-mkdir -p "$(dirname "$BIN")"
-install -m 755 "$work/$file" "$BIN.new"
-mv -f "$BIN.new" "$BIN"
+install_boot
+mv -f "$BOOT.new" "$BOOT"
+write_wrapper
 
 # The token goes in the environment, not the arguments, which ps shows.
 # shellcheck disable=SC2086 # $workload is two words or none.
@@ -346,45 +428,6 @@ HAPPY_JOIN_TOKEN="$HAPPY_JOIN_TOKEN" "$BIN" join --url "$HAPPY_JOIN_URL" \
   ${HAPPY_NODE_NAME:+--name "$HAPPY_NODE_NAME"} --state-dir "$STATE" $workload
 enable_system "$BIN"
 
-mkdir -p "$(dirname "$UNIT")"
-if [ "$os" = linux ]; then
-  wanted=default.target
-  [ -z "$root" ] || wanted=multi-user.target
-  cat >"$UNIT" <<UNIT
-[Unit]
-Description=happy-supervisor
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-ExecStart="$BIN" run --state-dir "$STATE"${workload:+ $workload}
-Restart=on-failure
-# Exit code 3: the control plane revoked the credential. Join again instead.
-RestartPreventExitStatus=3
-# The service's cgroup is the supervisor's, for limits.memoryBytes and processes (docs/install.md).
-Delegate=yes
-
-[Install]
-WantedBy=$wanted
-UNIT
-  # A user service outlives the user's logins only with lingering.
-  [ -n "$root" ] || loginctl enable-linger "$(id -un)" 2>/dev/null ||
-    echo "note: could not enable lingering; the service stops when you log out (loginctl enable-linger $(id -un) as an administrator)" >&2
-else
-  args="<string>$BIN</string><string>run</string><string>--state-dir</string><string>$STATE</string>"
-  [ -z "$root" ] || args="$args<string>--workload-user</string><string>$WORKLOAD_USER</string>"
-  cat >"$UNIT" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key><array>$args</array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-</dict>
-</plist>
-PLIST
-fi
+write_unit
 service_start
 echo "happy-supervisor $version is installed and running"

@@ -116,7 +116,8 @@ The shapes in this document are written as JSON for readability, with the frame 
 ### Key registry
 
 Every field name in this document, every frame type (`t`) and every message `kind` has a number
-in the registry. In a body, a map key that is in the registry is that CBOR unsigned integer, not
+in the registry, except `fs.read`'s `beneath` and `file`, which travel as text until every peer
+reads them. In a body, a map key that is in the registry is that CBOR unsigned integer, not
 the text. A frame's `t` value, and a `msg` frame's `kind` value, are their numbers too. Other
 values stay as they are, so `"stream": "stdout"` is `0x0d 0x66 "stdout"`, and the `kind` inside a
 body (an exit, a change, an error) stays text.
@@ -874,8 +875,8 @@ the path in the policy's read set, and writes need it in the write set (policy.m
 operation runs inside the same OS sandbox as a command with that policy. A sandboxed file
 command therefore can do exactly what a sandboxed command could do.
 
-Symlinks are followed, as `open` follows them. Under a sandbox, a symlink whose target lies
-outside the policy is refused by the OS.
+Symlinks are followed, as `open` follows them, except below `fs.read`'s `beneath`. Under a
+sandbox, a symlink whose target lies outside the policy is refused by the OS.
 
 ### `fs.stat`
 
@@ -906,8 +907,37 @@ Params `{ "path", "access", "offset": 0, "length": 1048576 }`. `offset` defaults
 `length` defaults to the rest of the file, and at most 16 MiB is read per call (more is
 `too_large`). Without `length`, a rest longer than 16 MiB is `too_large` too. The rest is found by
 reading, not from the size, so files that report size 0 (such as Linux's `/proc`) read fully.
-Result `{ "data": h'…', "size": 1234 }`, where `size` is the whole file's size. An
-`offset` at or past the end reads no data.
+Result `{ "data": h'…', "size": 1234, "file": "fd01:3a4b2:4d2:1763496000.0:1763496000.0" }`,
+where `size` is the whole file's size. An `offset` at or past the end reads no data. `file`
+says which file was read and in what state. It is opaque: compare it whole.
+
+The control plane checks a path and reads it in separate calls, and what runs on the node can
+replace the path in between. Two optional params close that gap.
+
+`beneath`, an absolute directory, confines the read. `path` must be `beneath` or below it,
+without `..`, else `invalid_params`. The node opens `beneath` as `open` would, following
+symlinks, then each later component from the directory opened before it, following none. A
+symlink anywhere below `beneath` is `permission_denied`, even one that points inside. A missing
+component, or a file where a directory should be, is `not_found`. Only a regular file is read,
+and anything else is `invalid_params`; a FIFO is refused without waiting for a writer. The
+checks and the read use one open file, so nothing can swap the path between them. Windows has
+no `openat`, so there the node opens the whole path, not following it if it is a link itself,
+and refuses it unless the opened file's real path is `beneath`'s real path followed by the rest,
+ignoring case. A link or junction on the way makes them differ.
+
+`file`, from an earlier reply, pins the read to that file: if `path` now opens a different file,
+or the same one changed, the reply is `not_found`. A read of one file in ranges passes the first
+reply's `file` with every later range, so a file swapped or changed between ranges fails
+instead of mixing two files. On Unix `file` covers the device, inode, size, modification time
+and change time. Nothing can set the change time back, so a same-size rewrite that restores the
+modification time is still caught. On Windows it covers the volume, file index, size, last write
+time and creation time, which a process can set back.
+
+Neither covers hard links: a hard link below `beneath` to a file elsewhere is that file.
+
+`beneath` and `file` have no registry number, so they travel as text. A node older than them
+ignores them, reads `path` as given, and replies without `file`, so a reply without `file` means
+the node did not apply them.
 
 ### `fs.write`
 

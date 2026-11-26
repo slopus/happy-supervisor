@@ -1936,13 +1936,18 @@ mod tests {
     use crate::testkit::cbor;
     use crate::wire::{from_cbor, from_value, to_cbor};
 
+    /// Fields that travel as text until every peer reads them (api.md, Key registry): a number
+    /// an older peer lacks loses the session, and every `fs.read` reply carries `file`.
+    const NOT_YET_NUMBERED: &[&str] = &["beneath", "file"];
+
     /// Parses the CBOR that `literal` stands for as `T`, checks that `T` encodes back to the
     /// same CBOR (nulls and omitted fields being equal), and returns it.
     fn round_trip<T: Serialize + DeserializeOwned>(literal: Json) -> T {
         let bytes = to_cbor(&cbor(literal.clone()));
         let parsed: T = from_cbor(&bytes).unwrap();
         let encoded = to_cbor(&parsed);
-        let unregistered = crate::wire::text_keys(&encoded);
+        let mut unregistered = crate::wire::text_keys(&encoded);
+        unregistered.retain(|key| !NOT_YET_NUMBERED.contains(&key.as_str()));
         assert!(
             unregistered.is_empty(),
             "field names missing from wire::REGISTRY: {unregistered:?}"
@@ -2840,7 +2845,25 @@ mod tests {
         let read_defaults: FsReadParams = parse(json!({ "path": "/x" }));
         assert_eq!((read_defaults.offset, read_defaults.length), (0, None));
         let result: FsReadResult = round_trip(json!({ "data": "h'6869'", "size": 1234 }));
-        assert_eq!(result.data.0, b"hi");
+        assert_eq!((result.data.0, result.file), (b"hi".to_vec(), None));
+        let pinned: WithAccess<FsReadParams> = round_trip(json!({
+            "path": "/home/me/repo/src/main.rs", "access": access, "offset": 0,
+            "beneath": "/home/me/repo", "file": "fd01:3a4b2:4d2:1763496000.0:1763496000.0"
+        }));
+        assert_eq!(
+            (pinned.params.beneath, pinned.params.file),
+            (
+                Some(AbsPath::try_from("/home/me/repo").unwrap()),
+                Some(FileId("fd01:3a4b2:4d2:1763496000.0:1763496000.0".into()))
+            )
+        );
+        let result: FsReadResult = round_trip(json!({
+            "data": "h'6869'", "size": 1234, "file": "fd01:3a4b2:4d2:1763496000.0:1763496000.0"
+        }));
+        assert_eq!(
+            result.file,
+            Some(FileId("fd01:3a4b2:4d2:1763496000.0:1763496000.0".into()))
+        );
         for mode in ["create", "overwrite", "append"] {
             round_trip::<WithAccess<FsWriteParams>>(
                 json!({ "path": "/x", "access": access, "data": "h''", "mode": mode }),

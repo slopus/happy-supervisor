@@ -3,7 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
@@ -15,7 +15,7 @@ use crate::helper::{Job, JobOp};
 use crate::identity::Workload;
 use crate::policy::{Confinement, ResolvedPolicy};
 use crate::protocol::{
-    AbsPath, Bytes, DirEntry, Empty, FileKind, FsListResult, FsMkdirParams, FsPathParams,
+    AbsPath, Bytes, DirEntry, Empty, FileId, FileKind, FsListResult, FsMkdirParams, FsPathParams,
     FsReadParams, FsReadResult, FsRemoveParams, FsRenameParams, FsStat, FsWriteParams,
     MAX_FS_DATA_BYTES, MAX_LIST_ENTRIES, Value, WriteMode,
 };
@@ -270,8 +270,19 @@ fn read(params: &FsReadParams) -> Result<FsReadResult> {
             "length {length} is more than {max} bytes"
         )));
     }
-    let mut file = File::open(path).map_err(at(path))?;
-    let size = file.metadata().map_err(at(path))?.len();
+    let mut file = match &params.beneath {
+        Some(root) => open_beneath(root.as_path(), path)?,
+        None => File::open(path).map_err(at(path))?,
+    };
+    let meta = file.metadata().map_err(at(path))?;
+    let id = file_id(&file, &meta).map_err(at(path))?;
+    if params.file.as_ref().is_some_and(|want| *want != id) {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!("{} is no longer the file read before", path.display()),
+        ));
+    }
+    let size = meta.len();
     file.seek(SeekFrom::Start(params.offset))
         .map_err(at(path))?;
     // Without a length, read to the end, but one byte past the cap shows the rest is too long.
@@ -289,8 +300,206 @@ fn read(params: &FsReadParams) -> Result<FsReadResult> {
     Ok(FsReadResult {
         data: Bytes::new(data),
         size,
-        file: None,
+        file: Some(id),
     })
+}
+
+/// Opens the regular file `path` names beneath `root`, through no symlink below `root`. What
+/// is read is what the name led to as it was opened, however the tree changes afterwards.
+fn open_beneath(root: &Path, path: &Path) -> Result<File> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        Error::invalid_params(format!(
+            "{} is not beneath {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    let mut names = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            Component::CurDir => {}
+            _ => {
+                return Err(Error::invalid_params(format!(
+                    "{} has `..` beneath {}",
+                    path.display(),
+                    root.display()
+                )));
+            }
+        }
+    }
+    let file = open_names(root, &names, path)?;
+    if !file.metadata().map_err(at(path))?.is_file() {
+        return Err(Error::invalid_params(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn through_a_symlink(path: &Path) -> Error {
+    Error::new(
+        ErrorKind::PermissionDenied,
+        format!("{} is or passes through a symbolic link", path.display()),
+    )
+}
+
+/// Opens `root`, then each of `names` inside the directory before it, never following a
+/// symlink. Without `..` this confines the walk as `openat2`'s `RESOLVE_BENEATH |
+/// RESOLVE_NO_SYMLINKS` would, on every Unix and kernel.
+#[cfg(unix)]
+fn open_names(root: &Path, names: &[&std::ffi::OsStr], path: &Path) -> Result<File> {
+    use nix::fcntl::{AtFlags, OFlag, openat};
+    use nix::sys::stat::{Mode, SFlag, fstatat};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut fd: OwnedFd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(root)
+        .map_err(at(path))?
+        .into();
+    for (i, name) in names.iter().enumerate() {
+        let shape = if i + 1 == names.len() {
+            // A FIFO opens at once instead of waiting for a writer, and is then refused.
+            OFlag::O_NONBLOCK | OFlag::O_NOCTTY
+        } else {
+            OFlag::O_DIRECTORY
+        };
+        let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | shape;
+        fd = match openat(&fd, *name, flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(errno) => {
+                // Systems differ in what a symlink fails with (ELOOP, EMLINK, ENOTDIR).
+                let is_link = fstatat(&fd, *name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok_and(|st| {
+                    SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFLNK
+                });
+                return Err(match errno {
+                    _ if is_link => through_a_symlink(path),
+                    nix::errno::Errno::ENOTDIR => Error::new(
+                        ErrorKind::NotFound,
+                        format!("{}: {}", path.display(), errno.desc()),
+                    ),
+                    _ => at(path)(errno.into()),
+                });
+            }
+        };
+    }
+    Ok(File::from(fd))
+}
+
+/// Windows has no `openat`, so the file is opened by its whole path, not followed if it is a
+/// link itself, and then its handle's real path must be exactly `root`'s real path and
+/// `names`: a link or junction anywhere on the way makes them differ.
+#[cfg(windows)]
+fn open_names(root: &Path, names: &[&std::ffi::OsStr], path: &Path) -> Result<File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    // Backup semantics opens a directory too, which is then refused as not a regular file.
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)
+        .map_err(at(path))?;
+    let mut expected = final_path(&root).map_err(at(path))?;
+    for name in names {
+        expected.push('\\');
+        expected.push_str(&name.to_string_lossy());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(at(path))?;
+    let attributes = file.metadata().map_err(at(path))?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || final_path(&file).map_err(at(path))?.to_lowercase() != expected.to_lowercase()
+    {
+        return Err(through_a_symlink(path));
+    }
+    Ok(file)
+}
+
+/// The path an open handle really has, with every link on the way resolved.
+#[cfg(windows)]
+fn final_path(file: &File) -> std::io::Result<String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW,
+    };
+
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // SAFETY: the handle is open for the call, and the buffer holds `buffer.len()` UTF-16
+        // units.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_NORMALIZED,
+            )
+        } as usize;
+        if len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len < buffer.len() {
+            return Ok(String::from_utf16_lossy(&buffer[..len]));
+        }
+        // Too small: `len` is the size needed, with the terminating NUL.
+        buffer.resize(len, 0);
+    }
+}
+
+/// Which file `file` is and the state it is in: two reads that report the same ID read the
+/// same file, unchanged in size and times.
+#[cfg(unix)]
+fn file_id(_file: &File, meta: &std::fs::Metadata) -> std::io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(FileId(format!(
+        "{:x}:{:x}:{:x}:{}.{}:{}.{}",
+        meta.dev(),
+        meta.ino(),
+        meta.size(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec()
+    )))
+}
+
+#[cfg(windows)]
+fn file_id(file: &File, _meta: &std::fs::Metadata) -> std::io::Result<FileId> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    // SAFETY: all-zero is a valid BY_HANDLE_FILE_INFORMATION, a plain C struct.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the call, and `info` is a writable struct of the type
+    // the call fills.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let time = |t: windows_sys::Win32::Foundation::FILETIME| {
+        (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
+    };
+    Ok(FileId(format!(
+        "{:x}:{:x}{:08x}:{:x}{:08x}:{}:{}",
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+        info.nFileSizeHigh,
+        info.nFileSizeLow,
+        time(info.ftLastWriteTime),
+        time(info.ftCreationTime)
+    )))
 }
 
 fn write(params: &FsWriteParams) -> Result<()> {

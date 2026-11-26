@@ -836,10 +836,11 @@ async fn files_are_read_written_and_listed_raw_and_sandboxed() {
             )
             .await;
         assert_eq!(
-            read,
-            json!({ "data": hex(b"world\n"), "size": 12 }),
+            (&read["data"], &read["size"]),
+            (&json!(hex(b"world\n")), &json!(12)),
             "{label}"
         );
+        assert!(read["file"].is_string(), "{label}: {read}");
         let stat = node
             .ok("fs.stat", json!({ "path": target, "access": access }))
             .await;
@@ -885,6 +886,41 @@ async fn files_are_read_written_and_listed_raw_and_sandboxed() {
         )
         .await;
     assert_eq!(secret["data"], hex(b"secret"));
+
+    // With `beneath`, a symlink out is refused, and `file` pins later ranges to one file.
+    std::os::unix::fs::symlink(closed.join("secret.txt"), open.join("link")).unwrap();
+    let beneath = |name: &str, offset: u64, pinned: Option<&Json>| {
+        let mut params = json!({ "path": file(&open, name), "beneath": path(&open),
+                                 "access": raw(), "offset": offset, "length": 3 });
+        if let Some(pinned) = pinned {
+            params["file"] = pinned.clone();
+        }
+        node.call("fs.read", params)
+    };
+    let refused = beneath("link", 0, None).await.unwrap_err();
+    assert_eq!(
+        (refused.kind, refused.message),
+        (
+            happy_supervisor::ErrorKind::PermissionDenied,
+            format!(
+                "{} is or passes through a symbolic link",
+                file(&open, "link")
+            )
+        )
+    );
+    let first = beneath("raw.txt", 0, None).await.unwrap();
+    assert_eq!(first["data"], hex(b"hel"));
+    let second = beneath("raw.txt", 3, Some(&first["file"])).await.unwrap();
+    assert_eq!(
+        (&second["data"], &second["file"]),
+        (&json!(hex(b"lo\n")), &first["file"])
+    );
+    std::fs::write(open.join("swap"), "HELLO\nWORLD\n").unwrap();
+    std::fs::rename(open.join("swap"), open.join("raw.txt")).unwrap();
+    let swapped = beneath("raw.txt", 6, Some(&first["file"]))
+        .await
+        .unwrap_err();
+    assert_eq!(swapped.kind, happy_supervisor::ErrorKind::NotFound);
 }
 
 #[tokio::test]

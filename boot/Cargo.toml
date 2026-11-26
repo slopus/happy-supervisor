@@ -1,0 +1,33 @@
+[package]
+name = "happy-supervisor-boot"
+version = "0.1.0"
+edition = "2024"
+description = "Starts happy-supervisor, verified against the release key, and changes its version on request"
+license = "MIT"
+repository = "https://github.com/slopus/happy-supervisor"
+
+[[bin]]
+name = "happy-supervisor-boot"
+path = "src/main.rs"
+
+[dependencies]
+blake2 = "0.10"
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+base64 = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

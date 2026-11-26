@@ -6,6 +6,10 @@ description = "Runs commands, file operations and watches on this machine for on
 license = "MIT"
 repository = "https://github.com/slopus/happy-supervisor"
 
+[workspace]
+# happy-supervisor-boot (boot/, docs/boot.md): the service's entry point, which starts this binary.
+members = ["boot"]
+
 [lib]
 name = "happy_supervisor"
 path = "src/lib.rs"

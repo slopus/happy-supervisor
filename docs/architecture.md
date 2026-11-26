@@ -8,6 +8,10 @@ behind the `testing` feature.
 
 Targets: `x86_64`/`aarch64` × `linux` (gnu), `apple-darwin`, `pc-windows-msvc`.
 
+On an installed node the service runs `happy-supervisor-boot` (`boot/`, a package of its own;
+boot.md), which starts this binary from a build verified against the release key, restarts it,
+and replaces it with another version when the control plane asks.
+
 ## Data flow
 
 ```

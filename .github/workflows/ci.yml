@@ -47,6 +47,9 @@ jobs:
       - run: cargo clippy --lib --no-default-features --features control-plane -- -D warnings
       - run: cargo test --lib --no-default-features --features control-plane
       - run: cargo build --all-targets --all-features
+      # The service's entry point, its own package (docs/boot.md).
+      - run: cargo clippy -p happy-supervisor-boot --all-targets -- -D warnings
+      - run: cargo test -p happy-supervisor-boot
       # The runner is an administrator; the tests run as the same account, as the supervisor would.
       - run: cargo run --all-features -- install-sandbox
         if: runner.os == 'Windows'

@@ -206,3 +206,8 @@ triggers and `release.yml` do.
   scheduled task runs boot, and `happy-supervisor.cmd` replaces `happy-supervisor.exe` in
   `%ProgramFiles%\Happy`. Running an installer again moves a computer installed before boot onto
   it, without joining again.
+* **0.2.11.** `install.sh` refreshes the package index (`apt-get update`) before it installs
+  bubblewrap, so a stale index no longer fails the install with a 404 for a `.deb` the mirror
+  has replaced. A repository that fails to refresh does not stop it; pacman syncs and retries
+  when its database is stale. When the package manager fails, its own output is shown with the
+  reason.

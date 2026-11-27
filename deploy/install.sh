@@ -253,7 +253,7 @@ fi
   fail "SHA256SUMS is not signed by the release key"
 expected=$(awk -v f="$file" '$2 == f || $2 == "*" f { print $1 }' "$work/SHA256SUMS")
 if [ -z "$expected" ]; then
-  builds=$(awk '{ sub(/^\*/, "", $2); sub(/^happy-supervisor-/, "", $2); print $2 }' "$work/SHA256SUMS" | tr '\n' ' ')
+  builds=$(awk '{ sub(/^\*/, "", $2) } $2 !~ /^happy-supervisor-boot-/ { sub(/^happy-supervisor-/, "", $2); print $2 }' "$work/SHA256SUMS" | tr '\n' ' ')
   fail "release $version has no build for $os-$arch; it has: ${builds:-none}"
 fi
 fetch "$BASE/releases/$version/$file" "$work/$file"

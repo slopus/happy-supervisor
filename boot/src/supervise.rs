@@ -108,7 +108,7 @@ pub fn run(config: Config) -> Result<i32, String> {
     let mut boot = Boot {
         events,
         status: Status {
-            boot_version: env!("CARGO_PKG_VERSION"),
+            boot_version: crate::VERSION,
             running: Some(current),
             previous: state.previous,
             target: None,

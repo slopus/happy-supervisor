@@ -1,7 +1,8 @@
 # Releases
 
-A release is five binaries, `SHA256SUMS` over exactly the binaries it has, its minisign
-signature, and the installers, served at `https://get.happy.engineering`:
+A release is five supervisor binaries and five happy-supervisor-boot binaries (docs/boot.md),
+`SHA256SUMS` over exactly the binaries it has, its minisign signature, and the installers,
+served at `https://get.happy.engineering`:
 
 ```
 https://get.happy.engineering/install.sh             the installer for Linux and macOS
@@ -9,6 +10,7 @@ https://get.happy.engineering/install.ps1            the installer for Windows
 https://get.happy.engineering/releases/latest        the latest version, one line
 https://get.happy.engineering/releases/<version>/    happy-supervisor-{linux-x86_64,linux-aarch64,
                                                      macos-aarch64,macos-x86_64,windows-x86_64.exe},
+                                                     happy-supervisor-boot-{the same five},
                                                      SHA256SUMS, SHA256SUMS.minisig
 ```
 
@@ -73,9 +75,10 @@ Push a change to `VERSION` to `main`. `.github/workflows/release.yml` then:
 1. refuses a version that is already served or released (versions are immutable);
 2. runs the whole suite, `ci.yml`, on Linux x86_64 and aarch64, macOS aarch64 and x86_64, and
    Windows;
-3. builds each binary on its own OS and architecture, with `HAPPY_SUPERVISOR_VERSION` set so
-   nodes report it (Linux: static musl through `cargo-zigbuild`), and starts it there (`info`);
-4. writes `SHA256SUMS` over exactly the five and a build provenance attestation for them;
+3. builds each platform's supervisor and boot on its own OS and architecture, with
+   `HAPPY_SUPERVISOR_VERSION` set so nodes report it (Linux: static musl through
+   `cargo-zigbuild`), and starts them there (`info`, `--version`);
+4. writes `SHA256SUMS` over exactly the ten and a build provenance attestation for them;
 5. stages the release, the installers, `VERSION` and the attestation (`attestation.sigstore.json`)
    at `gs://happy-supervisor-staging-<project number>/<commit>/<run id>-<attempt>/`,
    `SHA256SUMS` last;
@@ -97,9 +100,9 @@ Held in happy-terraform:
 * Trigger `happy-supervisor-publish`, no approval, run by `happy-supervisor-publish`, the
   only identity that may read secret `happy-supervisor-signing-key`. A Pub/Sub notification of the
   staging bucket starts it when a `<commit>/<run id>-<attempt>/SHA256SUMS` arrives. Its steps are
-  inline and run none of the repository's code: copy that prefix; check that the five binaries
-  match `SHA256SUMS` and that the attestation names each of them, this repository's
-  `release.yml` on `refs/heads/main` and that commit; then run the byte copy of `publish.sh`
+  inline and run none of the repository's code: copy that prefix; check that the ten binaries
+  (five supervisors, five boots) match `SHA256SUMS` and that the attestation names each of
+  them, this repository's `release.yml` on `refs/heads/main` and that commit; then run the byte copy of `publish.sh`
   without `--latest`, with `RELEASE_BUCKET=<the bucket behind get.happy.engineering>`,
   `MINISIGN_PUBLIC_KEY=RWQ6QpJv09qdNGB9/hp7j8OjguWGLTtuvAO/d34LiFGJPzFtF2bkY1Lr` and
   `MINISIGN_SECRET_KEY_B64` from the secret.

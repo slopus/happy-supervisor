@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
-    /// This boot's own version, which never changes on a node.
+    /// This boot's own version, the release it came with, which never changes on a node.
     pub boot_version: &'static str,
     /// The version running, or starting when `state` is `starting`.
     pub running: Option<String>,

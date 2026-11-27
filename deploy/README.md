@@ -53,22 +53,26 @@ $env:HAPPY_JOIN_URL='…'; $env:HAPPY_JOIN_TOKEN='…'; irm https://get.happy.en
   when bubblewrap is missing, which it cannot install. NodeInfo reports `root: false,
   workloadUser: null`.
 * **Windows**, in an elevated PowerShell signed in as the user it runs as: `install-sandbox`, then
-  a scheduled task that runs the supervisor as that user at logon, not elevated.
+  a scheduled task that runs boot, and boot the supervisor, as that user at logon, not elevated.
 
-On Linux and macOS the service is happy-supervisor-boot (docs/boot.md). It runs the supervisor
-and changes its version when the control plane asks (api.md, `node.upgrade`). `install.sh` checks
-boot's binary against the signed `SHA256SUMS`. It installs boot as `happy-supervisor-boot` and runs
-`happy-supervisor-boot install` with the version. Boot downloads and verifies the supervisor into
-its boot directory:
+On every platform the service is happy-supervisor-boot (docs/boot.md). It runs the supervisor and
+changes its version when the control plane asks (api.md, `node.upgrade`). The installers download
+both binaries of the release for the computer, `happy-supervisor-boot-<os>-<arch>` and
+`happy-supervisor-<os>-<arch>`, and check both against the signed `SHA256SUMS`. They install boot,
+then hand it the downloaded files with `happy-supervisor-boot install --version <v> --from <dir>`:
+boot checks them again against the keys compiled into it and stores the supervisor in its boot
+directory as the current version. Nothing is downloaded at the first start.
 
 | | Boot | Boot directory | `happy-supervisor` |
 |---|---|---|---|
 | System install | `/usr/local/bin/happy-supervisor-boot` | `/usr/local/lib/happy-supervisor` | `/usr/local/bin/happy-supervisor` |
 | User install | `~/.local/bin/happy-supervisor-boot` | `~/.local/lib/happy-supervisor` | `~/.local/bin/happy-supervisor` |
+| Windows | `%ProgramFiles%\Happy\happy-supervisor-boot.exe` | `%ProgramData%\happy-supervisor\boot` | `%ProgramFiles%\Happy\happy-supervisor.cmd` |
 
 `happy-supervisor` is a script that runs `happy-supervisor-boot exec`, so the commands below run
-the version the service runs, and boot verifies it first. A release without boot cannot be
-installed this way. Windows does not run boot yet.
+the version the service runs, and boot verifies it first. On Windows only SYSTEM, Administrators
+and the installing user may change the boot directory; everyone else may read it. A release
+without boot cannot be installed this way.
 
 `install.sh --system` (`sh -s -- --system`, with sudo only) also enables system access
 (docs/policy.md, System access): the control plane may run chosen commands as `happy-system` on
@@ -80,9 +84,10 @@ changes it later, with the service's state directory: `/var/lib/happy-supervisor
 `"/Library/Application Support/happy-supervisor"` on macOS.
 
 Run again without `HAPPY_JOIN_TOKEN` to upgrade a joined computer in place. That also moves a
-computer installed before boot onto it: the service is rewritten to run boot. `install.sh
---uninstall` (or `$env:HAPPY_UNINSTALL='1'`) removes it, with boot and its directory. `HAPPY_SUPERVISOR_VERSION` pins a
-release and `HAPPY_INSTALL_BASE` serves releases from elsewhere.
+computer installed before boot onto it: the service (on Windows the scheduled task) is rewritten
+to run boot, and the old binary is replaced by the script. `install.sh --uninstall` (or
+`$env:HAPPY_UNINSTALL='1'`) removes it, with boot and its directory. `HAPPY_SUPERVISOR_VERSION`
+pins a release and `HAPPY_INSTALL_BASE` serves releases from elsewhere.
 
 ## Releasing
 
@@ -194,3 +199,10 @@ triggers and `release.yml` do.
   boot into a `boot` leaf of the delegated cgroup. Without boot, `node.upgrade` is
   `permission_denied` and nothing else changes.
   Each release also ships `happy-supervisor-boot-<os>-<arch>`, signed in the same `SHA256SUMS`.
+* **0.2.10.** The installers download both binaries of the release, happy-supervisor-boot and
+  happy-supervisor, check both against the signed `SHA256SUMS`, and install boot as the service
+  with the supervisor already in its boot directory as the current version, so the first start
+  downloads nothing (`happy-supervisor-boot install --from`). This includes Windows: the
+  scheduled task runs boot, and `happy-supervisor.cmd` replaces `happy-supervisor.exe` in
+  `%ProgramFiles%\Happy`. Running an installer again moves a computer installed before boot onto
+  it, without joining again.

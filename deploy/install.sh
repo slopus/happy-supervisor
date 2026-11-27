@@ -1,10 +1,11 @@
 #!/bin/sh
 # Installs happy-supervisor as this computer's service and joins it to a control plane.
 #
-# The service is happy-supervisor-boot (docs/boot.md), which this installs once and which downloads,
-# verifies and runs the supervisor, and changes its version when the control plane asks. Boot keeps
-# the supervisor's builds in its boot directory (/usr/local/lib/happy-supervisor, or
-# ~/.local/lib/happy-supervisor without sudo). happy-supervisor itself becomes a script that runs
+# This downloads both of the release's binaries for this computer: happy-supervisor-boot
+# (docs/boot.md), which becomes the service, and happy-supervisor, which boot runs. The supervisor
+# goes into boot's directory (/usr/local/lib/happy-supervisor, or ~/.local/lib/happy-supervisor
+# without sudo) as its current version, so the first start downloads nothing more. Boot changes
+# the version later when the control plane asks. happy-supervisor itself becomes a script that runs
 # the version boot runs, verified, for commands such as `happy-supervisor system enable`.
 #
 #   curl -fsSL https://get.happy.engineering/install.sh \
@@ -35,8 +36,9 @@
 # Optional: HAPPY_SUPERVISOR_VERSION (default: the latest release), HAPPY_INSTALL_BASE (where
 # releases are served). Before anything is written outside a temporary directory, the release's
 # SHA256SUMS is checked against the release key below with minisign (the computer's own, or a
-# pinned minisign 0.12 release whose archive hash is fixed here), and boot's binary against
-# SHA256SUMS. Boot checks the supervisor's binary the same way, against the keys compiled into it.
+# pinned minisign 0.12 release whose archive hash is fixed here), and both binaries against
+# SHA256SUMS. Boot checks the supervisor's again, against the keys compiled into it, before it
+# stores it and before every start.
 set -eu
 
 BASE="${HAPPY_INSTALL_BASE:-https://get.happy.engineering}"
@@ -239,7 +241,8 @@ case "$version" in
   *[!0-9A-Za-z.+-]* | "") fail "bad version '$version'" ;;
 esac
 file="happy-supervisor-boot-$os-$arch"
-echo "downloading happy-supervisor-boot $version ($os-$arch)"
+supervisor="happy-supervisor-$os-$arch"
+echo "downloading happy-supervisor $version and happy-supervisor-boot ($os-$arch)"
 fetch "$BASE/releases/$version/SHA256SUMS" "$work/SHA256SUMS"
 fetch "$BASE/releases/$version/SHA256SUMS.minisig" "$work/SHA256SUMS.minisig"
 if command -v minisign >/dev/null 2>&1; then
@@ -264,16 +267,22 @@ else
 fi
 "$minisign" -Vqm "$work/SHA256SUMS" -x "$work/SHA256SUMS.minisig" -P "$MINISIGN_PUBKEY" ||
   fail "SHA256SUMS is not signed by the release key"
-expected=$(awk -v f="$file" '$2 == f || $2 == "*" f { print $1 }' "$work/SHA256SUMS")
-if [ -z "$expected" ]; then
-  if awk -v f="happy-supervisor-$os-$arch" '$2 == f || $2 == "*" f { found = 1 } END { exit !found }' "$work/SHA256SUMS"; then
-    fail "release $version has no happy-supervisor-boot, which this installer runs the supervisor with: install a later release"
-  fi
+# The hash SHA256SUMS names for $1, or nothing.
+listed() {
+  awk -v f="$1" '$2 == f || $2 == "*" f { print $1 }' "$work/SHA256SUMS"
+}
+expected_supervisor=$(listed "$supervisor")
+if [ -z "$expected_supervisor" ]; then
   builds=$(awk '{ sub(/^\*/, "", $2) } $2 !~ /^happy-supervisor-boot-/ { sub(/^happy-supervisor-/, "", $2); print $2 }' "$work/SHA256SUMS" | tr '\n' ' ')
   fail "release $version has no build for $os-$arch; it has: ${builds:-none}"
 fi
+expected=$(listed "$file")
+[ -n "$expected" ] ||
+  fail "release $version has no happy-supervisor-boot, which this installer runs the supervisor with: install a later release"
 fetch "$BASE/releases/$version/$file" "$work/$file"
 [ "$(sha256 "$work/$file")" = "$expected" ] || fail "checksum mismatch for $file"
+fetch "$BASE/releases/$version/$supervisor" "$work/$supervisor"
+[ "$(sha256 "$work/$supervisor")" = "$expected_supervisor" ] || fail "checksum mismatch for $supervisor"
 
 # happy-supervisor: the version boot runs, verified by boot before it runs.
 write_wrapper() {
@@ -287,11 +296,13 @@ WRAPPER
   chmod 755 "$BIN.new"
   mv -f "$BIN.new" "$BIN"
 }
-# Boot in place, and the supervisor's version stored, verified and current. Prints its binary.
+# Boot beside its final place, and the downloaded supervisor stored in boot's directory, verified
+# by boot and current. Boot downloads nothing: it is given the files checked above. Writes the
+# stored binary's path to $work/supervisor.
 install_boot() {
   mkdir -p "$(dirname "$BOOT")"
   install -m 755 "$work/$file" "$BOOT.new"
-  "$BOOT.new" install --dir "$BOOT_DIR" --base "$BASE" --version "$version" >"$work/supervisor" ||
+  "$BOOT.new" install --dir "$BOOT_DIR" --version "$version" --from "$work" >"$work/supervisor" ||
     { rm -f "$BOOT.new"; fail "happy-supervisor-boot could not install happy-supervisor $version"; }
 }
 

@@ -146,6 +146,29 @@ The supervisor to boot, on its stdout:
 `upgrade` asks for a version. `connected` says that the supervisor's first session has opened,
 which is what makes a new version healthy.
 
+## The supervisor's side
+
+The supervisor speaks the channel only in `run` with `HAPPY_SUPERVISOR_BOOT` set (`src/boot.rs`):
+
+* It sends `connected` once, when its first session opens.
+* It sends `upgrade` for `node.upgrade` (api.md).
+* It reports each status after the first as the event `node.boot`, and the latest one as
+  NodeInfo `boot`.
+* When stdin ends, it stops as it does on `SIGTERM`.
+
+Without the variable, it reads nothing from stdin and replies `permission_denied` to
+`node.upgrade`.
+
+On Linux, boot and the supervisor share the service's delegated cgroup (install.md,
+`Delegate=yes`). If boot's process ID is the supervisor's parent, the supervisor moves boot into
+a `boot` leaf and itself into the `supervisor` leaf (process/cgroups.rs). A supervisor that boot
+starts later begins in `boot`, so it takes the cgroup above that leaf as the delegated one. That
+leaf holds only boot and the supervisor. So `limits` work under boot as they do without it. All
+of this is in the supervisor, so it can still change.
+
+Supervisor versions before the channel never send `connected`. Boot can run one that is already
+installed, but an upgrade to one rolls back after 120 s.
+
 ## Release keys
 
 `release::RELEASE_KEYS` (`boot/src/release.rs`) is a fixed list of minisign public keys. A build

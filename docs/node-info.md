@@ -204,3 +204,16 @@ programs (policy.md, System access). Nothing else of the supervisor's environmen
 ### `collectedAtMs`
 
 Unix epoch milliseconds when the collection finished.
+
+### `boot`
+
+What happy-supervisor-boot last reported, when it started this supervisor (boot.md, The
+channel), otherwise omitted. It is the status object of boot.md, as the event `node.boot` also
+carries it:
+
+```json
+{ "bootVersion": "0.1.0", "running": "0.2.9", "previous": "0.2.8", "target": null, "state": "idle", "restarts": 0 }
+```
+
+`supervisorVersion` is the version that is running. `boot.running` is the same version, as boot
+names it. Its fields travel as text (api.md, Key registry).

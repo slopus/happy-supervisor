@@ -72,24 +72,35 @@ impl Node {
         access: &Json,
         limits: Json,
     ) -> (ExitStatus, String, Duration) {
-        let mut events = self.ctl.events();
-        let started = Instant::now();
-        let params = json!({ "execId": exec_id, "argv": argv, "cwd": cwd(), "env": env(),
-                             "access": access, "limits": limits });
-        let _: Json = self.ctl.command("exec.start", params).await.unwrap();
-        let mut output = Vec::new();
-        loop {
-            match tokio::time::timeout(WAIT, events.next()).await.unwrap() {
-                Some(Event::ExecOutput(ExecOutput {
-                    exec_id: id, data, ..
-                })) if id.as_str() == exec_id => output.extend(data.0),
-                Some(Event::ExecExit(exit)) if exit.exec_id.as_str() == exec_id => {
-                    let output = String::from_utf8_lossy(&output).replace("\r\n", "\n");
-                    return (exit.exit, output, started.elapsed());
-                }
-                Some(_) => {}
-                None => panic!("the events ended"),
+        run(&self.ctl, exec_id, argv, access, limits).await
+    }
+}
+
+/// [`Node::run`] on the node behind `ctl`.
+async fn run(
+    ctl: &Controller,
+    exec_id: &str,
+    argv: &[&str],
+    access: &Json,
+    limits: Json,
+) -> (ExitStatus, String, Duration) {
+    let mut events = ctl.events();
+    let started = Instant::now();
+    let params = json!({ "execId": exec_id, "argv": argv, "cwd": cwd(), "env": env(),
+                         "access": access, "limits": limits });
+    let _: Json = ctl.command("exec.start", params).await.unwrap();
+    let mut output = Vec::new();
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await.unwrap() {
+            Some(Event::ExecOutput(ExecOutput {
+                exec_id: id, data, ..
+            })) if id.as_str() == exec_id => output.extend(data.0),
+            Some(Event::ExecExit(exit)) if exit.exec_id.as_str() == exec_id => {
+                let output = String::from_utf8_lossy(&output).replace("\r\n", "\n");
+                return (exit.exit, output, started.elapsed());
             }
+            Some(_) => {}
+            None => panic!("the events ended"),
         }
     }
 }
@@ -283,6 +294,96 @@ async fn processes_caps_the_tree() {
                 (ExitStatus::Exited { code: 2 }, "/bin/sh: 0: Cannot fork\n"),
                 "{label}"
             );
+        }
+    }
+}
+
+/// Under happy-supervisor-boot (boot.md) boot shares the service's delegated cgroup. The
+/// supervisor moves boot into a `boot` leaf and still enforces the limits, and so does the next
+/// supervisor boot starts, which begins in that leaf. A shell stands in for boot.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn limits_hold_under_boot_and_after_it_restarts_the_supervisor() {
+    if !delegated() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
+    // In a file: systemd-run expands `$` in its arguments.
+    let boot = dir.path().join("boot.sh");
+    std::fs::write(
+        &boot,
+        r#"bin=$1 token=$2 state=$3
+export HAPPY_SUPERVISOR_BOOT=$$
+for i in 1 2; do "$bin" serve --listen 127.0.0.1:0 --token-file "$token" --state-dir "$state"; done
+"#,
+    )
+    .unwrap();
+    let mut child = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "-p",
+            "Delegate=yes",
+            "--",
+            "/bin/sh",
+        ])
+        .arg(&boot)
+        .arg(BIN)
+        .arg(&token)
+        .arg(dir.path().join("state"))
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(dir.path().join("log")).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let shell = child.id().unwrap();
+    let log = || std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let nested = ["/bin/sh", "-c", "/bin/echo nested & wait"];
+    for round in ["first", "restarted"] {
+        let line = tokio::time::timeout(WAIT, lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("serve exited before listening");
+        let addr = line.strip_prefix("listening ").unwrap().to_string();
+        let ctl = Controller::connect(&format!("ws://{addr}"), TOKEN)
+            .await
+            .unwrap();
+        let cgroup = std::fs::read_to_string(format!("/proc/{shell}/cgroup")).unwrap();
+        assert!(
+            cgroup.trim_end().ends_with("/boot"),
+            "{round}: boot is in {cgroup}; the node's log:\n{}",
+            log()
+        );
+        let info: NodeInfo = ctl.command("node.info", ()).await.unwrap();
+        assert!(info.limits.memory_bytes && info.limits.processes, "{round}");
+        let (exit, output, _) = run(
+            &ctl,
+            &format!("{round}-1"),
+            &nested,
+            &raw(),
+            json!({ "processes": 1 }),
+        )
+        .await;
+        assert_eq!(
+            (exit, output.as_str()),
+            (ExitStatus::Exited { code: 2 }, "/bin/sh: 0: Cannot fork\n"),
+            "{round}"
+        );
+        if round == "first" {
+            // The supervisor exits, and the stand-in for boot starts the next one. The reply
+            // may be lost with the session.
+            let _: Result<Json, _> = ctl
+                .command(
+                    "exec.start",
+                    json!({ "execId": "stop", "argv": ["/bin/sh", "-c", "kill -TERM $PPID"],
+                            "cwd": "/", "env": env(), "access": raw() }),
+                )
+                .await;
         }
     }
 }

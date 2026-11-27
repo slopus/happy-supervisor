@@ -18,6 +18,8 @@ const ROOT: &str = "/sys/fs/cgroup";
 /// The leaf the supervisor moves itself into: a cgroup that holds processes cannot enable
 /// controllers for its children.
 const SUPERVISOR: &str = "supervisor";
+/// The leaf happy-supervisor-boot is moved into, when it started the supervisor.
+const BOOT: &str = "boot";
 /// The prefix of a command's cgroup.
 const EXEC: &str = "exec-";
 
@@ -61,7 +63,25 @@ fn delegate() -> Result<Delegated, String> {
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
         .ok_or("the supervisor is not in a cgroup v2 hierarchy")?;
-    let dir = Path::new(ROOT).join(path.trim_start_matches('/'));
+    let mut dir = Path::new(ROOT).join(path.trim_start_matches('/'));
+    // Under happy-supervisor-boot (boot.md) the service's cgroup holds boot too. The first
+    // supervisor moves boot into a `boot` leaf; one boot starts later begins in that leaf, so
+    // the delegated cgroup is its parent.
+    let boot = crate::boot::pid().map(|pid| pid.to_string());
+    if boot.is_some() && dir.file_name().is_some_and(|name| name == BOOT) {
+        let leaf = fs::read_to_string(dir.join("cgroup.procs")).map_err(|err| err.to_string())?;
+        let pid = std::process::id().to_string();
+        if let Some(other) = leaf
+            .lines()
+            .find(|line| *line != pid && Some(*line) != boot.as_deref())
+        {
+            return Err(format!(
+                "{} holds process {other} besides boot and the supervisor",
+                dir.display()
+            ));
+        }
+        dir.pop();
+    }
     let read =
         |name: &str| fs::read_to_string(dir.join(name)).map_err(|err| format!("{}: {err}", name));
     let available = read("cgroup.controllers")?;
@@ -77,13 +97,25 @@ fn delegate() -> Result<Delegated, String> {
     let init = crate::init::pid().map(|pid| pid.to_string());
     let others = read("cgroup.procs")?
         .lines()
-        .filter(|line| *line != pid && Some(*line) != init.as_deref())
+        .filter(|line| {
+            *line != pid && Some(*line) != init.as_deref() && Some(*line) != boot.as_deref()
+        })
         .count();
     if others > 0 {
         return Err(format!(
             "{} holds {others} other processes, so it was not delegated to the supervisor alone",
             dir.display()
         ));
+    }
+    if let Some(boot) = &boot {
+        let leaf = dir.join(BOOT);
+        match fs::create_dir(&leaf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(format!("cannot create {}: {err}", leaf.display())),
+        }
+        fs::write(leaf.join("cgroup.procs"), boot)
+            .map_err(|err| format!("cannot move boot into {}: {err}", leaf.display()))?;
     }
     let leaf = dir.join(SUPERVISOR);
     match fs::create_dir(&leaf) {

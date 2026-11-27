@@ -251,6 +251,8 @@ pub enum Event {
     NetDenied(NetDenied),
     #[serde(rename = "net.bindDenied")]
     NetBindDenied(NetBindDenied),
+    #[serde(rename = "node.boot")]
+    NodeBoot(BootStatus),
     /// A `proxy.*` stream message (proxy.md), which carries its own `kind`.
     #[serde(untagged)]
     Proxy(ProxyMessage),
@@ -260,8 +262,9 @@ pub enum Event {
 }
 
 impl Event {
-    pub const KINDS: [&str; 7] = [
+    pub const KINDS: [&str; 8] = [
         "node.ready",
+        "node.boot",
         "exec.output",
         "exec.exit",
         "exec.timedOut",
@@ -306,6 +309,7 @@ fn tagged(kind: &str, body: Value) -> Value {
 pub enum CommandKind {
     NodeInfo,
     NodeUpdate,
+    NodeUpgrade,
     ExecStart,
     ExecWrite,
     ExecResize,
@@ -325,9 +329,10 @@ pub enum CommandKind {
 }
 
 impl CommandKind {
-    pub const ALL: [CommandKind; 18] = [
+    pub const ALL: [CommandKind; 19] = [
         CommandKind::NodeInfo,
         CommandKind::NodeUpdate,
+        CommandKind::NodeUpgrade,
         CommandKind::ExecStart,
         CommandKind::ExecWrite,
         CommandKind::ExecResize,
@@ -350,6 +355,7 @@ impl CommandKind {
         match self {
             CommandKind::NodeInfo => "node.info",
             CommandKind::NodeUpdate => "node.update",
+            CommandKind::NodeUpgrade => "node.upgrade",
             CommandKind::ExecStart => "exec.start",
             CommandKind::ExecWrite => "exec.write",
             CommandKind::ExecResize => "exec.resize",
@@ -646,6 +652,69 @@ impl TryFrom<NodeUpdateWire> for NodeUpdate {
             endpoint: wire.endpoint,
         })
     }
+}
+
+/// `node.upgrade`: run another supervisor version, through happy-supervisor-boot (boot.md).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "NodeUpgradeWire")]
+pub struct NodeUpgrade {
+    /// A release version as the release pipeline accepts one (boot.md, What boot runs).
+    pub version: String,
+}
+
+#[derive(Deserialize)]
+struct NodeUpgradeWire {
+    version: String,
+}
+
+impl TryFrom<NodeUpgradeWire> for NodeUpgrade {
+    type Error = Error;
+
+    fn try_from(wire: NodeUpgradeWire) -> Result<NodeUpgrade, Error> {
+        let version = wire.version;
+        let ok = version.len() <= 64
+            && version.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'));
+        if !ok {
+            return Err(Error::invalid_params(format!("bad version {version:?}")));
+        }
+        Ok(NodeUpgrade { version })
+    }
+}
+
+/// What happy-supervisor-boot reports (boot.md, The channel): NodeInfo `boot`, and the event
+/// `node.boot`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootStatus {
+    pub boot_version: String,
+    /// The version running, or starting when `state` is `starting`.
+    pub running: Option<String>,
+    /// The version kept to go back to.
+    pub previous: Option<String>,
+    /// The version last asked for, until it runs.
+    pub target: Option<String>,
+    pub state: BootState,
+    /// With `failed`, why the last change failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// How many times `running` was restarted after exiting on its own.
+    pub restarts: u32,
+    /// How it last exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootState {
+    Idle,
+    Downloading,
+    Verifying,
+    Starting,
+    Failed,
 }
 
 /// `node.ready`, the node's first message in every new session.
@@ -1687,6 +1756,10 @@ pub struct NodeInfo {
     pub limits: LimitSupport,
     pub default_env: BTreeMap<String, String>,
     pub collected_at_ms: u64,
+    /// What happy-supervisor-boot reports, when it started this supervisor (boot.md). `null`
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<BootStatus>,
 }
 
 /// NodeInfo's `limits`: which `exec.start` limits this node enforces.
@@ -1938,7 +2011,17 @@ mod tests {
 
     /// Fields that travel as text until every peer reads them (api.md, Key registry): a number
     /// an older peer lacks loses the session, and every `fs.read` reply carries `file`.
-    const NOT_YET_NUMBERED: &[&str] = &["beneath", "file"];
+    const NOT_YET_NUMBERED: &[&str] = &[
+        "beneath",
+        "file",
+        "boot",
+        "bootVersion",
+        "running",
+        "previous",
+        "target",
+        "restarts",
+        "lastExit",
+    ];
 
     /// Parses the CBOR that `literal` stands for as `T`, checks that `T` encodes back to the
     /// same CBOR (nulls and omitted fields being equal), and returns it.
@@ -2933,5 +3016,52 @@ mod tests {
                 .contains("node.update needs nodeToken, endpoint or both")
         );
         assert_eq!(round_trip::<Empty>(json!({})), Empty {});
+
+        let upgrade: NodeUpgrade = round_trip(json!({ "version": "0.2.9" }));
+        assert_eq!(upgrade.version, "0.2.9");
+        for bad in ["", "..", "../x", "a/b", "-1"] {
+            assert!(
+                rejects::<NodeUpgrade>(json!({ "version": bad }))
+                    .contains(&format!("bad version {bad:?}")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_status() {
+        let failed: BootStatus = round_trip(json!({
+            "bootVersion": "0.1.0", "running": "0.2.9", "previous": "0.2.8", "target": "0.3.0",
+            "state": "failed", "error": "0.3.0 did not connect within 120 s", "restarts": 1,
+            "lastExit": "exited with code 1"
+        }));
+        assert_eq!(
+            failed,
+            BootStatus {
+                boot_version: "0.1.0".into(),
+                running: Some("0.2.9".into()),
+                previous: Some("0.2.8".into()),
+                target: Some("0.3.0".into()),
+                state: BootState::Failed,
+                error: Some("0.3.0 did not connect within 120 s".into()),
+                restarts: 1,
+                last_exit: Some("exited with code 1".into()),
+            }
+        );
+        for state in ["idle", "downloading", "verifying", "starting"] {
+            let status: BootStatus = round_trip(json!({
+                "bootVersion": "0.1.0", "running": "0.2.9", "previous": null, "target": null,
+                "state": state, "restarts": 0
+            }));
+            assert_eq!(status.error, None);
+        }
+        let event = Event::parse(
+            "node.boot",
+            cbor(json!({
+                "bootVersion": "0.1.0", "running": "0.2.9", "previous": null, "target": null,
+                "state": "idle", "restarts": 0
+            })),
+        );
+        assert!(matches!(event, Some(Ok(Event::NodeBoot(_)))), "{event:?}");
     }
 }

@@ -134,6 +134,18 @@ async fn drive(
         stop.await;
         let _ = stop_tx.send(true);
     });
+    // Each status boot reports from now on is a `node.boot`; `node.ready` carries the current.
+    let boot = crate::boot::statuses().map(|mut statuses| {
+        let outbox = outbox.clone();
+        tokio::spawn(async move {
+            while statuses.changed().await.is_ok() {
+                let status = statuses.borrow_and_update().clone();
+                if let Some(status) = status {
+                    outbox.node_boot(status);
+                }
+            }
+        })
+    });
     let (to_handlers, from_driver) = mpsc::unbounded_channel();
     let handlers = tokio::spawn(serve(node.clone(), outbox, from_driver));
     let mut driver = Driver {
@@ -147,14 +159,25 @@ async fn drive(
         ready: None,
     };
     let exit = driver.run().await;
+    if let Some(boot) = boot {
+        boot.abort();
+    }
     handlers.abort();
     stopper.abort();
     node.shutdown().await;
     exit
 }
 
-/// Resolves on Ctrl-C or SIGTERM.
+/// Resolves on Ctrl-C or SIGTERM, or when happy-supervisor-boot closes stdin (boot.md,
+/// Running).
 pub async fn shutdown_signal() {
+    tokio::select! {
+        () = signal() => {}
+        () = crate::boot::closed() => {}
+    }
+}
+
+async fn signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -489,6 +512,8 @@ impl Driver {
                 session, resumed, ..
             } => {
                 tracing::info!(%session, resumed, "session open");
+                // What makes a version boot started healthy (boot.md, Running).
+                crate::boot::connected();
                 false
             }
             Incoming::Message { id, kind, body } => {

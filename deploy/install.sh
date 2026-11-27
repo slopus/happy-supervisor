@@ -197,19 +197,35 @@ if [ "$os" = linux ] && [ -z "$upgrade" ]; then
   if [ -z "$bwrap" ]; then
     [ -n "$root" ] || fail "sandboxed commands need bubblewrap, which is not installed and which an install without sudo cannot add: install the bubblewrap package, or run this with sudo"
     echo "installing bubblewrap"
+    # A package manager's output, shown only when it fails.
+    pkg_log=$(mktemp)
+    quietly() {
+      if "$@" >"$pkg_log" 2>&1; then return 0; fi
+      cat "$pkg_log" >&2
+      return 1
+    }
+    cannot() { rm -f "$pkg_log"; fail "$1 could not install bubblewrap (its output is above): install the bubblewrap package and run this again"; }
     if command -v apt-get >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap >/dev/null
+      # The package index may be older than the mirror, which then no longer has the .deb it
+      # names: refresh it first. A repository that fails to refresh need not stop the install.
+      quietly env DEBIAN_FRONTEND=noninteractive apt-get update -q ||
+        echo "note: apt-get update failed (above); installing bubblewrap with the package index there is" >&2
+      quietly env DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=120 bubblewrap ||
+        cannot apt-get
     elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y bubblewrap >/dev/null
+      quietly dnf install -y bubblewrap || cannot dnf
     elif command -v apk >/dev/null 2>&1; then
-      apk add --no-cache bubblewrap >/dev/null
+      quietly apk add --no-cache bubblewrap || cannot apk
     elif command -v zypper >/dev/null 2>&1; then
-      zypper --non-interactive install bubblewrap >/dev/null
+      quietly zypper --non-interactive install bubblewrap || cannot zypper
     elif command -v pacman >/dev/null 2>&1; then
-      pacman -S --noconfirm --needed bubblewrap >/dev/null
+      # A stale sync database names packages the mirror no longer has: sync it and try again.
+      quietly pacman -S --noconfirm --needed bubblewrap ||
+        quietly pacman -Sy --noconfirm --needed bubblewrap || cannot pacman
     else
       fail "sandboxed commands need bubblewrap, and no known package manager (apt-get, dnf, apk, zypper, pacman) is here to install it: install the bubblewrap package and run this again"
     fi
+    rm -f "$pkg_log"
     bwrap=$(command -v bwrap || true)
     [ -n "$bwrap" ] || fail "the bubblewrap package installed no bwrap on PATH"
   fi

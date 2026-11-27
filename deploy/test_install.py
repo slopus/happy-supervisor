@@ -32,8 +32,23 @@ if name == 'id':
         print('999')
 elif name == 'uname':
     print({'-s': os.environ.get('MOCK_OS', 'Linux'), '-m': 'x86_64'}[args[0]])
-elif name == 'apt-get':
-    # The package brings bwrap with it.
+elif name in ('apt-get', 'pacman'):
+    # The index is stale until refreshed: it names a package the mirror no longer has, as a
+    # computer's often does. Refreshed, the package brings bwrap with it.
+    refresh = args[0] == 'update' if name == 'apt-get' else args[0] == '-Sy'
+    if refresh:
+        (root / f'{name}-refreshed').touch()
+        if os.environ.get('MOCK_REFRESH_FAILS'):
+            print('E: The repository https://broken.example noble Release does not have a Release file.',
+                  file=sys.stderr)
+            sys.exit(100)
+    if args[0] == 'update':
+        sys.exit(0)
+    if os.environ.get('MOCK_PACKAGE_BROKEN') or not (root / f'{name}-refreshed').exists():
+        print('E: Failed to fetch http://archive.example/pool/main/b/bubblewrap/bubblewrap_0.9.0_amd64.deb'
+              '  404  Not Found', file=sys.stderr)
+        sys.exit(100)
+    print('Setting up bubblewrap (0.9.0) ...')
     shutil.copyfile(sys.argv[0], root / 'stubs' / 'bwrap')
     (root / 'stubs' / 'bwrap').chmod(0o755)
 elif name == 'curl':
@@ -257,12 +272,46 @@ class InstallTests(unittest.TestCase):
                       self.profile.read_text())
         self.assertIn(['apparmor_parser', '-r', str(self.profile)], events)
 
-    def test_missing_bubblewrap_comes_from_the_package_manager(self):
+    def test_missing_bubblewrap_comes_from_the_package_manager_after_a_refresh(self):
         (self.stub / 'bwrap').unlink()
         self.stubs('apt-get')
         self.fresh()
         events = self.run_install()
-        self.assertIn(['apt-get', 'install', '-y', 'bubblewrap'], events)
+        install = ['apt-get', 'install', '-y', '-o', 'DPkg::Lock::Timeout=120', 'bubblewrap']
+        # With a stale index the install alone fails (404): the index is refreshed first.
+        self.assertLess(events.index(['apt-get', 'update', '-q']), events.index(install))
+        self.assertNotIn('Setting up bubblewrap', self.output)
+        self.assertIn('happy-supervisor 0.2.0-linux.1 is installed and running', self.output)
+
+    def test_a_repository_that_fails_to_refresh_does_not_stop_the_install(self):
+        (self.stub / 'bwrap').unlink()
+        self.stubs('apt-get')
+        self.fresh(MOCK_REFRESH_FAILS='1')
+        self.run_install()
+        self.assertIn('does not have a Release file', self.output)
+        self.assertIn('note: apt-get update failed (above)', self.output)
+        self.assertIn('happy-supervisor 0.2.0-linux.1 is installed and running', self.output)
+
+    def test_a_package_that_cannot_be_installed_shows_why_and_installs_nothing(self):
+        (self.stub / 'bwrap').unlink()
+        self.stubs('apt-get')
+        self.fresh(MOCK_PACKAGE_BROKEN='1')
+        events = self.run_install(success=False)
+        self.assertIn('bubblewrap_0.9.0_amd64.deb  404  Not Found', self.output)
+        self.assertIn('happy-supervisor install: apt-get could not install bubblewrap (its output is above)',
+                      self.output)
+        self.assertFalse(any(e[0] in ('curl', 'boot', 'candidate') for e in events))
+        self.assertFalse(self.bin.exists() or self.boot.exists())
+
+    def test_pacman_syncs_a_stale_database_and_installs(self):
+        (self.stub / 'bwrap').unlink()
+        self.stubs('pacman')
+        self.fresh()
+        events = self.run_install()
+        self.assertEqual([e for e in events if e[0] == 'pacman'],
+                         [['pacman', '-S', '--noconfirm', '--needed', 'bubblewrap'],
+                          ['pacman', '-Sy', '--noconfirm', '--needed', 'bubblewrap']])
+        self.assertIn('happy-supervisor 0.2.0-linux.1 is installed and running', self.output)
 
     def test_without_bubblewrap_or_a_package_manager_it_refuses_before_downloading(self):
         (self.stub / 'bwrap').unlink()

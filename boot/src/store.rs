@@ -150,6 +150,25 @@ impl Store {
         self.verified(version)
     }
 
+    /// Verifies and stores the build of `version` that an installer downloaded into `from`:
+    /// `SHA256SUMS`, `SHA256SUMS.minisig` and this platform's [`release::FILE`], as the release
+    /// serves them. Nothing is downloaded. Returns the binary's path.
+    pub fn install_from(&self, version: &str, from: &Path) -> Result<PathBuf, String> {
+        let read = |name: &str| {
+            fs::read(from.join(name)).map_err(|err| format!("{}: {err}", from.join(name).display()))
+        };
+        let sums = read(SUMS)?;
+        let signature =
+            String::from_utf8(read(SIG)?).map_err(|_| format!("{version}: {SIG} is not text"))?;
+        let binary = read(release::FILE)?;
+        self.install(&Build {
+            version,
+            sums: &sums,
+            signature: &signature,
+            binary: &binary,
+        })
+    }
+
     /// Removes every build but `keep`, and anything a stopped install left behind.
     pub fn prune(&self, keep: &[&str]) {
         let Ok(entries) = fs::read_dir(self.dir.join("versions")) else {
@@ -275,5 +294,38 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["1.0.0"]);
+    }
+
+    #[test]
+    fn a_build_an_installer_downloaded_is_stored_only_when_it_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::new();
+        let store = Store::open(dir.path().join("boot"), vec![signer.public()]).unwrap();
+        let from = dir.path().join("download");
+        fs::create_dir(&from).unwrap();
+        let (sums, sig) = signed(&signer, "1.0.0", b"one");
+        fs::write(from.join(SUMS), &sums).unwrap();
+        fs::write(from.join(SIG), &sig).unwrap();
+
+        let missing = store.install_from("1.0.0", &from).unwrap_err();
+        assert!(
+            missing.starts_with(&format!("{}: ", from.join(FILE).display())),
+            "{missing}"
+        );
+        fs::write(from.join(FILE), b"two").unwrap();
+        assert_eq!(
+            store.install_from("1.0.0", &from),
+            Err(format!(
+                "1.0.0: the downloaded {FILE} is not the signed build"
+            ))
+        );
+        // Signed for 1.0.0, so never another version's.
+        assert!(store.install_from("2.0.0", &from).is_err());
+        assert!(!dir.path().join("boot/versions/1.0.0").exists());
+
+        fs::write(from.join(FILE), b"one").unwrap();
+        let path = store.install_from("1.0.0", &from).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+        assert_eq!(store.verified("1.0.0"), Ok(path));
     }
 }

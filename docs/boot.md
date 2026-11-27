@@ -56,16 +56,25 @@ umask, because a workload user runs the supervisor's binary as itself (policy.md
 
 ```
 happy-supervisor-boot install --dir <dir> [--base <url>] [--version <version>]
+happy-supervisor-boot install --dir <dir> --version <version> --from <directory>
 happy-supervisor-boot run --dir <dir> [--base <url>] -- <supervisor arguments>...
+happy-supervisor-boot exec --dir <dir> -- <supervisor arguments>...
 ```
 
 * `install` downloads and verifies a version, by default the one `releases/latest` names. It
   makes that version current, keeps the one before it as previous, and prints the binary's path.
-  The installers use it, then run that binary's `join`.
+  With `--from` it downloads nothing: it takes the release's `SHA256SUMS`, `SHA256SUMS.minisig`
+  and `happy-supervisor-<os>-<arch>` from that directory and verifies them the same way. The
+  installers download both binaries themselves, then use `--from`, so the first start needs no
+  download, and run `join` through `exec`.
 * `run` starts the current version with the arguments after `--`, such as `run --state-dir <dir>
   --workload-user happy-workload`. It runs until the supervisor exits with code `3`, which means
   the control plane revoked the node (api.md, Connection), and then exits `3` too. If there is
   no current version, it installs the latest first.
+
+* `exec` verifies the current version, as before a start, and runs it with the arguments after
+  `--`, in place of boot on Unix. The installers make `happy-supervisor` a script that runs it,
+  so `sudo happy-supervisor system enable …` runs the version boot runs.
 
 `--base` defaults to `https://get.happy.engineering`. It must be `https://`. Plain `http://` is
 allowed only on a loopback host, for tests. Releases are fetched from `<base>/releases/<version>/`.

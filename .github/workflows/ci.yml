@@ -42,6 +42,15 @@ jobs:
         run: |
           shellcheck deploy/install.sh deploy/publish.sh
           python3 -m unittest discover -s deploy -p 'test_*.py'
+      # `irm … | iex` runs install.ps1 in Windows PowerShell 5.1 on most computers; the tests
+      # above run it in PowerShell 7.
+      - name: install.ps1 parses in Windows PowerShell
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errors = $null
+          [Management.Automation.Language.Parser]::ParseFile("$PWD\deploy\install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | Format-List; exit 1 }
       - run: cargo clippy --all-targets --all-features -- -D warnings
       # The control plane's library alone, so no node-only dependency leaks into it.
       - run: cargo clippy --lib --no-default-features --features control-plane -- -D warnings

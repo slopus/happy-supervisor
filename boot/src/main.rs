@@ -13,6 +13,13 @@ const USAGE: &str = "usage:
   happy-supervisor-boot install --dir <boot dir> [--base <url>] [--version <version>]
       Download, verify and make current a version (default: the latest release), and print
       the path of its binary.
+  happy-supervisor-boot install --dir <boot dir> --version <version> --from <directory>
+      The same with the release's files already downloaded into <directory> (SHA256SUMS,
+      SHA256SUMS.minisig and this platform's happy-supervisor-<os>-<arch>), as the installers
+      do: nothing is downloaded.
+  happy-supervisor-boot exec --dir <boot dir> -- <supervisor arguments>...
+      Verify the current version and run it with these arguments, as `happy-supervisor` for an
+      administrator (`system enable`, `info`).
   happy-supervisor-boot --version";
 
 struct Args {
@@ -20,6 +27,7 @@ struct Args {
     dir: PathBuf,
     base: String,
     version: Option<String>,
+    from: Option<PathBuf>,
     rest: Vec<OsString>,
 }
 
@@ -28,7 +36,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> {
         .next()
         .and_then(|arg| arg.into_string().ok())
         .ok_or(USAGE)?;
-    let (mut dir, mut base, mut version) = (None, DEFAULT_BASE.to_owned(), None);
+    let (mut dir, mut base, mut version, mut from) = (None, DEFAULT_BASE.to_owned(), None, None);
     let mut rest = Vec::new();
     while let Some(arg) = args.next() {
         let mut value = || {
@@ -40,7 +48,8 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> {
             Some("--dir") => dir = Some(PathBuf::from(value()?)),
             Some("--base") => base = value()?,
             Some("--version") if command == "install" => version = Some(value()?),
-            Some("--") if command == "run" => {
+            Some("--from") if command == "install" => from = Some(PathBuf::from(value()?)),
+            Some("--") if command == "run" || command == "exec" => {
                 rest = args.by_ref().collect();
             }
             _ => {
@@ -52,11 +61,15 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> {
         }
     }
     let dir = dir.ok_or_else(|| format!("--dir is required\n{USAGE}"))?;
+    if from.is_some() && version.is_none() {
+        return Err(format!("--from needs --version\n{USAGE}"));
+    }
     Ok(Args {
         command,
         dir,
         base,
         version,
+        from,
         rest,
     })
 }
@@ -88,13 +101,40 @@ fn run(args: Args) -> Result<ExitCode, String> {
             let code = supervise::run(Config::new(store, fetcher, args.rest))?;
             Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
         }
+        "exec" => {
+            let io = |err: std::io::Error| format!("{}: {err}", args.dir.display());
+            let current = store
+                .state()
+                .map_err(io)?
+                .current
+                .ok_or_else(|| format!("{} has no current version", args.dir.display()))?;
+            let path = store.verified(&current)?;
+            let mut command = std::process::Command::new(&path);
+            command.args(&args.rest);
+            #[cfg(unix)]
+            {
+                let err = std::os::unix::process::CommandExt::exec(&mut command);
+                Err(format!("cannot run {}: {err}", path.display()))
+            }
+            #[cfg(not(unix))]
+            {
+                let status = command
+                    .status()
+                    .map_err(|err| format!("cannot run {}: {err}", path.display()))?;
+                let code = status.code().unwrap_or(1);
+                Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+            }
+        }
         "install" => {
             let version = match args.version {
                 Some(version) => version,
                 None => fetcher.latest()?,
             };
             release::check_version(&version)?;
-            let path = fetcher.fetch(&store, &version, |_| {})?;
+            let path = match &args.from {
+                Some(from) => store.install_from(&version, from)?,
+                None => fetcher.fetch(&store, &version, |_| {})?,
+            };
             let io = |err: std::io::Error| format!("{}: {err}", args.dir.display());
             let state = store.state().map_err(io)?;
             let previous = match state.current {

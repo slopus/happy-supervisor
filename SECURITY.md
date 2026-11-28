@@ -6,6 +6,16 @@ it with less. The details live in [docs/policy.md](docs/policy.md),
 [docs/proxy.md](docs/proxy.md), [docs/tunnels.md](docs/tunnels.md) and [docs/api.md](docs/api.md),
 and how to install the node is in [docs/install.md](docs/install.md).
 
+## What the sandbox is for
+
+The sandbox is not a security boundary. It keeps code that means no harm from doing damage by
+accident: writing outside the paths its policy allows, reading a path the policy denies, or
+reaching a host its egress rules do not name. It is not designed to contain hostile code, which
+can get out through a kernel bug, a service it shares with the host, or a gap the probe lists.
+Work that must be contained needs the VM mode, a fully contained virtual machine (Kata, KVM)
+designed apart from this sandbox. The requirements below still hold: a policy is enforced as
+written, and a node that cannot enforce it refuses the operation.
+
 ## Trust model
 
 1. The node trusts exactly one control plane. The control plane decides what runs on the
@@ -62,8 +72,8 @@ and how to install the node is in [docs/install.md](docs/install.md).
     io_uring, ptrace, other processes' memory, bpf, perf events, userfaultfd, keyrings, mounts and
     new namespaces, and Unix sockets when the policy denies them.
 16. **macOS:** Seatbelt (`sandbox-exec`) with a profile generated from the policy.
-17. **Windows:** a real sandbox, as in Codex's `windows-sandbox-rs`: a dedicated identity, ACLs on
-    the policy's paths, and firewall filters for the network.
+17. **Windows:** as in Codex's `windows-sandbox-rs`: a dedicated identity, ACLs on the policy's
+    paths, and firewall filters for the network.
 18. Host requirements are acceptable: bubblewrap and unprivileged user namespaces on Linux, a
     one-time administrator install on Windows. A node without them reports the sandbox as
     unavailable. Isolated networking on Linux also needs the state directory's path short enough

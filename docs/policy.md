@@ -6,6 +6,13 @@ its own: every policy states its own default for reads, for writes and for netwo
 the exceptions to it. The operating system enforces it, through bubblewrap and seccomp on Linux,
 Seatbelt on macOS, and a restricted token with ACLs and a firewall on Windows.
 
+**The sandbox is not a security boundary.** It stops accidents by code that means no harm: a
+write outside the paths the policy allows (a stray `rm -rf`, a tool that edits `~/.config`), a
+read of a denied secret, a connection to a host the egress rules do not name. It is not designed
+to contain hostile code, which can get out through a kernel bug, a service it shares with the
+host, or one of the gaps listed below. Code that must be contained needs the VM mode, a fully
+contained virtual machine (Kata, KVM) designed apart from this sandbox.
+
 ```json
 {
   "filesystem": {

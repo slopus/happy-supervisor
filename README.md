@@ -6,8 +6,10 @@ the machine opens no inbound port. Both sides queue their messages until the oth
 them, so a dropped connection resumes without losing or repeating anything, and a session that
 cannot resume is detected rather than silently lost. Commands and file operations run either raw, with the
 supervisor's rights, or sandboxed by a policy the operating system enforces (bubblewrap and
-seccomp on Linux, Seatbelt on macOS, a restricted token on Windows). It runs on Linux, macOS and
-Windows, on x86_64 and aarch64.
+seccomp on Linux, Seatbelt on macOS, a restricted token on Windows). The sandbox guards against
+accidents, such as writes outside the workspace and network egress the policy does not allow. It
+is not a security boundary for hostile code; the VM mode is the option for that
+([SECURITY.md](SECURITY.md)). It runs on Linux, macOS and Windows, on x86_64 and aarch64.
 
 Install it with the join URL and token from the control plane ([docs/install.md](docs/install.md);
 releases are at `https://get.happy.engineering`, [deploy/README.md](deploy/README.md)):

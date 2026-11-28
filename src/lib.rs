@@ -4,7 +4,6 @@
 //! The `node` feature (default) is the supervisor. `control-plane` alone is the control plane's
 //! side of the link: `protocol`, `wire`, `link`, `ws::upgrade` and `server`.
 
-#[cfg(all(feature = "node", target_os = "linux"))]
 #[cfg(feature = "node")]
 pub mod boot;
 #[cfg(feature = "node")]

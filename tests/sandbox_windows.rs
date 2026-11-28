@@ -931,7 +931,7 @@ fn exec_start_runs_through_the_broker() {
             tree.show("out")
         ));
         argv.insert(2, "/v:on".to_string());
-        exec.start(params("w1", argv), confinement(), None, None, None)
+        exec.start(params("w1", argv), confinement(), None, None)
             .await
             .unwrap();
         exec.write(ExecWriteParams {
@@ -953,7 +953,7 @@ fn exec_start_runs_through_the_broker() {
         assert_eq!(log.data.into_vec(), b"inside\r\n");
 
         let argv = cmd(format!(r"echo x>{}", tree.show("data/new.txt")));
-        exec.start(params("w2", argv), confinement(), None, None, None)
+        exec.start(params("w2", argv), confinement(), None, None)
             .await
             .unwrap();
         assert_eq!(exited("w2").await, ExitStatus::Exited { code: 1 });
@@ -961,7 +961,7 @@ fn exec_start_runs_through_the_broker() {
 
         let argv = vec![r"C:\nonexistent\prog.exe".to_string()];
         let err = exec
-            .start(params("w3", argv), confinement(), None, None, None)
+            .start(params("w3", argv), confinement(), None, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotFound, "{err}");

@@ -1,7 +1,6 @@
 //! The message boundary: parses each command's body, resolves `access` once, and calls the
 //! module that owns the command. Stream messages from the control plane go to the proxy.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,44 +132,6 @@ impl Node {
     /// Kills every running command, for a normal exit.
     pub async fn shutdown(&self) {
         self.exec.shutdown().await;
-    }
-
-    /// On Linux, a socket through which a system command that runs as `happy-system` installs
-    /// with apt while system access still runs as `happy-system` (policy.md, Installing with
-    /// apt), and the command's `env` to reach it.
-    #[cfg(target_os = "linux")]
-    async fn apt_gate(
-        &self,
-        system: &System,
-        env: &mut BTreeMap<String, String>,
-    ) -> Result<Option<crate::exec::AptGate>> {
-        use crate::system_account::USER;
-        let Some(account) = system.account().filter(|_| system.user() == USER) else {
-            return Ok(None);
-        };
-        let uid = account.uid();
-        let identity = self.identity.clone();
-        let enabled = move || identity.system().is_ok_and(|system| system.user() == USER);
-        let gate = tokio::task::spawn_blocking(move || crate::exec::AptGate::open(uid, enabled))
-            .await
-            .map_err(|err| Error::new(ErrorKind::Io, format!("system access failed: {err}")))?
-            .map_err(|err| {
-                Error::new(
-                    ErrorKind::Io,
-                    format!("system access failed: cannot open the apt socket: {err}"),
-                )
-            })?;
-        gate.apply_env(env);
-        Ok(Some(gate))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    async fn apt_gate(
-        &self,
-        _system: &System,
-        _env: &mut BTreeMap<String, String>,
-    ) -> Result<Option<crate::exec::AptGate>> {
-        Ok(None)
     }
 
     /// What an operation runs under, and as whom. `what` names it in the log line every system
@@ -413,19 +374,13 @@ async fn command(node: &Node, kind: &str, body: Value) -> Result<Value> {
                 user,
                 system,
             } = node.confine(access, what).await?;
-            let mut apt = None;
             if let Some(system) = system {
                 system.apply_env(&mut params.env);
-                apt = node.apt_gate(&system, &mut params.env).await?;
             }
             let proxy = node
                 .command_proxy(&params.exec_id, params.proxy.take(), &mut confinement)
                 .await?;
-            to_value(
-                node.exec
-                    .start(params, confinement, proxy, user, apt)
-                    .await?,
-            )
+            to_value(node.exec.start(params, confinement, proxy, user).await?)
         }
         CommandKind::ExecWrite => {
             node.exec.write(parse::<ExecWriteParams>(params)?).await?;

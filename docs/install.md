@@ -101,20 +101,16 @@ that is not root runs its work as itself, which is already a separate user.
 The state directory's private part, credentials included, stays `0700` root, so neither raw nor
 sandboxed work can read it (policy.md, Fixed rules).
 
-6. Optionally, let the control plane run chosen commands as `happy-system`, for `npm install -g`
-   (policy.md, System access):
+6. Optionally, let the control plane run chosen commands, each reviewed, as root, for installing
+   system-wide software (policy.md, System access):
 
    ```
    sudo happy-supervisor system enable --state-dir /var/lib/happy-supervisor
    ```
 
-   It creates `happy-system` and its npm prefix `/opt/happy-system/npm` if missing, and takes
-   effect at once, without a restart; `system disable` turns it off the same way and kills
-   `happy-system`'s processes. `happy-system` cannot read the credentials. Its `apt-get install
-   <names>` and `apt-get update` go through the supervisor, which installs packages by name only
-   and updates from the configured sources only (policy.md, Installing with apt). For any other
-   `apt-get` command, add `--user root` instead: a system command is then root, so it can read
-   the credentials too.
+   It takes effect at once, without a restart; `system disable` turns it off the same way. A
+   system command is root, so it may do anything, reading the credentials too. `install.sh` with
+   sudo does this step itself.
 
 ## Containers
 

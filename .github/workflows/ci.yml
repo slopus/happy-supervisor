@@ -74,20 +74,16 @@ jobs:
             | jq -r 'select(.target.name == "workload" and .executable != null) | .executable')
           sudo "$bin" --nocapture
       # System access (policy.md) for real: apt-get and npm -g on Linux, brew and npm -g on macOS
-      # are refused as raw and before `system enable`, then install. The runner is thrown away.
+      # are refused as raw and before `system enable`, then install; on Linux, as root, anything
+      # else too, and 0.2.12's happy-system moves to root. One at a time: both change accounts.
+      # The runner is thrown away.
       - name: system access installs packages, as root
         if: runner.os != 'Windows'
         run: |
-          # system enable refuses a /opt that others may change; the runner's may be one.
-          if [ "$RUNNER_OS" = Linux ]; then
-            ls -ld /opt
-            sudo chown root:root /opt
-            sudo chmod 755 /opt
-          fi
           bin=$(cargo test --all-features --test workload --no-run --message-format=json \
             | jq -r 'select(.target.name == "workload" and .executable != null) | .executable')
           sudo HS_TEST_PATH="$(dirname "$(command -v npm)")" "$bin" --ignored --nocapture \
-            system_access_installs_packages
+            --test-threads=1 system_access_
       # limits.memoryBytes and processes need a cgroup delegated to the supervisor: each node runs
       # in a user scope with Delegate=yes, as an installed user service would (docs/install.md).
       - name: limits, in a delegated cgroup

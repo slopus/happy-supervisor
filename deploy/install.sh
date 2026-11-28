@@ -22,18 +22,20 @@
 # and says why. A user install refuses when bubblewrap is missing.
 #
 # A sudo install also enables system access (docs/policy.md, System access): the control plane
-# may run chosen commands, each reviewed, as the account that installs software, so `apt-get
-# install`, `npm install -g` and `brew install` work without sudo. On Linux that is happy-system,
-# which it creates with an npm prefix it owns and which cannot read the node's credentials; on
-# macOS Homebrew's owner, or root without Homebrew. When `system enable` refuses (it says why), the
-# install goes on without it. --no-system (`sh -s -- --no-system`) leaves it off; --system makes a
-# refusal fail the install. An install without sudo cannot have it.
+# may run chosen commands, each reviewed, as the account that installs software, so installing
+# system-wide works without sudo. On Linux that is root: any command, which can read the node's
+# credentials too; on macOS Homebrew's owner, since brew refuses root, or root without Homebrew.
+# When `system enable` refuses (it says why), the install goes on without it. --no-system
+# (`sh -s -- --no-system`) leaves it off; --system makes a refusal fail the install. An install
+# without sudo cannot have it.
 # `sudo happy-supervisor system enable|disable --state-dir <the service's>` changes it later.
 #
 # Run again without HAPPY_JOIN_TOKEN to upgrade a joined computer in place (the same sudo or not);
-# a sudo upgrade enables system access too, unless --no-system.
+# a sudo upgrade enables system access too, unless --no-system, and on Linux moves it from
+# happy-system, the account 0.2.12 and earlier used, to root, removing that account and its npm
+# prefix (the service does the same as it starts, so an automatic update moves it too).
 # Uninstall (removes the service, its state, the binary and, for a system install, the
-# happy-workload user and on Linux happy-system and its npm prefix):
+# happy-workload user and on Linux what 0.2.12 and earlier made for happy-system):
 #
 #   curl -fsSL https://get.happy.engineering/install.sh | sudo sh -s -- --uninstall
 #
@@ -53,7 +55,7 @@ MINISIGN_LINUX_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d982
 MINISIGN_MACOS_SHA256="89000b19535765f9cffc65a65d64a820f433ef6db8020667f7570e06bf6aac63"
 APPARMOR_PROFILE=/etc/apparmor.d/happy-supervisor-bwrap
 WORKLOAD_USER=happy-workload
-# System access's account on Linux, which `system enable` creates (src/system_account.rs).
+# System access's account on Linux in 0.2.12 and earlier, which 0.2.13 removes (src/system_account.rs).
 SYSTEM_USER=happy-system
 SYSTEM_DIR=/opt/happy-system
 SYSTEM_PROFILE=/etc/profile.d/happy-system.sh

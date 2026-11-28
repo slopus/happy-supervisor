@@ -296,14 +296,15 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
 
 `{ "mode": "system" }` access carries no policy and runs as the account that installs
 system-wide software on this machine, so `apt-get install`, `npm install -g` and `brew install`
-work. It is off unless an administrator enables it, and the control plane asks for it per
-command, file operation or watch.
+work. A sudo install enables it (`install.sh`, unless `--no-system`); otherwise it is off until an
+administrator enables it. The control plane asks for it per command, file operation or watch.
 
 * `sudo happy-supervisor system enable [--user <name>] [--path <dir>]... --state-dir <dir>`
   records the account, and the directories to put first in its commands' `PATH`, in
   `private/system`, which only root can read or write. `system disable` removes it, and `system
   status` prints it. Each takes the service's state directory (install.md) and refuses one that
-  does not exist. `install.sh --system` runs `system enable` after joining.
+  does not exist. A sudo `install.sh` runs `system enable` after joining, and again on each sudo
+  upgrade, unless `--no-system`.
 * On Linux the account is `happy-system`, which `system enable` creates when it is missing: a
   system user with a home and no login shell, owning the npm prefix `/opt/happy-system/npm`,
   which its `~/.npmrc` names, so `npm install -g` works without root. `/etc/profile.d/happy-system.sh`

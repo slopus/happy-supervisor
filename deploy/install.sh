@@ -21,13 +21,17 @@
 # 23.10 and later), loads a profile that lets bubblewrap create them. Where it cannot, it refuses
 # and says why. A user install refuses when bubblewrap is missing.
 #
-# With --system (`sh -s -- --system`, sudo only) the control plane may also run chosen commands as
-# the account that installs software: on Linux happy-system, which it creates with an npm prefix
-# it owns and which cannot read the node's credentials; on macOS Homebrew's owner
-# (docs/policy.md, System access). `sudo happy-supervisor system enable|disable --state-dir <the service's>` changes
-# that later.
+# A sudo install also enables system access (docs/policy.md, System access): the control plane
+# may run chosen commands, each reviewed, as the account that installs software, so `apt-get
+# install`, `npm install -g` and `brew install` work without sudo. On Linux that is happy-system,
+# which it creates with an npm prefix it owns and which cannot read the node's credentials; on
+# macOS Homebrew's owner, or root without Homebrew. When `system enable` refuses (it says why), the
+# install goes on without it. --no-system (`sh -s -- --no-system`) leaves it off; --system makes a
+# refusal fail the install. An install without sudo cannot have it.
+# `sudo happy-supervisor system enable|disable --state-dir <the service's>` changes it later.
 #
-# Run again without HAPPY_JOIN_TOKEN to upgrade a joined computer in place (the same sudo or not).
+# Run again without HAPPY_JOIN_TOKEN to upgrade a joined computer in place (the same sudo or not);
+# a sudo upgrade enables system access too, unless --no-system.
 # Uninstall (removes the service, its state, the binary and, for a system install, the
 # happy-workload user and on Linux happy-system and its npm prefix):
 #
@@ -122,18 +126,25 @@ service_start() {
   fi
 }
 
+# System access: on for a sudo install (`default`), unless --no-system; `required` with --system.
 system=
+[ -z "$root" ] || system=default
 case "${1:-}" in
   "" | --uninstall) ;;
   --system)
     [ -n "$root" ] || fail "--system needs a sudo install: system access runs as root or another account, which only a supervisor running as root can switch to"
-    system=1
+    system=required
     ;;
-  *) fail "unknown option $1: the options are --system and --uninstall" ;;
+  --no-system) system= ;;
+  *) fail "unknown option $1: the options are --system, --no-system and --uninstall" ;;
 esac
-# Runs `system enable` with the binary in $1.
+# Runs `system enable` with the binary in $1. By default a refusal only says why and how to
+# enable it later; with --system it fails.
 enable_system() {
-  [ -z "$system" ] || "$1" system enable --state-dir "$STATE"
+  [ -n "$system" ] || return 0
+  "$1" system enable --state-dir "$STATE" && return 0
+  [ "$system" = default ] || return 1
+  echo "note: system access is off (above); fix that, then run: sudo happy-supervisor system enable --state-dir \"$STATE\"" >&2
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -371,7 +382,7 @@ PLIST
 # Verified: only now does anything reach a system path, or the user's own.
 if [ -n "$upgrade" ]; then
   install_boot
-  # Before the service stops, so a release without `system` leaves the running one as it was.
+  # Before the service stops, so a refusal with --system leaves the running one as it was.
   enable_system "$(cat "$work/supervisor")" || {
     rm -f "$BOOT.new"
     fail "could not enable system access; the running service is unchanged"
@@ -453,7 +464,9 @@ write_wrapper
 # shellcheck disable=SC2086 # $workload is two words or none.
 HAPPY_JOIN_TOKEN="$HAPPY_JOIN_TOKEN" "$BIN" join --url "$HAPPY_JOIN_URL" \
   ${HAPPY_NODE_NAME:+--name "$HAPPY_NODE_NAME"} --state-dir "$STATE" $workload
-enable_system "$BIN"
+enable_system "$BIN" || fail "could not enable system access (above)"
+[ -n "$root" ] ||
+  echo "note: without sudo there is no system access (installing system-wide software); install with sudo to have it"
 
 write_unit
 service_start

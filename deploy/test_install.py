@@ -67,6 +67,9 @@ import json, os, pathlib, sys
 root = pathlib.Path(os.environ['MOCK_ROOT'])
 with (root / 'events').open('a') as out:
     out.write(json.dumps(['candidate', *sys.argv[1:]]) + '\n')
+if sys.argv[1:3] == ['system', 'enable'] and os.environ.get('MOCK_SYSTEM_REFUSED'):
+    print('happy-supervisor: /opt is writable by others', file=sys.stderr)
+    sys.exit(1)
 if sys.argv[1] == 'join':
     out = (root / 'events').open('a')
     out.write(json.dumps(['join token', os.environ.get('HAPPY_JOIN_TOKEN')]) + '\n')
@@ -236,23 +239,52 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(self.profile.exists())
         self.assertIn('happy-supervisor 0.2.0-linux.1 is installed and running', self.output)
 
-    def test_system_enables_system_access_after_joining(self):
-        self.fresh()
-        events = self.run_install('--system')
-        candidate = [e for e in events if e[0] == 'candidate']
-        self.assertEqual(candidate[1], ['candidate', 'system', 'enable', '--state-dir', str(self.state)])
-        self.assertEqual(candidate[0][1], 'join')
-        self.assertLess(events.index(candidate[1]), events.index(['systemctl', 'restart', 'happy-supervisor']))
+    def test_a_sudo_install_enables_system_access_after_joining(self):
+        for flag in [(), ('--system',)]:
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.fresh()
+                events = self.run_install(*flag)
+                candidate = [e for e in events if e[0] == 'candidate']
+                self.assertEqual(candidate[1], ['candidate', 'system', 'enable', '--state-dir', str(self.state)])
+                self.assertEqual(candidate[0][1], 'join')
+                self.assertLess(events.index(candidate[1]),
+                                events.index(['systemctl', 'restart', 'happy-supervisor']))
+                self.assertNotIn('note: system access is off', self.output)
 
-    def test_an_upgrade_with_system_enables_it_before_stopping_the_service(self):
+    def test_an_upgrade_enables_system_access_before_stopping_the_service(self):
         self.fresh()
-        self.run_install()
+        self.run_install('--no-system')
         (self.root / 'events').unlink()
         del self.env['HAPPY_JOIN_TOKEN']
-        events = self.run_install('--system')
+        events = self.run_install()
         enable = ['candidate', 'system', 'enable', '--state-dir', str(self.state)]
         self.assertLess(events.index(enable),
                         events.index(['systemctl', 'disable', '--now', 'happy-supervisor']))
+
+    def test_no_system_leaves_system_access_off_on_install_and_upgrade(self):
+        self.fresh()
+        events = self.run_install('--no-system')
+        self.assertFalse(any(e[:2] == ['candidate', 'system'] for e in events))
+        (self.root / 'events').unlink()
+        del self.env['HAPPY_JOIN_TOKEN']
+        events = self.run_install('--no-system')
+        self.assertFalse(any(e[:2] == ['candidate', 'system'] for e in events))
+        self.assertIn('happy-supervisor upgraded to', self.output)
+
+    def test_a_refused_system_enable_says_why_and_the_install_goes_on(self):
+        self.fresh(MOCK_SYSTEM_REFUSED='1')
+        self.run_install()
+        self.assertIn('/opt is writable by others', self.output)
+        self.assertIn('note: system access is off (above); fix that, then run: '
+                      f'sudo happy-supervisor system enable --state-dir "{self.state}"', self.output)
+        self.assertIn('happy-supervisor 0.2.0-linux.1 is installed and running', self.output)
+
+    def test_with_system_a_refused_system_enable_fails(self):
+        self.fresh(MOCK_SYSTEM_REFUSED='1')
+        events = self.run_install('--system', success=False)
+        self.assertIn('could not enable system access', self.output)
+        self.assertFalse(any(e[0] == 'systemctl' and 'restart' in e for e in events))
 
     def test_system_without_sudo_refuses_before_downloading(self):
         self.fresh(MOCK_UID='1000')
@@ -260,10 +292,11 @@ class InstallTests(unittest.TestCase):
         self.assertIn('--system needs a sudo install', self.output)
         self.assertFalse(any(e[0] == 'curl' for e in events))
 
-    def test_a_default_install_leaves_system_access_off(self):
-        self.fresh()
+    def test_a_user_install_has_no_system_access_and_says_so(self):
+        self.fresh(MOCK_UID='1000')
         events = self.run_install()
         self.assertFalse(any(e[:2] == ['candidate', 'system'] for e in events))
+        self.assertIn('note: without sudo there is no system access', self.output)
 
     def test_where_apparmor_restricts_user_namespaces_bubblewrap_gets_a_profile(self):
         self.fresh(MOCK_RESTRICTED='1')
@@ -369,7 +402,9 @@ class InstallTests(unittest.TestCase):
         self.assertLess(events.index(self.boot_install(events)),
                         events.index(['systemctl', 'disable', '--now', 'happy-supervisor']))
         self.assertEqual(json.loads((self.boot_dir / 'state.json').read_text())['current'], '0.2.0-linux.1')
-        self.assertFalse(any(e[0] == 'candidate' for e in events))
+        # It does not join again; a sudo upgrade enables system access.
+        self.assertEqual([e for e in events if e[0] == 'candidate'],
+                         [['candidate', 'system', 'enable', '--state-dir', str(self.state)]])
         self.assertIn(['systemctl', 'restart', 'happy-supervisor'], events)
         self.assertIn('happy-supervisor upgraded to 0.2.0-linux.1', self.output)
 

@@ -107,22 +107,6 @@ impl Identity {
         Vec::new()
     }
 
-    /// On Linux with system access as `happy-system`, the directory of the programs it installs
-    /// with `npm install -g`, which NodeInfo `defaultEnv` appends to `PATH` so every command
-    /// finds them. Only with a workload user: `happy-system` may write it, so it is never on the
-    /// `PATH` of commands that run as root.
-    pub fn shared_bin(&self) -> Option<&'static str> {
-        #[cfg(target_os = "linux")]
-        if self.workload().is_some()
-            && self
-                .system()
-                .is_ok_and(|system| system.user == crate::system_account::USER)
-        {
-            return Some(crate::system_account::PREFIX_BIN);
-        }
-        None
-    }
-
     /// NodeInfo `identity`.
     pub fn info(&self) -> IdentityInfo {
         IdentityInfo {
@@ -205,18 +189,6 @@ impl System {
     /// `LOGNAME`, on macOS its `TMPDIR`, and the recorded directories first in `PATH`, ahead of
     /// any other copy of them, so package managers use the account's caches and Homebrew's tools.
     pub fn apply_env(&self, env: &mut BTreeMap<String, String>) {
-        // A root command never gets the directory `happy-system` writes, even from a
-        // `defaultEnv` read while system access ran as `happy-system`.
-        #[cfg(target_os = "linux")]
-        if self.account.is_none()
-            && let Some(path) = env.get_mut("PATH")
-        {
-            let kept: Vec<&str> = path
-                .split(':')
-                .filter(|entry| *entry != crate::system_account::PREFIX_BIN)
-                .collect();
-            *path = kept.join(":");
-        }
         env.insert("HOME".to_owned(), self.home.clone());
         for key in ["USER", "LOGNAME"] {
             env.insert(key.to_owned(), self.user.clone());
@@ -243,11 +215,11 @@ impl System {
 }
 
 /// `happy-supervisor system enable`: records the account system access runs as, with `path` and
-/// the account's own directories for `PATH`. Without `user`, on Linux that is `happy-system`,
-/// which this creates with an npm prefix it owns (system_account.rs); root only when named, since
-/// root can read the node's credentials. On macOS it is Homebrew's owner, with Homebrew's
-/// directories, because `brew` refuses to run as root and Homebrew's `npm -g` installs into its
-/// prefix; root on a Mac without Homebrew. Needs root.
+/// the account's own directories for `PATH`. Without `user`, on Linux that is root, which can do
+/// anything, reading the node's credentials too; enabling it as root removes `happy-system`, the
+/// account 0.2.12 and earlier ran it as (system_account.rs). On macOS it is Homebrew's owner,
+/// with Homebrew's directories, because `brew` refuses to run as root and Homebrew's `npm -g`
+/// installs into its prefix; root on a Mac without Homebrew. Needs root.
 pub fn enable_system(
     state: &StateDir,
     user: Option<String>,
@@ -277,16 +249,11 @@ pub fn enable_system(
     let user = match user {
         Some(user) => user,
         #[cfg(target_os = "linux")]
-        None => crate::system_account::USER.to_owned(),
+        None => "root".to_owned(),
         #[cfg(not(target_os = "linux"))]
         None => user_name(homebrew.as_ref().map_or(0, |brew| brew.owner))?,
     };
     let mut entries = homebrew.map(|brew| brew.path).unwrap_or_default();
-    #[cfg(target_os = "linux")]
-    if user == crate::system_account::USER {
-        crate::system_account::provision()?;
-        entries.push(crate::system_account::PREFIX_BIN.to_owned());
-    }
     for dir in path {
         if !entries.contains(&dir) {
             entries.push(dir);
@@ -298,18 +265,41 @@ pub fn enable_system(
     };
     System::resolve(access.clone(), &supervisor_user)?;
     state.store_system(Some(&access))?;
+    #[cfg(target_os = "linux")]
+    if access.user == "root" {
+        crate::system_account::remove()?;
+    }
     Ok(access)
 }
 
-/// `happy-supervisor system disable`: refuses system access from the next request on, then, on
-/// Linux, kills every process of `happy-system`, so nothing a system command left behind keeps
-/// running. Needs root.
+/// Moves system access that runs as `happy-system`, as 0.2.12 and earlier enabled it by
+/// default, to root, and removes that account ([`enable_system`]). The service does this as it
+/// starts, so an automatic update moves it. Returns the new access when it moved. Linux; needs
+/// root, and does nothing otherwise.
+pub fn upgrade_system(state: &StateDir) -> Result<Option<SystemAccess>> {
+    #[cfg(target_os = "linux")]
+    if current().1
+        && let Some(access) = state
+            .system()?
+            .filter(|access| access.user == crate::system_account::USER)
+    {
+        let path = access
+            .path
+            .into_iter()
+            .filter(|dir| dir != crate::system_account::PREFIX_BIN)
+            .collect();
+        return enable_system(state, Some("root".to_owned()), path).map(Some);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state;
+    Ok(None)
+}
+
+/// `happy-supervisor system disable`: refuses system access from the next request on. Needs
+/// root.
 pub fn disable_system(state: &StateDir) -> Result<()> {
     state.check_protected()?;
-    state.store_system(None)?;
-    #[cfg(target_os = "linux")]
-    crate::system_account::kill_processes()?;
-    Ok(())
+    state.store_system(None)
 }
 
 /// Homebrew's repository and prefix: Apple silicon's, then Intel's.
@@ -783,23 +773,6 @@ mod tests {
         let mut empty = BTreeMap::new();
         system.apply_env(&mut empty);
         assert_eq!(empty["PATH"], "/opt/homebrew/bin:/opt/homebrew/sbin");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_root_command_never_gets_the_directory_happy_system_writes() {
-        let system = System {
-            user: "root".to_string(),
-            account: None,
-            home: "/root".to_string(),
-            path: vec![],
-        };
-        let mut env = BTreeMap::from([(
-            "PATH".to_string(),
-            "/usr/bin:/opt/happy-system/npm/bin:/bin".to_string(),
-        )]);
-        system.apply_env(&mut env);
-        assert_eq!(env["PATH"], "/usr/bin:/bin");
     }
 
     #[test]

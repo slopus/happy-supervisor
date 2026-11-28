@@ -5,7 +5,6 @@
 //! side of the link: `protocol`, `wire`, `link`, `ws::upgrade` and `server`.
 
 #[cfg(all(feature = "node", target_os = "linux"))]
-pub mod apt;
 #[cfg(feature = "node")]
 pub mod boot;
 #[cfg(feature = "node")]

@@ -88,9 +88,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SystemAction {
-    /// Run system access as `--user`, else on Linux as `happy-system`, which this creates, and
-    /// on macOS as Homebrew's owner (root without Homebrew). `--user root` is root-equivalent:
-    /// system commands can then read this node's credentials.
+    /// Run system access as `--user`, else on Linux as root, and on macOS as Homebrew's owner
+    /// (root without Homebrew). As root, system commands may do anything, reading this node's
+    /// credentials too. Enabling it as root on Linux removes `happy-system`, the account 0.2.12
+    /// and earlier ran it as.
     Enable {
         #[arg(long)]
         user: Option<String>,
@@ -100,8 +101,7 @@ enum SystemAction {
         #[command(flatten)]
         state: ServiceState,
     },
-    /// Refuse system access from the next request on, and on Linux stop every process of
-    /// `happy-system`.
+    /// Refuse system access from the next request on.
     Disable(ServiceState),
     /// Print the account system access runs as, or that it is disabled.
     Status(ServiceState),
@@ -115,11 +115,6 @@ struct ServiceState {
 }
 
 fn main() -> ExitCode {
-    // `apt` and `apt-get` in a system command are links to this binary (apt.rs).
-    #[cfg(target_os = "linux")]
-    if let Some(code) = happy_supervisor::apt::shim_main(std::env::args_os()) {
-        return code;
-    }
     // The helper must start before any runtime or thread exists (docs/architecture.md).
     if std::env::args_os()
         .nth(1)
@@ -178,8 +173,8 @@ fn open_state(
 /// What `system enable` and `system status` say of enabled system access.
 fn enabled(access: &SystemAccess) -> String {
     match access.user.as_str() {
-        "root" => "system access enabled: it runs as root, which is root-equivalent: system \
-                   commands can read this node's credentials"
+        "root" => "system access enabled: it runs as root, so system commands may do anything, \
+                   reading this node's credentials too"
             .to_owned(),
         user => format!("system access enabled: it runs as {user}"),
     }
@@ -222,7 +217,14 @@ async fn run(command: Command) -> happy_supervisor::Result<ExitCode> {
         } => match client::run({
             // Before the state opens: with boot, its cgroup handoff needs to know (boot.md).
             happy_supervisor::boot::attach();
-            open_state(state_dir, workload_user)?
+            let state = open_state(state_dir, workload_user)?;
+            // An automatic update moves system access from `happy-system` to root.
+            match identity::upgrade_system(&state) {
+                Ok(Some(_)) => tracing::info!("system access moved from happy-system to root"),
+                Ok(None) => {}
+                Err(err) => tracing::warn!("system access was not moved to root: {err}"),
+            }
+            state
         })
         .await?
         {

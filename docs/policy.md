@@ -295,9 +295,11 @@ it may read, write and run as that user, beneath any policy. NodeInfo `identity`
 ## System access
 
 `{ "mode": "system" }` access carries no policy and runs as the account that installs
-system-wide software on this machine, so `apt-get install`, `npm install -g` and `brew install`
-work. A sudo install enables it (`install.sh`, unless `--no-system`); otherwise it is off until an
-administrator enables it. The control plane asks for it per command, file operation or watch.
+system-wide software on this machine: root on Linux, so any command works (`apt-get install` and
+`remove`, adding a repository, a vendor's install script, writing `/usr/local`). A sudo install
+enables it (`install.sh`, unless `--no-system`); otherwise it is off until an administrator
+enables it. The control plane asks for it per command, file operation or watch, and reviews
+each.
 
 * `sudo happy-supervisor system enable [--user <name>] [--path <dir>]... --state-dir <dir>`
   records the account, and the directories to put first in its commands' `PATH`, in
@@ -305,32 +307,14 @@ administrator enables it. The control plane asks for it per command, file operat
   status` prints it. Each takes the service's state directory (install.md) and refuses one that
   does not exist. A sudo `install.sh` runs `system enable` after joining, and again on each sudo
   upgrade, unless `--no-system`.
-* On Linux the account is `happy-system`, which `system enable` creates when it is missing: a
-  system user with a home and no login shell, owning the npm prefix `/opt/happy-system/npm`,
-  which its `~/.npmrc` names, so `npm install -g` works without root. `/etc/profile.d/happy-system.sh`
-  appends `/opt/happy-system/npm/bin` to the `PATH` of every user but root, and NodeInfo
-  `defaultEnv`, on a node with a workload user, appends it to `PATH` too, so every command finds
-  what it installs; appended, so nothing it installs shadows a system program, though a user
-  whose `PATH` has it runs what `happy-system` put there under a name nothing earlier has. Root's
-  `PATH` never gets it: not from the profile script, not in `defaultEnv` when raw commands run as
-  root, and a system command as root has it taken out of its `PATH`. The prefix is not under
-  `/usr/local`, whose directories root searches first. `system enable` checks before it changes
-  anything, and refuses rather than repairs: `/opt/happy-system` and every directory above it
-  must be root's and writable by no one else (but root's group, or anyone in a sticky
-  directory), and an existing `happy-system` must not be root, in root's group or in any group
-  but its own. The account is added to `/etc/cron.deny`, and to `/etc/at.deny` when that exists
-  (without it `at` is root's alone); a scheduler with an allow file is left alone, and one whose
-  allow file names the account makes `system enable` refuse. `system disable` kills every
-  process the account has, through a pidfd after checking the uid again, so nothing it left
-  behind keeps running; a command whose start was already under way at that moment can still
-  start after it, so check `identity.system` and the processes, or disable again. An
-  administrator can give the account a package manager of its own, such as Homebrew on Linux
-  under `/home/linuxbrew/.linuxbrew` owned by `happy-system`, with `--path` for its `bin`.
-* `apt-get install` as `happy-system` goes through the supervisor, which runs it as root with
-  package names only (Installing with apt, below).
-* `--user root` runs system access as root on Linux, so every `apt-get` command works. It is
-  root-equivalent: a system command can then read the node's credentials (below), and `system
-  enable` and `system status` say so.
+* On Linux the account is root unless `--user` names another. 0.2.12 and earlier ran it as
+  `happy-system`, an account with an npm prefix of its own and apt behind a socket of the
+  supervisor's that installed packages by name only. Enabling system access as root removes
+  what they made for it: the account, its home and processes, `/opt/happy-system` (its npm
+  prefix, and what it installed there), `/etc/profile.d/happy-system.sh` and its lines in
+  `/etc/cron.deny` and `/etc/at.deny`, refusing an account that is root's or in root's group,
+  which they did not make. The service does the same as it starts when `private/system` names
+  `happy-system`, so an automatic update moves such a node to root without the installer.
 * On macOS the account is the owner of Homebrew (`/opt/homebrew`, else `/usr/local/Homebrew`),
   because `brew` refuses to run as root and Homebrew's `npm -g` installs into its prefix; without
   Homebrew it is root. `--user` names another account. Root on macOS with Homebrew (for
@@ -340,8 +324,7 @@ administrator enables it. The control plane asks for it per command, file operat
   entry and no setuid program is involved, so the workload user, which every raw command runs
   as, gains nothing.
 * The node reads `private/system` on every system request, so `system disable` refuses the next
-  one without a restart. Running commands keep running, except on Linux as `happy-system`,
-  whose processes it kills. A refusal is `permission_denied` and
+  one without a restart. Running commands keep running. A refusal is `permission_denied` and
   says why: the supervisor is not root, system access is not enabled, or its account no longer
   exists. NodeInfo `identity.system` names the account, or is `null` when the node refuses it.
 * A system command, file operation or watch is unconfined and runs as that account, like raw
@@ -358,63 +341,14 @@ administrator enables it. The control plane asks for it per command, file operat
   keep a custom state path out of such directories.
 * The supervisor logs each system operation (its command and program, or its path) with the
   account it ran as.
-* `happy-system`, and Homebrew's owner on macOS, cannot read `private/`, so the node token and
-  the proxy CA key stay the supervisor's. As root (`--user root`), a system command can read
-  them, rewrite `private/system` so a later `system disable` does not hold, and replace the
-  supervisor: that hands the control plane the machine. Turn it off in the control plane as
-  well, and after a node that ran root system commands has it disabled, rotate its token
-  (`node.update`). On macOS, Homebrew's owner is usually the person who uses the Mac, whose own
-  files system commands can then read.
+* Security: as root, which Linux system access is by default, a system command can do anything
+  on the machine. It can read `private/`, so the node token and the proxy CA key, rewrite
+  `private/system` so a later `system disable` does not hold, replace the supervisor, and leave
+  processes, services or cron jobs running after it exits and after `system disable`. Enabling
+  it hands whoever approves system commands in the control plane the machine; the control plane
+  reviews each one, and that review is the boundary. To take it back, turn it off in the
+  control plane as well as with `system disable`, and rotate the node's token (`node.update`);
+  after root system commands ran, treat the machine as theirs. On macOS, Homebrew's owner cannot
+  read `private/`, but is usually the person who uses the Mac, whose own files system commands
+  can then read.
 * Not supported on Windows, where the node refuses it.
-
-### Installing with apt
-
-`apt-get` needs root, and an `apt-get` that runs as root with options the caller picks can run
-anything as root (`-o APT::Update::Pre-Invoke::=…`, a local `.deb`, a `Dpkg::Pre-Invoke` in an
-`APT_CONFIG`). So a Linux system command that runs as `happy-system` asks the supervisor instead,
-which takes package names to install, or a bare `update`, and nothing else. An account named
-with `--user` other than `happy-system` gets none of this.
-
-* Each such command gets a socket, `/opt/happy-system/apt/<pid>-<n>.sock`, owned by
-  `happy-system`, mode `0600`, in a directory only root may change. It serves from the spawn
-  until the command's process exits, when the supervisor closes and removes it, before the
-  command's output ends. The command's environment names it in `HAPPY_APT_SOCKET`.
-* `/opt/happy-system/bin`, root's, holds a copy of the supervisor binary and the links `apt` and
-  `apt-get` to it, and comes first in the command's `PATH`. Run under those names, the binary
-  forwards `install` and the package names, or `update`, prints what `apt-get` prints (its
-  output and errors together, on standard output), and exits as `apt-get` did. It takes
-  `apt-get install` or `apt install` with `-y`, `-q`, `--yes`, `--assume-yes`, `--quiet` and
-  `--no-install-recommends`, and `apt-get update` or `apt update` with no options or arguments,
-  and refuses anything else (`update foo`, `update -o …`, `remove`, other options) with exit
-  code 100 and a message saying what is allowed.
-* The supervisor answers only a process of the command's own session (the command leads it)
-  whose user is `happy-system`, by the socket's peer credentials, so a process that called
-  `setsid`, or that the command left running after its exit, cannot install. It answers four
-  requests per socket and sixteen in all at a time, and waits 10 seconds at most for a whole
-  request.
-* It checks each name to install itself, whatever reaches the socket: lowercase letters, digits, `+`, `.`
-  and `-`; 2 to 128 characters; starting with a letter or digit; not ending in `-` or `.deb`; and
-  exactly the name of a real package in apt's lists (`apt-cache pkgnames`, so not a virtual
-  one), so `apt-get`, which takes a package's own name first, does not read it as a pattern of
-  the packages in those lists, a version, a release, an architecture, a file or a removal.
-* Then it runs `/usr/bin/apt-get install -y -q --no-remove [--no-install-recommends] <names>`,
-  or `/usr/bin/apt-get update -q`, which reads only the sources the administrator configured,
-  with a fixed environment (`PATH`, `HOME=/root`, `LANG`, `DEBIAN_FRONTEND=noninteractive`),
-  standard input closed, `/` as working directory and its output in a pipe of the supervisor's,
-  one at a time, and logs what it runs. Just before it starts, under the same lock that closing
-  the socket takes, it checks again that the command is still running, that the asking process
-  is still in its session, and that `private/system` still names `happy-system`, so a request
-  waiting when the command exits or `system disable` runs does not start. `system disable` runs
-  in another process, so an install whose check passed just before it removed `private/system`
-  can still start just after. An `apt-get` that started finishes, since stopping dpkg midway can
-  leave packages broken. Output the shim does not take within 30 seconds is dropped, so
-  `apt-get` never waits for it, and output that something `apt-get` started writes more than 2
-  seconds after it exits is dropped too.
-* So a system command can install, as root, any package of the repositories the administrator
-  configured, whose maintainer scripts then run as root and may change the machine's
-  configuration. Enabling system access trusts those repositories with that. A command can
-  refresh the lists from them, so that a fresh machine's empty lists do not stop it, but cannot
-  add a repository, pick a version or remove a package.
-* Processes of one user can trace each other where `kernel.yama.ptrace_scope` is 0, so on such a
-  machine something `happy-system` left running from an earlier command could make the current
-  one install a package by name, as that command could itself.

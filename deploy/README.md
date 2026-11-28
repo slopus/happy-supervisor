@@ -75,14 +75,14 @@ and the installing user may change the boot directory; everyone else may read it
 without boot cannot be installed this way.
 
 A sudo install of `install.sh` also enables system access (docs/policy.md, System access): the
-control plane may run chosen commands, each reviewed, as `happy-system` on Linux, which it
-creates with an npm prefix it owns, for `npm install -g` and, through the supervisor, `apt-get
-install`, and as Homebrew's owner on macOS (root without Homebrew), for `brew install` and `npm
-install -g`. NodeInfo then reports `identity.system`. When `system enable` refuses, it says why and
+control plane may run chosen commands, each reviewed, as root on Linux, which may do anything
+(`apt-get install` and `remove`, adding repositories, vendor install scripts, `/usr/local`) and
+read the node's credentials too, and as Homebrew's owner on macOS (root without Homebrew), for
+`brew install` and `npm install -g`, since `brew` refuses root. NodeInfo then reports `identity.system`. When `system enable` refuses, it says why and
 the install goes on without it; `--system` makes that refusal fail the install, and
 `--no-system` (`sh -s -- --no-system`) leaves system access off. A sudo upgrade enables it too,
-unless `--no-system`. An install without sudo, and Windows, cannot have it. `sudo happy-supervisor
-system enable --user root --state-dir <dir>` runs it as root on Linux, which is root-equivalent.
+unless `--no-system`, and on Linux moves a computer that 0.2.12 set up with `happy-system` to root,
+removing that account. An install without sudo, and Windows, cannot have it.
 `sudo happy-supervisor system enable|disable --state-dir <dir>` changes it later, with the
 service's state directory: `/var/lib/happy-supervisor` on Linux,
 `"/Library/Application Support/happy-supervisor"` on macOS.
@@ -221,3 +221,10 @@ triggers and `release.yml` do.
   on; `--system` makes it fail the install, and `--no-system` leaves system access off. Running
   `install.sh` again with sudo enables it on a computer joined without it. An install without sudo
   says it has none. Windows has none.
+* **0.2.13.** On Linux, system access runs as root: any command works, including `apt-get
+  remove`, adding repositories, vendor install scripts and writing `/usr/local`, and it can read
+  the node's credentials. The `happy-system` account and the supervisor's apt shim are gone. As
+  it starts, the service moves a node that 0.2.12 set up with `happy-system` to root and removes
+  that account, its npm prefix (and what it installed there), its profile script and its cron and
+  at deny lines, so the automatic update moves it; a sudo `install.sh` does the same. macOS keeps
+  Homebrew's owner where Homebrew is, since `brew` refuses root. Windows has none.

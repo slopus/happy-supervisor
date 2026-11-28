@@ -510,8 +510,8 @@ async fn system_access_runs_as_the_enabled_account_only_while_enabled() {
 
     assert_eq!(
         node.install.system(&["enable", "--user", "root"]),
-        "system access enabled: it runs as root, which is root-equivalent: system commands can \
-         read this node's credentials\n"
+        "system access enabled: it runs as root, so system commands may do anything, reading \
+         this node's credentials too\n"
     );
     let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
     assert_eq!(
@@ -637,7 +637,7 @@ async fn system_access_installs_packages() {
     let (installs, account) = if cfg!(target_os = "linux") {
         (
             ["apt-get install -y hello", "npm install -g cowsay"],
-            String::new(),
+            "root".to_owned(),
         )
     } else {
         (
@@ -670,15 +670,19 @@ async fn system_access_installs_packages() {
         assert_eq!(err.kind, ErrorKind::PermissionDenied);
     }
 
-    if cfg!(target_os = "linux") {
-        return happy_system_installs(&node, env).await;
-    }
     let enabled = node.install.system(&["enable"]);
     eprintln!("{enabled}");
-    assert_eq!(
-        enabled,
-        format!("system access enabled: it runs as {account}\n")
-    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            enabled.starts_with("system access enabled: it runs as root, so system commands may"),
+            "{enabled}"
+        );
+    } else {
+        assert_eq!(
+            enabled,
+            format!("system access enabled: it runs as {account}\n")
+        );
+    }
     for (n, install) in installs.iter().enumerate() {
         let (exit, output) = node
             .sh_in(
@@ -692,241 +696,97 @@ async fn system_access_installs_packages() {
         eprintln!("system `{install}`: {exit:?}\n{output}");
         assert_eq!(exit, ExitStatus::Exited { code: 0 }, "system `{install}`");
     }
-    let (exit, output) = node.sh_in("check", check, system(), false, env).await;
+    let (exit, output) = node
+        .sh_in("check", check, system(), false, env.clone())
+        .await;
     eprintln!("system `{check}`: {exit:?}\n{output}");
     assert_eq!(exit, ExitStatus::Exited { code: 0 });
     assert!(output.starts_with("Hello, world!\n"), "{output}");
     assert!(output.contains("< installed >"), "{output}");
+    #[cfg(target_os = "linux")]
+    root_does_anything(&node, env).await;
 }
 
-/// Package names that `apt-get install` would read as something else (apt.rs).
-const NOT_PACKAGE_NAMES: [&str; 13] = [
-    "-o",
-    "APT::Update::Pre-Invoke::=id",
-    "./hello.deb",
-    "/tmp/hello.deb",
-    "hello.deb",
-    "hello=2.10-3",
-    "hello/noble",
-    "hello:amd64",
-    "hello-",
-    "coreutils-",
-    "--reinstall",
-    "Hello",
-    "h*",
-];
-
-/// `apt-get install` and `apt-get update` as `happy-system`, which the supervisor runs for the
-/// command's own processes, with package names only.
-async fn happy_system_installs_with_apt(node: &Node, env: &Json, read: &str) {
-    // A fresh machine's: no lists, so nothing is a package until `apt-get update`.
-    for entry in std::fs::read_dir("/var/lib/apt/lists").unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path).unwrap();
-        } else {
-            std::fs::remove_file(&path).unwrap();
-        }
-    }
-    let install = "apt-get install -y hello";
-    let (exit, output) = node
-        .sh_in("no-lists", install, system(), false, env.clone())
-        .await;
-    eprintln!("system `{install}` without lists: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 100 });
-    assert!(
-        output.starts_with("apt-get: hello is not a package in this machine's apt lists; "),
-        "{output}"
-    );
-
-    let apt = format!("id -un; apt-get update && apt-get install -y hello && hello; {read}");
-    let (exit, output) = node.sh_in("apt", &apt, system(), false, env.clone()).await;
-    eprintln!("system `{apt}`: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 1 }, "the last is the read");
-    assert!(output.starts_with("happy-system\n"), "{output}");
-    assert!(output.contains("Hello, world!\n"), "{output}");
-    assert!(output.contains("Permission denied"), "{output}");
-    assert!(!output.contains("nt_secret"), "{output}");
-
-    let names: Vec<String> = NOT_PACKAGE_NAMES.iter().map(|n| format!("'{n}'")).collect();
-    let refused = format!(
-        "for name in {}; do apt-get install -y \"$name\"; echo \"exit $?\"; done; \
-         apt update foo; echo \"exit $?\"; \
-         apt-get update -o APT::Update::Pre-Invoke::=id; echo \"exit $?\"; \
-         apt-get remove -y hello; echo \"exit $?\"; \
-         apt-get install -y hell.o; echo \"exit $?\"",
-        names.join(" ")
-    );
-    let (exit, output) = node
-        .sh_in("refused", &refused, system(), false, env.clone())
-        .await;
-    eprintln!("system `{refused}`: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert_eq!(output.matches("exit 100\n").count(), 17, "{output}");
-    for name in NOT_PACKAGE_NAMES {
-        let why = if name.starts_with('-') {
-            format!("apt-get: the option {name} is not allowed; ")
-        } else {
-            format!("apt-get: {name:?} is not a package name; ")
-        };
-        assert!(output.contains(&why), "{why}\n{output}");
-    }
-    for why in [
-        "apt: update takes no options or arguments: update foo; ",
-        "apt-get: update takes no options or arguments: update -o APT::Update::Pre-Invoke::=id; ",
-        "apt-get: only install and update are allowed, not remove; ",
-    ] {
-        assert!(output.contains(why), "{why}\n{output}");
-    }
-    // A pattern apt-get would match against package names, which the supervisor refuses.
-    assert!(
-        output.contains("apt-get: hell.o is not a package in this machine's apt lists; "),
-        "{output}"
-    );
-
-    // The supervisor checks the names itself, whatever reaches the socket.
-    let direct = r#"python3 -c '
-import os, socket
-s = socket.socket(socket.AF_UNIX)
-s.connect(os.environ["HAPPY_APT_SOCKET"])
-s.sendall(b"{\"do\": \"install\", \"packages\": [\"coreutils-\"]}")
-s.shutdown(socket.SHUT_WR)
-reply = b""
-while chunk := s.recv(4096):
-    reply += chunk
-print(reply[0], reply[5:].decode())
-'"#;
-    let (exit, output) = node
-        .sh_in("direct", direct, system(), false, env.clone())
-        .await;
-    eprintln!("system, straight to the socket: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert_eq!(output, "2 \"coreutils-\" is not a package name\n");
-
-    // Another session of the account, while the command runs, may not install.
-    let other = "setsid -w sh -c 'apt-get install -y hello; echo \"exit $?\"'";
-    let (exit, output) = node
-        .sh_in("other", other, system(), false, env.clone())
-        .await;
-    eprintln!("system `{other}`: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert!(
-        output.contains("only the system command's own processes may install"),
-        "{output}"
-    );
-    assert!(output.ends_with("exit 100\n"), "{output}");
-
-    // Nor may what the command leaves running after it exits, even holding its output open.
-    let left = format!("/tmp/happy-system-left-behind-{}", std::process::id());
-    let _ = std::fs::remove_file(&left);
-    let behind = format!(
-        "echo \"$HAPPY_APT_SOCKET\"; (sleep 3; apt-get install -y hello >{left} 2>&1; \
-         echo \"exit $?\" >>{left}) </dev/null &"
-    );
-    let (exit, output) = node
-        .sh_in("behind", &behind, system(), false, env.clone())
-        .await;
-    assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    let socket = output.trim_end();
-    assert!(socket.starts_with("/opt/happy-system/apt/"), "{output}");
-    assert!(!Path::new(socket).exists(), "{socket} is gone at the exit");
-    let mut output = String::new();
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        output = std::fs::read_to_string(&left).unwrap_or_default();
-        if output.contains("exit ") {
-            break;
-        }
-    }
-    eprintln!("left behind by a system command: {output}");
-    assert!(
-        output.contains("apt-get: the supervisor did not answer ("),
-        "{output}"
-    );
-    assert!(output.ends_with("exit 100\n"), "{output}");
-    std::fs::remove_file(&left).unwrap();
-}
-
-/// The rest of [`system_access_installs_packages`] on Linux, where system access runs as
-/// `happy-system` unless root is named.
-async fn happy_system_installs(node: &Node, env: Json) {
+/// The rest of [`system_access_installs_packages`] on Linux, where system access runs as root:
+/// any command, removing packages and reading the node's credentials too.
+#[cfg(target_os = "linux")]
+async fn root_does_anything(node: &Node, env: Json) {
     let credentials = node.install.path("state/private/credentials.json");
     std::fs::write(&credentials, r#"{"nodeToken":"nt_secret"}"#).unwrap();
     std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let enabled = node.install.system(&["enable"]);
-    eprintln!("{enabled}");
-    assert_eq!(enabled, "system access enabled: it runs as happy-system\n");
-    let account = nix::unistd::User::from_name("happy-system")
+    let anything = format!(
+        "id -un; apt-get remove -y hello && ! command -v hello && echo removed; \
+         mkdir -p /usr/local/hs-test && echo ok > /usr/local/hs-test/file && \
+         cat /usr/local/hs-test/file && rm -r /usr/local/hs-test; cat {}",
+        credentials.display()
+    );
+    let (exit, output) = node
+        .sh_in("anything", &anything, system(), false, env)
+        .await;
+    eprintln!("system `{anything}`: {exit:?}\n{output}");
+    assert_eq!(exit, ExitStatus::Exited { code: 0 });
+    assert!(output.starts_with("root\n"), "{output}");
+    assert!(output.contains("removed\nok\n"), "{output}");
+    assert!(output.ends_with("nt_secret\"}"), "{output}");
+}
+
+/// What 0.2.12 and earlier set up for system access as `happy-system`, which the service moves
+/// to root as it starts, removing the account and what it had (system_account.rs).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "creates and removes the happy-system account"]
+async fn system_access_as_happy_system_moves_to_root() {
+    assert!(root(), "moving system access needs root");
+    let node = Node::start().await;
+    let created = std::process::Command::new("useradd")
+        .args([
+            "--system",
+            "--create-home",
+            "--home-dir",
+            "/home/happy-system",
+        ])
+        .args(["--shell", "/usr/sbin/nologin", "happy-system"])
+        .status()
+        .unwrap();
+    assert!(created.success());
+    std::fs::create_dir_all("/opt/happy-system/npm/bin").unwrap();
+    std::fs::write("/opt/happy-system/npm/bin/cowsay", "").unwrap();
+    std::fs::write("/etc/profile.d/happy-system.sh", "PATH=$PATH\n").unwrap();
+    let deny = std::fs::read_to_string("/etc/cron.deny").unwrap_or_default();
+    std::fs::write("/etc/cron.deny", format!("{deny}happy-system\n")).unwrap();
+    let state = node.install.path("state/private/system");
+    std::fs::write(
+        &state,
+        r#"{ "user": "happy-system", "path": ["/opt/happy-system/npm/bin", "/hs/bin"] }"#,
+    )
+    .unwrap();
+
+    let dir = happy_supervisor::state::StateDir::existing(node.install.path("state")).unwrap();
+    let moved = happy_supervisor::identity::upgrade_system(&dir)
         .unwrap()
         .unwrap();
-    assert!(env.get("NPM_CONFIG_PREFIX").is_none());
-
-    let read = format!("cat {}", credentials.display());
-    let (exit, output) = node
-        .sh_in("token", &read, system(), false, env.clone())
-        .await;
-    eprintln!("system `{read}`: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 1 });
-    assert!(output.contains("Permission denied"), "{output}");
-
-    let npm = "npm install -g cowsay";
-    let (exit, output) = node.sh_in("npm", npm, system(), false, env.clone()).await;
-    eprintln!("system `{npm}`: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    let installed = std::fs::metadata("/opt/happy-system/npm/lib/node_modules/cowsay").unwrap();
-    assert_eq!(installed.uid(), account.uid.as_raw());
-
-    let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
-    let path = &info.default_env["PATH"];
-    assert!(path.ends_with(":/opt/happy-system/npm/bin"), "{path}");
-    let mut raw_env = env.clone();
-    raw_env["PATH"] = json!(format!(
-        "{path}:{}",
-        std::env::var("HS_TEST_PATH").unwrap_or_default()
-    ));
-    let (exit, output) = node
-        .sh_in("cowsay", "id -un; cowsay installed", raw(), false, raw_env)
-        .await;
-    eprintln!("raw `cowsay installed`: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert!(output.starts_with(&format!("{USER}\n")), "{output}");
-    assert!(output.contains("< installed >"), "{output}");
-
-    happy_system_installs_with_apt(node, &env, &read).await;
-
-    let mut events = node.ctl.events();
-    let _: Json = node
-        .ctl
-        .command(
-            "exec.start",
-            json!({ "execId": "left", "argv": ["/bin/sleep", "600"], "cwd": "/", "env": env,
-                    "access": system() }),
-        )
-        .await
-        .unwrap();
     assert_eq!(
-        node.install.system(&["disable"]),
-        "system access disabled\n"
+        (moved.user.as_str(), moved.path),
+        ("root", vec!["/hs/bin".to_owned()])
     );
-    let exit = loop {
-        match tokio::time::timeout(WAIT, events.next()).await.unwrap() {
-            Some(Event::ExecExit(exit)) if exit.exec_id.as_str() == "left" => break exit.exit,
-            Some(_) => {}
-            None => panic!("the events ended"),
-        }
-    };
-    eprintln!("a happy-system process at `system disable`: {exit:?}");
-    assert_eq!(exit, ExitStatus::Signaled { signal: 9 });
-
-    let enabled = node.install.system(&["enable", "--user", "root"]);
-    eprintln!("{enabled}");
     assert!(
-        enabled.starts_with("system access enabled: it runs as root, which is root-equivalent"),
-        "{enabled}"
+        nix::unistd::User::from_name("happy-system")
+            .unwrap()
+            .is_none()
     );
-    let apt = "apt-get install -y hello && hello";
-    let (exit, output) = node.sh_in("apt-root", apt, system(), false, env).await;
-    eprintln!("system `{apt}` as root: {exit:?}\n{output}");
-    assert_eq!(exit, ExitStatus::Exited { code: 0 });
-    assert!(output.ends_with("Hello, world!\n"), "{output}");
+    for gone in [
+        "/opt/happy-system",
+        "/home/happy-system",
+        "/etc/profile.d/happy-system.sh",
+    ] {
+        assert!(!Path::new(gone).exists(), "{gone}");
+    }
+    let deny = std::fs::read_to_string("/etc/cron.deny").unwrap();
+    assert!(!deny.lines().any(|line| line == "happy-system"), "{deny}");
+    assert_eq!(
+        happy_supervisor::identity::upgrade_system(&dir).unwrap(),
+        None
+    );
+    let info: NodeInfo = node.ctl.command("node.info", ()).await.unwrap();
+    assert_eq!(info.identity.system.unwrap().user, "root");
 }

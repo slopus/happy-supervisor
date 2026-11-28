@@ -585,8 +585,8 @@ enforced by the operating system, as the same user.
 { "mode": "system" }
 ```
 
-`system` runs unconfined as the account that installs system-wide software, `happy-system` on
-Linux (root only if the administrator chose it) and Homebrew's owner on macOS (policy.md, System
+`system` runs unconfined as the account that installs system-wide software, root on Linux
+(unless the administrator named another) and Homebrew's owner on macOS (policy.md, System
 access). A node replies `permission_denied` unless
 an administrator enabled it there; NodeInfo `identity.system` says whether it did. A node older
 than `system` replies `invalid_params`. The full policy rules are in policy.md. A node that cannot enforce
@@ -671,9 +671,7 @@ IDs are 1 to 64 characters of `[A-Za-z0-9_.-]`.
   NodeInfo's `defaultEnv` holds the usual variables for this machine, for the control plane
   to copy. The one exception is `system` access: the node sets `HOME`, `USER` and `LOGNAME` to
   the system account's, on macOS also its `TMPDIR`, and puts Homebrew's `bin` and `sbin` first
-  in `PATH`, ahead of any other copy of them. On Linux as `happy-system` it also sets
-  `HAPPY_APT_SOCKET` and puts `/opt/happy-system/bin`, whose `apt-get` installs through the
-  supervisor, first in `PATH` (policy.md, Installing with apt).
+  in `PATH`, ahead of any other copy of them.
 * `stdin: true` keeps the process's stdin open for `exec.write`. `false` gives it an empty,
   closed stdin.
 * `timeout` is optional. Without it the process runs until it exits or is killed. With it,

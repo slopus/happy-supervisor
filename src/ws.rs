@@ -23,7 +23,7 @@ use crate::protocol::MAX_FRAME_BYTES;
 #[cfg(feature = "node")]
 mod dial;
 #[cfg(feature = "node")]
-pub use dial::{Dialed, accept, dial};
+pub use dial::{Dialed, accept, dial, dial_over};
 
 /// The one link subprotocol. The control plane must select it.
 pub const SUBPROTOCOL: &str = "happy-supervisor.v1";

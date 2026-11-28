@@ -29,6 +29,9 @@ pub enum Listen {
     Tcp(SocketAddr),
     /// `unix:PATH`. The socket file is created `0600`.
     Unix(PathBuf),
+    /// `vsock:PORT`, Linux only: a VM's agent, which the host reaches through its VMM
+    /// (docs/vm-mode.md, Boot).
+    Vsock(u32),
 }
 
 impl FromStr for Listen {
@@ -41,9 +44,17 @@ impl FromStr for Listen {
             }
             return Ok(Listen::Unix(PathBuf::from(path)));
         }
+        if let Some(port) = text.strip_prefix("vsock:") {
+            if !cfg!(target_os = "linux") {
+                return Err(Error::invalid_params("vsock: listeners need Linux"));
+            }
+            return port.parse().map(Listen::Vsock).map_err(|_| {
+                Error::invalid_params(format!("--listen {text:?} has no vsock port"))
+            });
+        }
         text.parse().map(Listen::Tcp).map_err(|_| {
             Error::invalid_params(format!(
-                "--listen {text:?} is neither IP:PORT nor unix:PATH"
+                "--listen {text:?} is neither IP:PORT, unix:PATH nor vsock:PORT"
             ))
         })
     }
@@ -119,6 +130,23 @@ pub async fn serve_until(
         #[cfg(not(unix))]
         Listen::Unix(_) => {
             return Err(Error::invalid_params("unix: listeners need a Unix system"));
+        }
+        #[cfg(target_os = "linux")]
+        Listen::Vsock(port) => {
+            let listener = crate::vm::vsock::Listener::bind(port)?;
+            listening(format!("vsock:{port}"));
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok(stream) => accept.connection(stream),
+                        Err(err) => tracing::warn!("accepting a connection failed: {err}"),
+                    }
+                }
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Listen::Vsock(_) => {
+            return Err(Error::invalid_params("vsock: listeners need Linux"));
         }
     };
     let exit = crate::client::serve_until(state, sockets_rx, stop).await;
@@ -237,10 +265,19 @@ mod tests {
             "unix:/run/happy/supervisor.sock".parse::<Listen>(),
             Ok(Listen::Unix(PathBuf::from("/run/happy/supervisor.sock")))
         );
+        #[cfg(target_os = "linux")]
+        assert_eq!("vsock:1024".parse::<Listen>(), Ok(Listen::Vsock(1024)));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            "vsock:x".parse::<Listen>(),
+            Err(Error::invalid_params(
+                r#"--listen "vsock:x" has no vsock port"#
+            ))
+        );
         assert_eq!(
             "localhost:7777".parse::<Listen>(),
             Err(Error::invalid_params(
-                r#"--listen "localhost:7777" is neither IP:PORT nor unix:PATH"#
+                r#"--listen "localhost:7777" is neither IP:PORT, unix:PATH nor vsock:PORT"#
             ))
         );
     }

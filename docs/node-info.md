@@ -47,7 +47,8 @@ the rest of the collection, and each is cut off at 3 seconds.
   "identity": { "supervisorUser": "root", "workloadUser": "happy-workload", "root": true },
   "limits": { "memoryBytes": false, "processes": false, "cpuSeconds": true },
   "defaultEnv": { "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/me", "USER": "me", "LANG": "C.UTF-8" },
-  "collectedAtMs": 1763496000000
+  "collectedAtMs": 1763496000000,
+  "vm": { "available": false, "reason": "/dev/kvm cannot be opened: the supervisor's user needs to be in group kvm" }
 }
 ```
 
@@ -215,3 +216,35 @@ carries it:
 
 `supervisorVersion` is the version that is running. `boot.running` is the same version, as boot
 names it. Its fields travel as text (api.md, Key registry).
+
+### `vm`
+
+Whether this node can boot VMs (vm-mode.md), with the VMM and guest kernel it would use. It is
+checked at every collection, cheaply: the node opens `/dev/kvm` and runs the VMM's `--version`,
+and boots nothing.
+
+```json
+{ "available": true, "vmm": { "kind": "cloud-hypervisor", "path": "/opt/kata/bin/cloud-hypervisor", "version": "55.0" }, "kernel": "/opt/kata/share/kata-containers/vmlinux-6.18.62-211" }
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `available` | bool | Every check below passed. |
+| `reason` | string | When unavailable: the first check that failed, in one sentence. |
+| `vmm` | object | When available: `kind` (`"cloud-hypervisor"`), `path`, and `version`, what `--version` printed after the `v` (`"55.0"`). |
+| `kernel` | string | When available: the guest kernel's path, with symlinks resolved. |
+
+The checks, in order:
+
+1. Linux. macOS and Windows report `"VM mode needs Linux with KVM"`.
+2. `/dev/kvm` opens read-write and answers `KVM_GET_API_VERSION` with 12.
+3. The running binary is static. A guest runs this same binary as its init, on a kernel with no
+   libraries, as the Linux releases are built. A dynamically linked build, such as a `cargo
+   build` for glibc, is unavailable.
+4. `cloud-hypervisor` on the supervisor's `PATH`, else Kata's `/opt/kata/bin/cloud-hypervisor`,
+   runs and prints `cloud-hypervisor v<version>`.
+5. Kata's guest kernel, `/opt/kata/share/kata-containers/vmlinux.container`, exists and is an
+   uncompressed ELF `vmlinux`.
+
+A node older than VM mode omits `vm`. Its fields travel as text (api.md, Key registry). No
+command uses VMs yet: they come with the next phases of vm-mode.md.

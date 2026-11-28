@@ -18,8 +18,10 @@ connects and drives the node with the full protocol without any server.
   `--token-file` (trailing newline trimmed). A missing or wrong token gets `401` before the upgrade.
   `--token-file -` reads the token from stdin once.
 * `--listen` accepts `IP:PORT` (port `0` picks one; the chosen address is printed on stdout as one
-  line `listening <addr>`) or `unix:PATH` (the socket file is created `0600`). A non-loopback IP is
-  allowed but the node logs a warning: the listener speaks plain `ws://`, so put TLS in front.
+  line `listening <addr>`), `unix:PATH` (the socket file is created `0600`), or, on Linux,
+  `vsock:PORT`: `AF_VSOCK` on that port of every CID, which is how a VM's agent listens for the
+  host (vm-mode.md, Boot). A non-loopback IP is allowed but the node logs a warning: the listener
+  speaks plain `ws://`, so put TLS in front.
 * One client session at a time. A second connection that presents a session ID resumes it (taking
   over from the first, which is closed); one that presents `session: null` starts a new session and
   the old one is lost, exactly as when a control plane forgets a session.
@@ -43,4 +45,6 @@ let mut events = ctl.events();          // exec.output, exec.exit, watch.event, 
 ```
 
 It is the same `link::Session` the node and `testing::ControlPlane` use, in the control-plane role,
-over a real WebSocket, with reconnect and resume.
+over a real WebSocket, with reconnect and resume. `Controller::with_dialer(dial)` is the same over
+whatever connections `dial` opens, one now and one each time the last drops. The host drives a
+VM's agent this way, through the VMM's vsock and `ws::dial_over` (vm-mode.md, Boot).

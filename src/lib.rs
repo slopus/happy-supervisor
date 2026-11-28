@@ -52,6 +52,8 @@ pub mod testing;
 #[cfg(feature = "node")]
 pub mod tunnel;
 #[cfg(feature = "node")]
+pub mod vm;
+#[cfg(feature = "node")]
 pub mod watch;
 pub mod wire;
 pub mod ws;

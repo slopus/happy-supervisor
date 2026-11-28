@@ -1760,6 +1760,90 @@ pub struct NodeInfo {
     /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot: Option<BootStatus>,
+    /// Whether this node runs VMs (docs/vm-mode.md). `null` from a node older than VM mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<VmInfo>,
+}
+
+/// NodeInfo's `vm`: whether this node can run VMs, with the VMM and the guest kernel it would use,
+/// or why it cannot. On the wire it is a flat object, `available` with `reason`, or `vmm` and
+/// `kernel`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "VmInfoWire", try_from = "VmInfoWire")]
+pub enum VmInfo {
+    Available { vmm: VmmInfo, kernel: String },
+    Unavailable { reason: String },
+}
+
+/// NodeInfo's `vm.vmm`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmmInfo {
+    pub kind: VmmKind,
+    pub path: String,
+    /// What `--version` printed, without the program's name and the `v`: `55.0`.
+    pub version: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VmmKind {
+    CloudHypervisor,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VmInfoWire {
+    available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vmm: Option<VmmInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel: Option<String>,
+}
+
+impl From<VmInfo> for VmInfoWire {
+    fn from(info: VmInfo) -> VmInfoWire {
+        match info {
+            VmInfo::Available { vmm, kernel } => VmInfoWire {
+                available: true,
+                reason: None,
+                vmm: Some(vmm),
+                kernel: Some(kernel),
+            },
+            VmInfo::Unavailable { reason } => VmInfoWire {
+                available: false,
+                reason: Some(reason),
+                vmm: None,
+                kernel: None,
+            },
+        }
+    }
+}
+
+impl TryFrom<VmInfoWire> for VmInfo {
+    type Error = Error;
+
+    fn try_from(wire: VmInfoWire) -> Result<VmInfo, Error> {
+        match wire {
+            VmInfoWire {
+                available: true,
+                reason: None,
+                vmm: Some(vmm),
+                kernel: Some(kernel),
+            } => Ok(VmInfo::Available { vmm, kernel }),
+            VmInfoWire {
+                available: false,
+                reason: Some(reason),
+                vmm: None,
+                kernel: None,
+            } => Ok(VmInfo::Unavailable { reason }),
+            _ => Err(Error::invalid_params(
+                "vm is either available with vmm and kernel, or unavailable with a reason",
+            )),
+        }
+    }
 }
 
 /// NodeInfo's `limits`: which `exec.start` limits this node enforces.
@@ -2021,6 +2105,9 @@ mod tests {
         "target",
         "restarts",
         "lastExit",
+        "vm",
+        "vmm",
+        "kernel",
     ];
 
     /// Parses the CBOR that `literal` stands for as `T`, checks that `T` encodes back to the
@@ -2313,6 +2400,51 @@ mod tests {
                 cpu_seconds: true
             }
         );
+        assert_eq!(info.vm, None);
+        // NodeInfo `vm` (node-info.md), newer than the key registry too.
+        let mut json = node_info_json();
+        json["vm"] = json!({
+            "available": true,
+            "vmm": { "kind": "cloud-hypervisor", "path": "/opt/kata/bin/cloud-hypervisor", "version": "55.0" },
+            "kernel": "/opt/kata/share/kata-containers/vmlinux-6.18.62-211"
+        });
+        let parsed: NodeInfo = round_trip(json);
+        assert_eq!(
+            parsed.vm,
+            Some(VmInfo::Available {
+                vmm: VmmInfo {
+                    kind: VmmKind::CloudHypervisor,
+                    path: "/opt/kata/bin/cloud-hypervisor".to_string(),
+                    version: "55.0".to_string()
+                },
+                kernel: "/opt/kata/share/kata-containers/vmlinux-6.18.62-211".to_string()
+            })
+        );
+        assert_eq!(
+            crate::wire::text_keys(&to_cbor(&parsed)),
+            ["vm", "vmm", "kernel"]
+        );
+        let mut json = node_info_json();
+        json["vm"] = json!({ "available": false, "reason": "/dev/kvm does not exist" });
+        let parsed: NodeInfo = round_trip(json);
+        assert_eq!(
+            parsed.vm,
+            Some(VmInfo::Unavailable {
+                reason: "/dev/kvm does not exist".to_string()
+            })
+        );
+        for vm in [
+            json!({ "available": true, "reason": "x" }),
+            json!({ "available": false, "reason": "x", "kernel": "/k" }),
+            json!({ "available": false }),
+        ] {
+            let mut json = node_info_json();
+            json["vm"] = vm;
+            assert!(
+                from_cbor::<NodeInfo>(&to_cbor(&cbor(json))).is_err(),
+                "a vm with the wrong fields parses"
+            );
+        }
 
         let ready = json!({ "kind": "node.ready", "body": {
             "info": node_info_json(),

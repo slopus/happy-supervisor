@@ -206,6 +206,10 @@ What a command sees on Linux:
 * Creating, renaming or removing an entry in a write-denied directory fails with `EROFS`.
 * A missing deny path behaves the same at its placeholder: a file placeholder as a read-denied
   file, a directory placeholder as a read- and write-denied directory.
+* With `unixSockets: false`, creating a Unix socket with `socket` fails with `EPERM`, and so
+  does a datagram `socketpair`, which can send to any named socket. A stream or seqpacket
+  `socketpair` works: it has no address and reaches only its other end, and language runtimes
+  need one (Rust's `Command`, libuv's child stdio, Python's asyncio).
 * With `localBind: false`, `bind` fails with `EPERM` where seccomp refuses it (`unixSockets:
   false`, or a kernel before 6.7), and with `EACCES` where Landlock does. Where seccomp refuses it,
   the node also sends `net.bindDenied` with the TCP or UDP address and port (api.md), so the

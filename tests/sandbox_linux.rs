@@ -274,6 +274,26 @@ fn child_action() {
         "udp-at" => std::net::UdpSocket::bind(&arg).map(|_| "ok".into()),
         "unix" => UnixListener::bind(&arg).map(|_| "ok".into()),
         "socketpair" => std::os::unix::net::UnixStream::pair().map(|_| "ok".into()),
+        "dgram-pair" => std::os::unix::net::UnixDatagram::pair().map(|_| "ok".into()),
+        // With `pre_exec`, std forks instead of posix_spawn and reports a failed exec over a
+        // seqpacket pair, as cargo's jobserver and rustc's linker call do.
+        // SAFETY: the pre_exec closure does nothing.
+        "spawn" => unsafe {
+            std::process::Command::new("/bin/true")
+                .pre_exec(|| Ok(()))
+                .status()
+                .map(|status| status.to_string())
+        },
+        // Binds, listens, connects and accepts on a socket at `arg`, and echoes a byte.
+        "unix-echo" => UnixListener::bind(&arg).and_then(|listener| {
+            let mut client = std::os::unix::net::UnixStream::connect(&arg)?;
+            let (mut server, _) = listener.accept()?;
+            client.write_all(b"x")?;
+            let mut byte = [0];
+            server.read_exact(&mut byte)?;
+            Ok(String::from_utf8_lossy(&byte).into_owned())
+        }),
+        "unix-connect" => std::os::unix::net::UnixStream::connect(&arg).map(|_| "ok".into()),
         "connect" => {
             TcpStream::connect_timeout(&arg.parse().unwrap(), std::time::Duration::from_secs(3))
                 .map(|_| "ok".into())
@@ -561,15 +581,29 @@ fn syscalls_that_escape_the_sandbox_are_refused() {
 
 #[test]
 fn unix_sockets_and_local_bind_follow_the_policy() {
-    let tree = Tree::new();
+    // Unix socket paths are short (108 bytes), so this tree lives in /tmp.
+    let tree = Tree::in_dir(Path::new("/tmp"));
     let sockets = tree.dir("sockets");
     let write = || tree.rules(Default::Deny, &["{}/sockets"], &[]);
-    // (localBind, unixSockets) -> tcp bind, udp bind, unix bind, socketpair
-    let table: [((bool, bool), [&str; 4]); 4] = [
-        ((false, false), ["EPERM", "EPERM", "EPERM", "EPERM"]),
-        ((false, true), ["EACCES", "ok", "ok", "ok"]),
-        ((true, false), ["ok", "ok", "EPERM", "EPERM"]),
-        ((true, true), ["ok", "ok", "ok", "ok"]),
+    // (localBind, unixSockets) -> tcp bind, udp bind, unix bind to accept, stream pair,
+    // seqpacket pair (spawn), datagram pair
+    let table: [((bool, bool), [&str; 6]); 4] = [
+        (
+            (false, false),
+            ["EPERM", "EPERM", "EPERM", "ok", "exit status: 0", "EPERM"],
+        ),
+        (
+            (false, true),
+            ["EACCES", "ok", "x", "ok", "exit status: 0", "ok"],
+        ),
+        (
+            (true, false),
+            ["ok", "ok", "EPERM", "ok", "exit status: 0", "EPERM"],
+        ),
+        (
+            (true, true),
+            ["ok", "ok", "x", "ok", "exit status: 0", "ok"],
+        ),
     ];
     for (n, ((local_bind, unix_sockets), expected)) in table.into_iter().enumerate() {
         for network in [
@@ -581,10 +615,33 @@ fn unix_sockets_and_local_bind_follow_the_policy() {
             let got = [
                 act(&p, "tcp", ""),
                 act(&p, "udp", ""),
-                act(&p, "unix", socket.to_str().unwrap()),
+                act(&p, "unix-echo", socket.to_str().unwrap()),
                 act(&p, "socketpair", ""),
+                act(&p, "spawn", ""),
+                act(&p, "dgram-pair", ""),
             ];
             assert_eq!(got, expected, "{network:?}");
+        }
+    }
+}
+
+#[test]
+fn without_unix_sockets_only_unnamed_pairs_are_allowed() {
+    // Unix socket paths are short (108 bytes), so this tree lives in /tmp.
+    let tree = Tree::in_dir(Path::new("/tmp"));
+    let host_socket = tree.path("host.sock");
+    let _listener = UnixListener::bind(&host_socket).unwrap();
+    let host_socket = host_socket.to_str().unwrap();
+    for network in [host(false, false), isolated(false, false)] {
+        let p = tree.resolve(read_all(&tree), write_none(&tree), network.clone());
+        let table = [
+            ("socketpair", "", "ok"),
+            ("spawn", "", "exit status: 0"),
+            ("dgram-pair", "", "EPERM"),
+            ("unix-connect", host_socket, "EPERM"),
+        ];
+        for (action, arg, expected) in table {
+            assert_eq!(act(&p, action, arg), expected, "{network:?} {action}");
         }
     }
 }

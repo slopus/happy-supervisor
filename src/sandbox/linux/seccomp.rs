@@ -48,6 +48,8 @@ pub enum When {
     Arg0NotIn(Vec<u64>),
     /// The second argument (a 32-bit int) equals this.
     Arg1Is(u64),
+    /// The second argument (a 32-bit int), masked with the first value, equals the second.
+    Arg1MaskedIs(u64, u64),
 }
 
 /// One refused call: the syscall number, when, and the errno it fails with.
@@ -76,6 +78,8 @@ const SYS_MOUNT_SETATTR: i64 = 442;
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 
 const CLONE_NEWTIME: u64 = 0x80;
+/// The bits of socket(2)'s type argument below `SOCK_NONBLOCK` and `SOCK_CLOEXEC`.
+const SOCK_TYPE_MASK: u64 = 0xf;
 /// Every namespace a clone(2) flag word can ask for. `CLONE_NEWTIME` is left out: in clone(2)
 /// that bit is part of the exit signal, and unshare(2) checks it separately.
 const CLONE_NAMESPACES: [u64; 7] = [
@@ -161,8 +165,18 @@ pub fn denials(net: NetRules) -> Vec<Denial> {
             libc::SYS_socket,
             When::Arg0Is(libc::AF_UNIX as u64),
         ));
-        // Every socketpair is a Unix socket pair.
-        denials.push(eperm("socketpair", libc::SYS_socketpair, When::Always));
+        // A stream or seqpacket pair has no address and reaches only its other end. Runtimes
+        // need one: Rust's `Command` reports a failed exec over it, libuv makes child stdio
+        // from it, Python's asyncio wakes its loop with it. A datagram pair can `sendto` or
+        // `connect` to any named datagram socket, such as `/dev/log`, and a Unix `SOCK_RAW` is
+        // a datagram socket.
+        for ty in [libc::SOCK_DGRAM, libc::SOCK_RAW] {
+            denials.push(eperm(
+                "socketpair",
+                libc::SYS_socketpair,
+                When::Arg1MaskedIs(SOCK_TYPE_MASK, ty as u64),
+            ));
+        }
     }
     if net.isolated {
         // The families a network namespace fences. Anything else (vsock, bluetooth, ...) can
@@ -314,6 +328,7 @@ fn rule(when: &When) -> std::result::Result<Option<SeccompRule>, seccompiler::Ba
         When::Arg0HasFlag(flag) => vec![arg(0, SeccompCmpOp::MaskedEq(*flag), *flag)?],
         When::Arg0Is(value) => vec![arg(0, SeccompCmpOp::Eq, *value)?],
         When::Arg1Is(value) => vec![arg(1, SeccompCmpOp::Eq, *value)?],
+        When::Arg1MaskedIs(mask, value) => vec![arg(1, SeccompCmpOp::MaskedEq(*mask), *value)?],
         When::Arg0NotIn(values) => values
             .iter()
             .map(|value| arg(0, SeccompCmpOp::Ne, *value))
@@ -388,7 +403,7 @@ mod tests {
             deny_bind: true,
             bind_notified: false,
         });
-        let tail: Vec<(&str, When)> = isolated_closed[isolated_closed.len() - 5..]
+        let tail: Vec<(&str, When)> = isolated_closed[isolated_closed.len() - 6..]
             .iter()
             .map(|d| (d.name, d.when.clone()))
             .collect();
@@ -396,7 +411,8 @@ mod tests {
             tail,
             [
                 ("socket", When::Arg0Is(1)),
-                ("socketpair", When::Always),
+                ("socketpair", When::Arg1MaskedIs(15, 2)),
+                ("socketpair", When::Arg1MaskedIs(15, 3)),
                 ("socket", When::Arg0NotIn(vec![2, 10, 16, 1])),
                 ("bind", When::Always),
                 ("listen", When::Always),

@@ -74,13 +74,17 @@ the version the service runs, and boot verifies it first. On Windows only SYSTEM
 and the installing user may change the boot directory; everyone else may read it. A release
 without boot cannot be installed this way.
 
-`install.sh --system` (`sh -s -- --system`, with sudo only) also enables system access
-(docs/policy.md, System access): the control plane may run chosen commands as `happy-system` on
-Linux, which it creates with an npm prefix it owns, for `npm install -g`, and as Homebrew's owner
-on macOS, for `brew install` and `npm install -g`. `apt-get install` needs root on Linux: `sudo
-happy-supervisor system enable --user root --state-dir <dir>`, which is root-equivalent. NodeInfo
-then reports `identity.system`. `sudo happy-supervisor system enable|disable --state-dir <dir>`
-changes it later, with the service's state directory: `/var/lib/happy-supervisor` on Linux,
+A sudo install of `install.sh` also enables system access (docs/policy.md, System access): the
+control plane may run chosen commands, each reviewed, as `happy-system` on Linux, which it
+creates with an npm prefix it owns, for `npm install -g` and, through the supervisor, `apt-get
+install`, and as Homebrew's owner on macOS (root without Homebrew), for `brew install` and `npm
+install -g`. NodeInfo then reports `identity.system`. When `system enable` refuses, it says why and
+the install goes on without it; `--system` makes that refusal fail the install, and
+`--no-system` (`sh -s -- --no-system`) leaves system access off. A sudo upgrade enables it too,
+unless `--no-system`. An install without sudo, and Windows, cannot have it. `sudo happy-supervisor
+system enable --user root --state-dir <dir>` runs it as root on Linux, which is root-equivalent.
+`sudo happy-supervisor system enable|disable --state-dir <dir>` changes it later, with the
+service's state directory: `/var/lib/happy-supervisor` on Linux,
 `"/Library/Application Support/happy-supervisor"` on macOS.
 
 Run again without `HAPPY_JOIN_TOKEN` to upgrade a joined computer in place. That also moves a
@@ -211,3 +215,9 @@ triggers and `release.yml` do.
   has replaced. A repository that fails to refresh does not stop it; pacman syncs and retries
   when its database is stale. When the package manager fails, its own output is shown with the
   reason.
+* **0.2.12.** A sudo install enables system access by default, as `--system` did: `apt-get
+  install`, `npm install -g` and on macOS `brew install` work through the control plane without
+  sudo. A refusal from `system enable` says why and how to enable it later, and the install goes
+  on; `--system` makes it fail the install, and `--no-system` leaves system access off. Running
+  `install.sh` again with sudo enables it on a computer joined without it. An install without sudo
+  says it has none. Windows has none.

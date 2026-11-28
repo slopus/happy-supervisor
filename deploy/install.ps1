@@ -7,6 +7,7 @@
 # directory, %ProgramData%\happy-supervisor\boot, as its current version, so the first start
 # downloads nothing more. Boot changes the version later when the control plane asks.
 # happy-supervisor.cmd, beside boot, runs the version boot runs, verified.
+# Windows has no system access (docs/policy.md, System access): the node refuses it.
 #
 #   $env:HAPPY_JOIN_URL='<join url>'; $env:HAPPY_JOIN_TOKEN='<token>'
 #   irm https://get.happy.engineering/install.ps1 | iex

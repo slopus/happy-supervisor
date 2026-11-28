@@ -99,7 +99,7 @@ fn crypto_provider() -> Arc<CryptoProvider> {
         .clone()
 }
 
-fn random_bytes(buf: &mut [u8]) -> Result<()> {
+pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {
     crypto_provider()
         .secure_random
         .fill(buf)

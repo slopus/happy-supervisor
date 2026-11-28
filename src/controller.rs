@@ -2,6 +2,8 @@
 //! client): a [`ControlPlaneLink`] over a WebSocket it dials to a `serve` node, redialing when
 //! the connection drops so the session resumes.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +19,10 @@ use crate::ws::{Dialed, Socket};
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const REDIAL_MIN: Duration = Duration::from_millis(100);
 const REDIAL_MAX: Duration = Duration::from_secs(5);
+
+/// Opens one connection to a node: `Err` with `PermissionDenied` when the node refused the
+/// token, so redialing stops.
+type Dial = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Socket>> + Send>> + Send + Sync>;
 
 /// A connection to one node. Dropping it closes the connection; the node keeps its processes
 /// and loses the session once the resume window passes.
@@ -47,11 +53,29 @@ impl Controller {
     pub async fn connect(url: &str, token: &str) -> Result<Controller> {
         let url = Url::parse(url)
             .map_err(|err| Error::invalid_params(format!("bad node URL {url:?}: {err}")))?;
-        let socket = dial(&url, token).await?;
+        let token = token.to_string();
+        Controller::with_dialer(move || {
+            let (url, token) = (url.clone(), token.clone());
+            async move { dial(&url, &token).await }
+        })
+        .await
+    }
+
+    /// The same over whatever connections `dial` opens: one now, and one each time the last
+    /// drops (serve.md). The host drives a VM's agent this way, over its vsock
+    /// (docs/vm-mode.md, Boot). `dial` fails with `PermissionDenied` when the node refuses it,
+    /// which stops redialing.
+    pub async fn with_dialer<F, Fut>(dial: F) -> Result<Controller>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Socket>> + Send + 'static,
+    {
+        let dial: Dial = Arc::new(move || Box::pin(dial()));
+        let socket = dial().await?;
         let link = Arc::new(ControlPlaneLink::new(RESUME_WINDOW_MS));
         let events = link.events();
         link.attach(socket);
-        let redial = tokio::spawn(redial(link.clone(), events, url, token.to_string()));
+        let redial = tokio::spawn(redial(link.clone(), events, dial));
         let controller = Controller { link, redial };
         controller.link.opened(OPEN_TIMEOUT).await?;
         Ok(controller)
@@ -108,7 +132,7 @@ impl Drop for Controller {
 
 /// Dials again whenever the connection drops, until the node refuses the token or a newer
 /// connection takes it over.
-async fn redial(link: Arc<ControlPlaneLink>, mut events: LinkEvents, url: Url, token: String) {
+async fn redial(link: Arc<ControlPlaneLink>, mut events: LinkEvents, dial: Dial) {
     while let Some(event) = events.next().await {
         let LinkEvent::Disconnected { replaced } = event else {
             continue;
@@ -122,7 +146,7 @@ async fn redial(link: Arc<ControlPlaneLink>, mut events: LinkEvents, url: Url, t
         let socket = loop {
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(REDIAL_MAX);
-            match dial(&url, &token).await {
+            match dial().await {
                 Ok(socket) => break socket,
                 Err(err) if err.kind == ErrorKind::PermissionDenied => {
                     tracing::warn!("{err}");

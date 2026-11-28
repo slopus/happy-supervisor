@@ -28,6 +28,30 @@ pub enum Dialed {
 /// `Err` describes a failure worth retrying.
 pub async fn dial(endpoint: &Url, token: &str) -> Result<Dialed, String> {
     let (io, host_header, target) = connect(endpoint).await?;
+    handshake(io, host_header, target, token).await
+}
+
+/// [`dial`] over a stream the caller opened, such as a VM's vsock (docs/vm-mode.md, Boot): the
+/// same upgrade at `GET /`, with `Host: localhost`.
+pub async fn dial_over(
+    io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    token: &str,
+) -> Result<Dialed, String> {
+    handshake(
+        Box::new(io),
+        "localhost".to_string(),
+        "/".to_string(),
+        token,
+    )
+    .await
+}
+
+async fn handshake(
+    io: Box<dyn Io>,
+    host_header: String,
+    target: String,
+    token: &str,
+) -> Result<Dialed, String> {
     let key = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::now_v7().as_bytes());
     let bearer = HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| "the token is not a valid header value".to_string())?;

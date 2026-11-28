@@ -1,7 +1,9 @@
 # VM mode (design)
 
-Status: **proposal**. Nothing here is implemented. api.md, policy.md and node-info.md stay the
-contract. Each phase below moves its part of this design into them, in the same PR as the code.
+Status: **proposal**, with phase 1 (boot and agent) implemented. api.md, policy.md,
+node-info.md and serve.md stay the contract, and phase 1's parts are in them: NodeInfo `vm`,
+`serve --listen vsock:PORT`, and architecture.md, VMs. Each later phase moves its part of this
+design into them, in the same PR as the code.
 
 VM mode runs work inside a KVM virtual machine that the supervisor starts, stops and restarts
 itself. The VM is the security boundary. The existing sandbox (bubblewrap, seccomp and Landlock
@@ -192,23 +194,29 @@ and no shared folder.
    `switch_root`.
 3. The host starts `cloud-hypervisor --kernel <vmlinux> --initramfs <run/initrd> --cmdline
    "console=ttyS0 quiet -- __vm init" --cpus boot=N --memory size=M --disk path=…,readonly=on …
-   --vsock cid=3,socket=<run>/v.sock --serial file=<run>/console.log --console off --api-socket
-   <run>/api.sock`, in a cgroup of its own. A pure function turns a `VmSpec` into the argv,
-   so tests can check it literally.
-4. `__vm init` (PID 1, in the initramfs) mounts `/proc`, `/sys`, `/dev` and cgroup2, and reads
-   `/vm.json`. It mounts the layers read-only, then the state and workspace disks, and assembles
-   the root (Rootfs modes). It puts a tmpfs at `/.happy-supervisor`, with a copy of the binary
-   (`0555`) and the CA bundle, then calls `switch_root` and execs `__vm agent`.
-5. `__vm agent` stays PID 1, reaping orphans (`init::reap_as_pid1`). It runs `serve` on
+   --vsock cid=3,socket=<run>/v.sock --serial file=<run>/console.log --console off`, in a process
+   group of its own, with its own output in `<run>/vmm.log`. Every disk is `image_type=raw`, so
+   no guessed qcow2 can name a backing file on the host. A pure function (`vmm::argv`) turns the
+   plan into the argv, so tests check it literally. The VMM's cgroup and `--api-socket` come with
+   phases 10 and 4.
+4. `__vm init` (PID 1, in the initramfs) mounts `/proc`, `/sys` and `/dev`, then reads and
+   removes `/vm.json`. It mounts the layers read-only, then the state and workspace disks, and
+   assembles the root (Rootfs modes). It puts a tmpfs at `/.happy-supervisor` holding the binary
+   (`/init` bound read-only, `0555`, not copied, so the guest holds it in memory once), the CA
+   bundle and `agent.json`. Then it calls `switch_root`, mounts cgroup2, brings `lo` up, and
+   starts `__vm agent`.
+5. Init stays PID 1, reaping orphans. When the agent exits, or anything before it fails, init
+   prints why to the console and powers the VM off, so the VMM exits. The agent runs `serve` on
    `vsock:1024` with the token. Its state directory is a tmpfs at `/.happy-supervisor/state`
-   (`0700`), so the guest's private state is per boot, and hidden from policies as on any node.
+   (`0700`), so the guest's private state lasts one boot and is hidden from policies, as on any
+   node.
 6. The host connects to `v.sock`, sends `CONNECT 1024\n`, reads `OK <port>\n`, and runs the
    ordinary WebSocket upgrade over the rest of the stream with the token. It retries every 50 ms
    until the boot timeout (30 s). After `welcome`, the guest's `node.ready` makes the VM
    `running`.
 
 A boot costs about one Cloud Hypervisor start, the kernel's start (around 100 to 300 ms with
-Kata's minimal kernel), and the mounts. Phase 1 measures it.
+Kata's minimal kernel), and the mounts. `tests/vm.rs` prints it (`booted in N ms`).
 
 ### Guest agent protocol
 
@@ -399,22 +407,23 @@ guest's loopback.
 
 ### NodeInfo `vm`
 
+Phase 1 reports whether the node can boot a VM, and with what (node-info.md, `vm`):
+
 ```json
 "vm": {
-  "available": true, "reason": null,
-  "vmm": { "kind": "cloud-hypervisor", "path": "/opt/kata/bin/cloud-hypervisor", "version": "48.0" },
-  "kernel": "/opt/kata/share/kata-containers/vmlinux.container",
-  "maxVcpus": 48, "maxMemoryBytes": 133143986176, "hostLimits": true
+  "available": true,
+  "vmm": { "kind": "cloud-hypervisor", "path": "/opt/kata/bin/cloud-hypervisor", "version": "55.0" },
+  "kernel": "/opt/kata/share/kata-containers/vmlinux-6.18.62-211"
 }
 ```
 
-`available` is decided at startup. `/dev/kvm` must open read-write and answer
-`KVM_GET_API_VERSION` = 12. The VMM must answer `--version`. The kernel file and `mke2fs` must
-exist, and the supervisor's binary must be static. `reason` names the first check that failed.
-The node finds the VMM and kernel on `PATH`, then at Kata's paths, unless
-`--vm-vmm <path>` and `--vm-kernel <path>` (in `run` and `serve`) say otherwise. Those are the
-node's configuration, never the control plane's. Booting a probe VM would cost about a second
-and some memory at every start, so the first real boot reports a broken kernel instead
+It is checked at every collection. The checks are Linux, `/dev/kvm` answering
+`KVM_GET_API_VERSION` = 12, a static supervisor binary, the VMM's `--version`, and the kernel
+being an ELF `vmlinux`. `reason` names the first that failed. The node finds the VMM on `PATH`,
+then at Kata's path, and the kernel at Kata's path. Phase 2 adds `mke2fs`, `maxVcpus`,
+`maxMemoryBytes`, and the node's own `--vm-vmm <path>` and `--vm-kernel <path>`, which are never
+the control plane's to set. Phase 10 adds `hostLimits`. Booting a probe VM would cost about a
+second and some memory at every start, so the first real boot reports a broken kernel instead
 (`bootFailed`).
 
 ## Image store
@@ -477,8 +486,9 @@ stateDiagram-v2
   (`exec.log` of a stopped VM's process is `not_found`, while a `file` log on `/workspace`
   stays; Q7), and the guest link session.
 * **Supervisor exit.** A normal exit stops every VM (reason `shutdown`), as it kills every
-  process today (decision 4). The VMM runs in the supervisor's kill group with `PR_SET_PDEATHSIG`, and
-  startup kills any VMM a previous run recorded under `run/`. So an upgrade or a crash stops VMs
+  process today (decision 4). Dropping a VM kills its VMM, and startup kills any VMM a previous run
+  recorded under `run/`. There is no `PR_SET_PDEATHSIG`: Linux sends it when the thread that
+  forked exits, and tokio's blocking threads come and go. So an upgrade or a crash stops VMs
   without losing their disks, and the next operation starts them again.
 
 ## Guest user
@@ -613,7 +623,7 @@ untrusted, egress is host-side, and VM files live in `private/`.
 | The link to the guest drops while the VMM lives | Redial and resume, as `Controller` does. A lost guest link session is reconciled from the guest's `node.ready`. |
 | Guest disk full | `ENOSPC` inside, as on any machine. |
 | Host disk full under a sparse disk | The guest gets I/O errors, and ext4 remounts read-only. The VM keeps running, and `vm.list` shows its usage. Q3. |
-| Supervisor crash or `SIGKILL` | Parent-death signal kills the VMMs. At startup the node kills leftovers recorded in `run/`, and removes half-written layers and images. |
+| Supervisor crash or `SIGKILL` | The VMMs keep running until the next start, which kills the leftovers recorded in `run/` before it serves anything, and removes half-written layers and images. |
 | Image deleted while in use | `invalid_params`. |
 | State disk corrupt | `bootFailed` with the console's fsck output. `vm.delete` still works. |
 | A guest sends events for IDs it does not own, or malformed frames | Dropped and logged. Repeated protocol errors stop the VM as `crashed`. |
@@ -629,12 +639,16 @@ untrusted, egress is host-side, and VM files live in `private/`.
 * **Guest tests without KVM:** `__vm agent` is `serve` on a different listener. Tests run it over
   vsock loopback (`vsock_loopback`, CID 1) where the kernel allows, or over a Unix socket, so
   bridges, poweroff and seccomp toggles are tested in a plain Linux process.
-* **Integration tests with KVM:** `tests/vm.rs` drives the real binary: import an Alpine
-  minirootfs tarball (about 3 MB, pinned by sha256), `vm.create`, `exec.start` `uname -a` with
-  `access: vm`, fs round trips, idle stop and lazy start, then commit and boot the new image.
-  They run when `HAPPY_SUPERVISOR_VM_TESTS=1` is set, with `HAPPY_SUPERVISOR_VMM`,
-  `HAPPY_SUPERVISOR_VM_KERNEL` and `HAPPY_SUPERVISOR_GUEST_EXE` (a musl build) set. Without the
-  flag they say so and pass. With it, a missing prerequisite fails rather than skips.
+* **Integration tests with KVM:** `tests/vm.rs` boots real guests from a static build of the
+  supervisor. In phase 1 that is a test-built ext4 root, the guest's `node.info`, `fs.read` and
+  an `exec.start` as its user, plus a boot that fails and says why. Later phases add an image
+  saved with `docker save`, `vm.create`, `access: vm`, idle stop, lazy start and commit. The
+  tests need `/dev/kvm` that opens, Cloud Hypervisor and the kernel (vm/mod.rs finds them). If
+  any of those is missing, they print `skipping: this machine cannot boot VMs: <reason>` and
+  pass. Once they are present, a missing guest build fails the test. The guest build comes from
+  `HAPPY_SUPERVISOR_GUEST_EXE`, else `target/x86_64-unknown-linux-musl/debug/happy-supervisor`
+  from `cargo zigbuild --target x86_64-unknown-linux-musl --bin happy-supervisor`. So does a
+  missing `mke2fs`.
 * **CI:** a `vm` job on `ubuntu-latest`. GitHub-hosted Linux runners expose `/dev/kvm`, which the
   Android emulator actions rely on, but not to the runner's user. The job opens it with the udev rule the Android emulator actions use
   (`KERNEL=="kvm", GROUP="kvm", MODE="0666"`), builds `x86_64-unknown-linux-musl` with zig as the

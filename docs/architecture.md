@@ -46,6 +46,7 @@ control plane ──wss── client ── link::Session ──► dispatch ─
 | `NodeCa` (the CA and `public/ca-bundle.pem`), `ProxyManager` (what every command proxy shares: streams, CA, resolver, the `net.denied` sink; `on_event`, `session_lost`), `egress::start` → `CommandProxy` (one command's HTTP and SOCKS5 proxies in `http`, `socks5`, its decisions and environment; proxy.md), `address` (the internal-address filter) | `proxy/*` | proxy track |
 | `TunnelManager` (`open` for `tcp.open`, `on_event`, `session_lost`): one task per tunnel moving bytes between its loopback socket and its stream | `tunnel` | proxy track |
 | `connect::main` (`happy-supervisor __connect <host> <port>`, the SSH `ProxyCommand` of an isolated command: one connection through the SOCKS5 proxy in `ALL_PROXY`, over stdio) | `connect` | Linux track |
+| VM mode, phase 1 (vm-mode.md): `vm::probe` (NodeInfo `vm`), `vm::Host` (the VMM and kernel), `vm::Vm::boot(&Boot)` (a running VM and a `Controller` for its agent), `cpio::Archive` (the initramfs), `vmm::{argv, Process}` (Cloud Hypervisor), `hvsock::connect` (the host's side of its vsock), `vsock::{Listener, Stream}` (`serve --listen vsock:PORT`), `guest::main` (`happy-supervisor __vm init\|agent`) | `vm/*` | VM track |
 | `Identity` (the supervisor's user, whether it is root, the `Workload` user every raw and sandboxed command and file operation runs as, and `System`, the account of system access read from `private/system`; `Workload::apply` makes a child that user), NodeInfo `identity` | `identity` | scaffold |
 | `boot` (the channel to happy-supervisor-boot when it started `run`, boot.md: `attach` reads its status from stdin, `status` for NodeInfo `boot`, `statuses` for `node.boot`, `upgrade` and `connected` write to stdout, `closed` when stdin ends, and on Linux `pid` for the cgroup handoff) | `boot` | scaffold |
 | `system_account` (Linux: `remove` takes away `happy-system`, the account 0.2.12 and earlier ran system access as, with its processes, home, npm prefix, profile script and `cron.deny` and `at.deny` lines, when system access moves to root: `identity::enable_system`, and `identity::upgrade_system` as the service starts) | `system_account` | scaffold |
@@ -110,6 +111,33 @@ like a job, performs it unconfined as that user, and replies like a file job.
 
 The job travels on stdin, never in argv or the environment, so other users cannot see
 the command's environment in `ps`.
+
+## VMs
+
+A VM (vm-mode.md) boots Kata's guest kernel with an initramfs that the host writes from a static
+build of this binary. That binary is `/init` in one newc archive. A second archive holds
+`vm.json`: the boot's token, the agent's vsock port, the user `raw` work runs as, and the root
+device. Cloud Hypervisor runs it with the root disk on virtio-blk, the guest's serial console in
+`console.log`, and its vsock behind a Unix socket, `v.sock`, in the VM's run directory, which is
+`0700`.
+
+`__vm init` is the guest's PID 1. It mounts `/dev`, `/proc` and `/sys`, reads and removes
+`vm.json`, and mounts the root disk. It puts a tmpfs at `/.happy-supervisor` in the new root,
+holding itself (`/init`, bound read-only rather than copied, so the guest holds the binary in
+memory once), `agent.json` (`0400`) and the agent's state directory. It puts tmpfs at
+`/tmp` and `/run`, moves the kernel filesystems over, and switches root. Then it mounts cgroup2,
+brings `lo` up, and starts `__vm agent`. It stays PID 1, reaping orphans. When the agent exits,
+or anything before it fails, init says why on the console and powers the VM off, so the VMM
+exits.
+
+`__vm agent` is `serve` on `vsock:1024`, with the token and with the boot's user as its workload
+user. It is root in the guest, so its work runs as that user, as on a Linux node with
+`--workload-user` (policy.md). `Vm::boot` makes the host its control plane. It dials through
+`v.sock` (`CONNECT 1024`, then `OK <port>`, hvsock.rs), upgrades over that stream with the token
+(`ws::dial_over`), and builds a `Controller::with_dialer` that redials the same way. So the link
+to the guest is the link protocol unchanged. Until the agent answers, or for 30 s, the boot
+retries every 50 ms. A VMM that exits first, or a timeout, fails the boot with the end of the
+console and of the VMM's own log. Dropping the `Vm` kills the VMM.
 
 ## Watching
 

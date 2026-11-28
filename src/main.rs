@@ -53,7 +53,7 @@ enum Command {
     /// Listen for a control plane instead of dialing one (docs/serve.md). Prints
     /// `listening <addr>` once connections are accepted.
     Serve {
-        /// `IP:PORT` (port 0 picks one) or `unix:PATH`.
+        /// `IP:PORT` (port 0 picks one), `unix:PATH`, or `vsock:PORT` (Linux, a VM's agent).
         #[arg(long)]
         listen: String,
         /// A file holding the token clients must present, or `-` for one line of stdin.
@@ -127,6 +127,14 @@ fn main() -> ExitCode {
         .is_some_and(|arg| arg == CONNECT_ARG)
     {
         return happy_supervisor::connect::main(std::env::args().skip(2));
+    }
+    // A VM's init forks before any thread exists (docs/vm-mode.md, Boot).
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == happy_supervisor::vm::guest::ARG)
+    {
+        return happy_supervisor::vm::guest::main(std::env::args().skip(2));
     }
     let cli = Cli::parse();
     // Before the runtime starts any thread: forking is safe only while there is one.

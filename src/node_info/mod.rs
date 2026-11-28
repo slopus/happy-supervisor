@@ -41,6 +41,7 @@ pub fn collect(
     identity: &Identity,
 ) -> NodeInfo {
     let gpus = std::thread::spawn(gpu::probe);
+    let vm = std::thread::spawn(crate::vm::probe);
     let os = platform::os();
     let disks = platform::disks();
     let system = System::new_with_specifics(
@@ -59,6 +60,7 @@ pub fn collect(
         hostname,
         supervisor_version: crate::VERSION.to_string(),
         boot: crate::boot::status(),
+        vm: vm.join().ok(),
         os,
         cpu: CpuInfo {
             model: system

@@ -10,6 +10,20 @@ and is not treated as one. Inside the VM, the supervisor's own binary is the gue
 agent. The host forwards the normal API to it, so a caller runs `exec.start`, `fs.*` and
 `watch.start` in a VM with the same messages and the same results it gets on the host.
 
+## Decisions (Steve, 2026-11-28)
+
+1. **Containers without containerd.** The supervisor drives Cloud Hypervisor with Kata's kernel,
+   as recommended below. It is still container-based: a base image is a real OCI image. Phase 2
+   imports a local OCI image, either an image layout or a `docker save` tarball, into the layer
+   store. Registry pulls come later (phase 8).
+2. **Guest user.** Commands run as an unprivileged user by default, with passwordless `sudo` in
+   the guest (Guest user).
+3. **Restart is a cold boot** for now. Memory snapshots are a later phase (phase 12, Q1).
+4. **VMs stop when the supervisor exits or upgrades.**
+5. **Network goes only through the host's proxies.** There is no NAT mode.
+6. **Test host.** `core` gets `happy-agent` in group `kvm`, plus a pinned Cloud Hypervisor and
+   Kata guest kernel under `/opt/kata/`.
+
 ## Goals
 
 * A separate access mode, `{"mode": "vm"}`, next to `raw`, `sandboxed` and `system`. It replaces
@@ -34,10 +48,10 @@ agent. The host forwards the normal API to it, so a caller runs `exec.start`, `f
 * Replacing the bubblewrap, Seatbelt or Windows sandboxes.
 * macOS and Windows hosts. Virtualization.framework has vsock and could run the same guest
   later. Nothing in this design relies on Linux on the host side beyond KVM and the VMM.
-* Keeping processes alive across a stop. A stop is a guest poweroff and a start is a cold boot.
-  A memory snapshot is an open question (Q4).
+* Keeping processes alive across a stop, for now. A stop is a guest poweroff and a start is a
+  cold boot. Memory snapshots are phase 12 (Q1).
 * A general network for the guest (NAT, UDP, inbound). The guest reaches out only through the
-  proxies, as an `isolated` command does today (Q6).
+  proxies, as an `isolated` command does today (decision 5).
 * happy-cluster. Cluster is meant to drive this through the existing API, but its side is out of
   scope here.
 * Running OCI containers inside the VM. The image is the VM's root filesystem, and the guest runs
@@ -82,9 +96,9 @@ them. The supervisor looks for them there by default.
 | Host dependencies | containerd running as root, the Kata shim and runtime, CNI plugins for any network, a snapshotter, and for block rootfs devmapper with a thin pool | One static `cloud-hypervisor` binary, one kernel file, `mke2fs`. No daemon. |
 | In-guest agent | `kata-agent` owns the guest. Our supervisor would be a container under it. The host reaches it either by `exec` through kata-agent (the gVisor draft's pipe, through two agents) or through Kata's internal hybrid-vsock socket path, which is an implementation detail Kata can change | Our binary is PID 1 and the only agent. It listens on a vsock port, and the host dials it through a socket in `private/` |
 | Host↔guest transport | ttRPC to kata-agent. Ours would ride on top | Hybrid vsock: a Unix socket on the host, `CONNECT <port>\n` / `OK <port>\n`, then a byte stream. Unix permissions decide who can reach it, with no `/dev/vhost-vsock` and no global CID |
-| Images | OCI pull and unpack come free | The node imports a rootfs tarball, or pulls OCI itself (phase 8), and unpacks it **inside a VM** |
+| Images | OCI pull and unpack come free | The node imports OCI images itself, from a local layout or a `docker save` tarball (phase 2), later from a registry (phase 8), and unpacks the layers **inside a VM** |
 | Rootfs isolation | The default shares the rootfs over virtio-fs, with `virtiofsd` on the host serving host paths. Block devices need devmapper | Block devices only. There is no virtio-fs or 9p, so no host filesystem is exported |
-| Stop/restart with state | `nerdctl stop`/`start` keeps the container's snapshot. Kata has no checkpoint or restore | We own the disks, so a stop keeps them. Cloud Hypervisor's snapshot and restore stay available for later (Q4) |
+| Stop/restart with state | `nerdctl stop`/`start` keeps the container's snapshot. Kata has no checkpoint or restore | We own the disks, so a stop keeps them. Cloud Hypervisor's snapshot and restore stay available for later (phase 12) |
 | Idle stop | Through containerd tasks | A guest poweroff the supervisor asks for |
 | Build an image | `nerdctl commit` (an image layer) | Freeze the VM's overlay upper as a new read-only layer (phase 7) |
 | Failure surface | Daemon, shim, agent, CNI, snapshotter | One VMM process per VM, which the supervisor waits for |
@@ -118,13 +132,24 @@ Conclusion: KVM is usable on both reachable Linux hosts. On `core` the agents' u
 `kvm`, which is an admin change this check did not make. Neither host has a VMM, so phase 1
 needs a pinned Cloud Hypervisor and kernel (Test strategy).
 
-Kata's kernel config (`tools/packaging/kernel/configs/fragments/common/fs.conf`) builds in ext4,
-erofs, overlayfs (with index, redirect_dir and metacopy) and virtio-fs. vsock is required by
-kata-agent. Phase 1 must still check the rest against a real `vmlinux.container`: the guest needs
-`CONFIG_VIRTIO_VSOCKETS`, `VIRTIO_BLK`, cgroup v2, seccomp, user namespaces (for bubblewrap in
-the guest) and Landlock. Landlock is not confirmed. If it is missing, only the bubblewrap
-sandbox *inside* the guest gets weaker (phase 11), and that is the open question about which
-kernel we ship (Q9).
+**Pinned for phase 1** (checked 2026-11-28):
+
+* Cloud Hypervisor **v55.0**, `cloud-hypervisor-static` from its GitHub release: a static-pie
+  x86_64 binary, sha256 `ce7133bf535ed5a4e2a63ea1f26025445a5b1241f73ddfb81ff2fbcb2e803a59`.
+* Kata Containers **4.4.0**, guest kernel `vmlinux-6.18.62-211`, sha256
+  `011100a36d401b7eff9c4ab132bd570c9a4f9bd7a70550d32b0aaa6cb1455027`. It is an uncompressed ELF
+  with PVH, and its config has sha256
+  `0127c096083a883f9701a44249cb343f1c33f137d05f6e6184d1b3b833f26de6`. Both come from
+  `kata-static-substrate-4.4.0-amd64.tar.zst` (42 MB). The full kata-static is 1 GB.
+* The kernel's config has everything this design needs, built in, with `CONFIG_MODULES` off:
+  `VIRTIO_VSOCKETS`, `VIRTIO_BLK`, `EXT4_FS`, `OVERLAY_FS`, `EROFS_FS`, `BLK_DEV_INITRD`
+  (gzip, not zstd), `DEVTMPFS`, cgroups with `MEMCG` and `CGROUP_PIDS`, `SECCOMP_FILTER`,
+  `USER_NS`, `NET_NS`, `PID_NS`, `SECURITY_LANDLOCK` (first in `CONFIG_LSM`), `INOTIFY_USER`,
+  `FANOTIFY`, `SERIAL_8250_CONSOLE` and `PVH`. There is no `HW_RANDOM_VIRTIO`, so the VM gets no
+  virtio-rng device, and the guest seeds its random pool itself.
+
+Installing them on `core` needs root, and so does adding `happy-agent` to `kvm`. `happy-agent`
+has no passwordless sudo, so an admin runs the setup (Test strategy).
 
 ## Architecture
 
@@ -166,7 +191,7 @@ and no shared folder.
    unpacks concatenated archives in order. The config never touches a disk and is gone after
    `switch_root`.
 3. The host starts `cloud-hypervisor --kernel <vmlinux> --initramfs <run/initrd> --cmdline
-   "console=hvc0 quiet panic=-1" --cpus boot=N --memory size=M --disk path=…,readonly=on … --rng
+   "console=ttyS0 quiet -- __vm init" --cpus boot=N --memory size=M --disk path=…,readonly=on …
    --vsock cid=3,socket=<run>/v.sock --serial file=<run>/console.log --console off --api-socket
    <run>/api.sock`, in a cgroup of its own. A pure function turns a `VmSpec` into the argv,
    so tests can check it literally.
@@ -243,7 +268,7 @@ control planes have learned them.
 * `vm` names a VM (`vm.create`). It is `not_found` if no such VM exists, and
   `sandbox_unavailable` when NodeInfo `vm.available` is false.
 * `access` is the access **inside** the guest, and it is required, so nothing is implicit:
-  * `raw` runs as the VM's `user`.
+  * `raw` runs as the VM's unprivileged user (Guest user), who has passwordless `sudo`.
   * `system` runs as guest root. Inside a VM it is always enabled: it can do anything to the
     guest and nothing to the host.
   * `sandboxed` is the guest's own bubblewrap, under policy.md's rules with guest paths. It needs
@@ -258,23 +283,40 @@ control planes have learned them.
 
 ### Images
 
+A base image is an OCI image (decision 1).
+
 ```json
-{ "kind": "vm.image.import", "body": { "imageId": "debian-trixie", "source": { "kind": "tar", "path": "/srv/images/debian-trixie.tar" } } }
-{ "kind": "vm.image.import", "body": { "imageId": "debian-trixie", "source": { "kind": "oci", "ref": "docker.io/library/debian:trixie-slim" } } }
+{ "kind": "vm.image.import", "body": { "imageId": "debian-trixie", "source": { "kind": "ociArchive", "path": "/srv/images/debian-trixie.tar" } } }
+{ "kind": "vm.image.import", "body": { "imageId": "node-22", "source": { "kind": "ociLayout", "path": "/srv/images/node-22", "ref": "22-bookworm" } } }
+{ "kind": "vm.image.import", "body": { "imageId": "alpine", "source": { "kind": "registry", "ref": "docker.io/library/alpine:3.22" } } }
 ```
 
-* `tar` reads a rootfs tarball on the node: `docker export`, an Alpine minirootfs, or
-  `debootstrap` output. It is read as the workload user, like a raw `fs.read`. It may be plain,
-  gzip or zstd.
-* `oci` pulls the image for the node's architecture from its registry, anonymously, flattening
-  the layers and applying whiteouts (phase 8). Registry credentials are Q10.
-* The node creates an ext4 file of the tar's size plus 20 % with `mke2fs`, boots an **import VM**
-  (initramfs only, with that disk read-write), and streams the tar into it over the link. The
-  guest unpacks it as root, so ownership, modes, xattrs and device nodes come out right with no
-  root on the host. Symlink tricks and hostile paths stay inside a VM. Then the disk is frozen
-  (`0400`).
-* Result `{ "imageId", "sizeBytes", "layers": 1 }`. `already_exists` if the ID is taken or being
-  built.
+* `ociArchive` reads a tarball on the node. It is either the output of `docker save` (a
+  `manifest.json` that names a config and layer tarballs) or a tarred OCI image layout (an
+  `oci-layout`, an `index.json` and `blobs/sha256/…`), which `docker save` also writes since
+  Docker 25, as do `podman save --format oci-archive` and `skopeo copy … oci-archive:`. An
+  archive with more than one image needs `ref`: a `RepoTags` entry, or an index annotation
+  `org.opencontainers.image.ref.name`.
+* `ociLayout` reads an untarred OCI image layout directory, with the same `ref` rule.
+* An index (a multi-platform image) resolves to the manifest for the node's architecture and
+  `linux`. Layers may be plain, gzip or zstd tarballs. Every blob is checked against its
+  sha256 digest as it is read, and so is each layer's `diffID` from the config. A mismatch is
+  `invalid_params`.
+* Paths are read as the workload user, like a raw `fs.read`.
+* `registry` pulls the same thing from a registry, anonymously (phase 8). Registry credentials
+  are Q6.
+* The node creates an ext4 file with `mke2fs`, sized at the layers' uncompressed size plus 20 %
+  plus 256 MiB. It boots an **import VM** (initramfs only, with that disk read-write) and streams
+  the layers into it over the link, bottom first. The guest unpacks each one as root and
+  applies OCI whiteouts (`.wh.<name>` removes a path, `.wh..wh..opq` empties a directory), so
+  the image becomes one flattened layer. Ownership, modes, xattrs and device nodes come out
+  right with no root on the host, and symlink tricks and hostile paths stay inside a VM. Then
+  the disk is frozen (`0400`).
+* The image's config is kept with it. `Env` becomes the VM's `defaultEnv`. `User` and
+  `WorkingDir` are recorded and reported. `Entrypoint` and `Cmd` are kept but never run, since a
+  VM runs only what the control plane starts.
+* Result `{ "imageId", "digest", "sizeBytes", "layers": 1 }`, where `digest` is the manifest's.
+  `already_exists` if the ID is taken or being built.
 
 ```json
 { "kind": "vm.image.commit", "body": { "imageId": "debian-dev", "vmId": "builder-1" } }
@@ -285,8 +327,9 @@ read-only layer on top. The VM must be `stopped` (`invalid_params` otherwise), a
 must be `writable`. The workspace is not part of an image. Result as for import, with `parent`.
 
 `vm.image.delete {imageId}` removes an image no VM and no other image uses. An image in use is
-`invalid_params` and a missing one is `not_found`. `vm.image.list {}` returns `{ "images": [ { "imageId", "parent", "layers",
-"sizeBytes", "createdMs", "source" } ] }`, sorted by ID.
+`invalid_params` and a missing one is `not_found`. `vm.image.list {}` returns `{ "images": [ {
+"imageId", "parent", "digest", "layers", "sizeBytes", "createdMs", "source", "config": { "env",
+"user", "workingDir" } } ] }`, sorted by ID.
 
 **Building from an image plus setup steps** is composed by the control plane, not a node
 command: `vm.create` from the base image, `exec.start` each step with `access: {mode: "vm", vm,
@@ -319,8 +362,7 @@ and `net.denied`. The node needs no long-running build command with its own prog
 
 * `vmId` follows `execId`'s rules. A VM's disks are created (sparse) and formatted. Nothing boots,
   and the state is `stopped`. Result `{}`.
-* `user` is the account `raw` runs as. It must exist in the image's `/etc/passwd`. It defaults to
-  `root`, as a container does (Q3).
+* `user` is the unprivileged account `raw` runs as (Guest user). It defaults to `happy`.
 * `rootfs` is in Rootfs modes, `network` is in Egress, and `resources` is in Limits.
 * `idleTimeoutMs` is 1 to 604800000, or `null` for never.
 * Every field shown is required except `user`. An unknown key anywhere is `invalid_params`, as in
@@ -395,7 +437,7 @@ private/vm/
   --reflink=auto --sparse=always`. The guest mounts layer *k* read-only, and overlayfs gets
   `lowerdir=` the top layer first. Images share layers, so `debian-dev` on `debian-trixie`
   costs only its changes.
-* At most 16 layers. A 17th commit is `too_large` until flattening exists (Q13).
+* At most 16 layers. A 17th commit is `too_large` until flattening exists (Q9).
 * Writes go to a temporary name and are renamed into place. A layer is fsynced before its image
   record. At startup the node removes half-written layers and images, and anything under `run/`
   left by a previous run (Failure modes).
@@ -433,11 +475,38 @@ stateDiagram-v2
   `writable` mode or the writable dirs in `readonly` mode. Exited processes stay listed, with
   their exit and `logBytes`. **What does not:** processes, memory, `/tmp`, memory logs
   (`exec.log` of a stopped VM's process is `not_found`, while a `file` log on `/workspace`
-  stays; Q11), and the guest link session.
+  stays; Q7), and the guest link session.
 * **Supervisor exit.** A normal exit stops every VM (reason `shutdown`), as it kills every
-  process today. The VMM runs in the supervisor's kill group with `PR_SET_PDEATHSIG`, and
+  process today (decision 4). The VMM runs in the supervisor's kill group with `PR_SET_PDEATHSIG`, and
   startup kills any VMM a previous run recorded under `run/`. So an upgrade or a crash stops VMs
-  without losing their disks, and the next operation starts them again (Q5).
+  without losing their disks, and the next operation starts them again.
+
+## Guest user
+
+`raw` runs as an unprivileged account with passwordless `sudo` (decision 2). `system` runs as
+guest root.
+
+* `vm.create` `user` names the account, `happy` by default: 1 to 32 characters of
+  `[a-z_][a-z0-9_-]*`, not `root`.
+* At every boot, `__vm init` makes sure of it before anything runs:
+  * If the image has the account, its uid, gid and home are used as they are. An account with
+    uid 0 is `bootFailed`.
+  * If it does not, the account is added to `/etc/passwd`, `/etc/group` and `/etc/shadow` (with
+    a locked password). It gets the first free uid and gid from 1000 and the home
+    `/home/<user>`, created with that owner, and shell `/bin/sh`, or `/bin/bash` when the image
+    has it.
+  * `/etc/sudoers.d/happy-supervisor` (`0440`, root) holds `<user> ALL=(ALL) NOPASSWD: ALL`.
+* `sudo` itself comes from the image. NodeInfo cannot know whether it is there, so `vm.list`
+  reports `sudo: true | false` from the last boot. An image without it still has root through
+  `system`. A Debian or Ubuntu base needs `apt-get install sudo` in a setup step, and Alpine
+  needs `apk add sudo`.
+* In `writable` mode these edits land in the overlay's upper, like any change, and persist.
+  In `readonly` mode `/etc` is read-only, so the agent bind-mounts generated `passwd`, `group`,
+  `shadow` and `sudoers.d/happy-supervisor` from a tmpfs over the image's, every boot. `/home` is
+  always writable in that mode.
+* The guest's agent runs it as its workload user, as `--workload-user` does on a Linux node
+  (policy.md, Workload user). A `tty` command's terminal belongs to it, and its `HOME`, `USER`
+  and `LOGNAME` come with `vm.list` `defaultEnv`.
 
 ## Rootfs modes
 
@@ -445,9 +514,10 @@ stateDiagram-v2
 workdir=state:/work)`. It behaves like a container: `apt-get install` works with `system`, and
 everything survives a stop. `vm.image.commit` freezes `upper`.
 
-`{ "mode": "readonly", "writable": ["/home", "/var/tmp"] }`: `/` is the layers read-only, as an
+`{ "mode": "readonly", "writable": ["/var/tmp"] }`: `/` is the layers read-only, as an
 overlay without an upper, or the single layer itself. `/workspace` is always writable (its own
-disk), and `/tmp` and `/run` are always tmpfs. Each path in `writable` (absolute, at most 16,
+disk), `/home` is always writable and persisted (Guest user), and `/tmp` and `/run` are always
+tmpfs. Each path in `writable` (absolute, at most 16,
 not `/`, not under `/workspace`, `/proc`, `/sys`, `/dev` or `/.happy-supervisor`) is an overlay
 of the image's directory with an upper on the state disk, so it starts with the image's
 contents and keeps changes across stops. The rest of the tree is `EROFS`. `vm.image.commit`
@@ -493,7 +563,7 @@ they are enforced on the host. The guest has no NIC, no route and no resolver.
   compromised guest can reach only the host ports of its running execs, and through them only
   what the VM's `egress` allows.
 * Programs that ignore the proxy variables have no network, and UDP and DNS have no route, as in
-  isolated mode. A NAT network (passt as a vhost-user backend, or a tap device) is Q6.
+  isolated mode. There is no NAT mode (decision 5).
 * Import and OCI pulls are the node's own traffic, made by the host. They are not subject to a
   VM's egress.
 * Phase 11 lets a sandboxed `isolated` policy inside the guest narrow this further: the guest's
@@ -504,7 +574,7 @@ they are enforced on the host. The guest has no NIC, no route and no resolver.
 * **Per VM:** `vcpus` (1 to NodeInfo `maxVcpus`), `memoryBytes` (128 MiB to `maxMemoryBytes`,
   a multiple of 2 MiB), `stateDiskBytes` and `workspaceDiskBytes` (1 GiB to 2 TiB). The disks are
   sparse files: their size caps what the guest can write (`ENOSPC` in the guest), and the host
-  pays only for what is written (Q7).
+  pays only for what is written (Q3).
 * **On the host,** the VMM's cgroup gets `memory.max` = `memoryBytes` + 256 MiB of VMM overhead,
   `pids.max` 256, and `cpu.max` = `vcpus`. That needs the delegated cgroup that `limits` need
   today. Without one the VMM runs uncapped on the host, and NodeInfo `vm.hostLimits` is
@@ -527,7 +597,7 @@ Cloud Hypervisor's own seccomp filters stay on. Phase 10 adds:
 * The VMM as its own account. A root supervisor runs it as `happy-vm`, a system user in group
   `kvm` that the installer creates, so no raw host command, which runs as the workload user, can
   `ptrace` it or read a VM's disks. A non-root supervisor runs it as itself, and must be in group
-  `kvm` (Q8).
+  `kvm` (Q4).
 
 SECURITY.md gains a VM section with phase 2: the guest gets nothing of the host, the guest is
 untrusted, egress is host-side, and VM files live in `private/`.
@@ -542,7 +612,7 @@ untrusted, egress is host-side, and VM files live in `private/`.
 | Kernel panic, VMM crash, or guest link broken beyond resume | `stopped` with `crashed`. Every running process of the VM gets `exec.exit` `signaled 9` from the host. The tunnels reset. The disks are kept, and the next boot replays the journal. |
 | The link to the guest drops while the VMM lives | Redial and resume, as `Controller` does. A lost guest link session is reconciled from the guest's `node.ready`. |
 | Guest disk full | `ENOSPC` inside, as on any machine. |
-| Host disk full under a sparse disk | The guest gets I/O errors, and ext4 remounts read-only. The VM keeps running, and `vm.list` shows its usage. Q7. |
+| Host disk full under a sparse disk | The guest gets I/O errors, and ext4 remounts read-only. The VM keeps running, and `vm.list` shows its usage. Q3. |
 | Supervisor crash or `SIGKILL` | Parent-death signal kills the VMMs. At startup the node kills leftovers recorded in `run/`, and removes half-written layers and images. |
 | Image deleted while in use | `invalid_params`. |
 | State disk corrupt | `bootFailed` with the console's fsck output. `vm.delete` still works. |
@@ -571,8 +641,9 @@ untrusted, egress is host-side, and VM files live in `private/`.
   release does, and fetches a pinned `cloud-hypervisor` static binary and Kata's `vmlinux`
   (extracted from a pinned kata-static release, sha256-checked, cached). `ubuntu-24.04-arm` is
   tried the same way, and the job becomes required only if KVM is there.
-* **By hand:** `androids` works today (nested KVM, `steve` in `kvm`), but has 21 GiB free.
-  `core` needs `happy-agent` added to group `kvm` by an admin.
+* **Test host:** `core` (decision 6). As root, an admin adds `happy-agent` to `kvm` and installs
+  the pinned binary and kernel above at Kata's paths. Then the agents' daemon restarts, since
+  group membership reaches only new processes. `androids` is for Android emulators only.
 
 ## Phases
 
@@ -581,20 +652,24 @@ for what it lands, with real implementations and no stubs (AGENTS.md). Until a p
 fields are refused, never ignored.
 
 1. **Boot and agent.** `__vm init` and `__vm agent`. `serve --listen vsock:PORT`. The cpio
-   writer. The Cloud Hypervisor driver (argv, spawn, cgroup, console, kill). The hybrid-vsock
-   dialer and a `Controller` over a dialed stream. NodeInfo `vm` and the probe. *Accepted when*
-   `tests/vm.rs` boots a VM from a test-built ext4 rootfs and the host gets the guest's
-   `node.info` over vsock, and when the guest kernel's config is checked and listed in the PR.
-   No `vm.*` kinds yet.
-2. **Image store, VMs and exec.** `vm.image.import` (`tar`), `vm.image.list`,
-   `vm.image.delete`; `vm.create`, `vm.start`, `vm.stop`, `vm.delete`, `vm.list`, `vm.state`;
-   `Access::Vm` for `exec.*` with `raw` and `system` inside; routing, the event relay with
-   foreign-ID filtering, and the startup sweep. `writable` rootfs only. `network.egress` must
-   allow nothing until phase 5 (`sandbox_unavailable` otherwise). *Accepted when* an imported
-   Alpine image runs `exec.start` with streaming output, `exec.write` stdin, `tty`,
-   `exec.kill interrupt`, exit codes, `timeout`, `exec.log` and `limits` in the guest; `vm.stop`
-   then `vm.start` keeps a file written in `/workspace` and a package installed in `/usr`; and
-   the guest cannot open any host path or host socket (asserted from inside).
+   writer. The Cloud Hypervisor driver (argv, spawn, console, kill). The hybrid-vsock dialer and
+   a `Controller` over a dialed stream. NodeInfo `vm` and its probe. *Accepted when*
+   `tests/vm.rs` on `core` boots a VM from a test-built ext4 rootfs, and the host gets the
+   guest's `node.info` and runs a command in it over vsock, as the guest's unprivileged user.
+   The test skips cleanly where `/dev/kvm` cannot be opened, and the guest kernel's config is
+   checked and listed in the PR. No `vm.*` kinds yet.
+2. **OCI image store, VMs and exec.** `vm.image.import` from `ociArchive` (`docker save`, or a
+   tarred OCI layout) and `ociLayout`, unpacked with whiteouts in an import VM; `vm.image.list`
+   and `vm.image.delete`; `vm.create`, `vm.start`, `vm.stop`, `vm.delete`, `vm.list` and
+   `vm.state`; the guest user with passwordless `sudo`; `Access::Vm` for `exec.*` with `raw`
+   and `system` inside; routing, the event relay with foreign-ID filtering, and the startup
+   sweep. `writable` rootfs only. `network.egress` must allow nothing until phase 5
+   (`sandbox_unavailable` otherwise). *Accepted when* an image saved with `docker save` (Alpine,
+   and Debian with `sudo`) imports and runs `exec.start` with streaming output, `exec.write`
+   stdin, `tty`, `exec.kill interrupt`, exit codes, `timeout`, `exec.log` and `limits` in the
+   guest. `raw` runs as `happy`, and `sudo -n true` succeeds. `vm.stop` then `vm.start` keeps a
+   file written in `/workspace` and a package installed in `/usr`. The guest cannot open any
+   host path or host socket, asserted from inside.
 3. **Files and watches.** `fs.*` and `watch.*` with `access: vm`; watches that survive a stop and
    come back with `overflow`. *Accepted when* the fs and watch suites run against a VM with the
    same expected results as on the host, guest paths aside.
@@ -606,17 +681,18 @@ fields are refused, never ignored.
    guest, `__connect`, and the credential route. *Accepted when* the existing egress and proxy
    tests pass against a VM: allowed host, denied host with `net.denied`, internal address,
    credential host through the control plane, and `git` over SSH through `__connect`.
-6. **Rootfs modes and toggles.** `readonly` with `writable`; `localBind` and `unixSockets` set to
-   `false` through guest seccomp, with `net.bindDenied`. *Accepted when* a write outside the
-   writable set is `EROFS`, writable dirs survive a stop, and each toggle refuses with the
-   documented errno and event.
+6. **Rootfs modes and toggles.** `readonly` with `writable`, plus the generated `/etc` files of
+   the guest user; `localBind` and `unixSockets` set to `false` through guest seccomp, with
+   `net.bindDenied`. *Accepted when* a write outside the writable set is `EROFS`, writable dirs
+   survive a stop, `sudo` works in `readonly` mode, and each toggle refuses with the documented
+   errno and event.
 7. **Commit.** `vm.image.commit`, layered images, content-addressed layers, and the 16-layer cap.
    *Accepted when* a base image, plus setup steps run by the test as the control plane would,
    then `vm.stop` and `vm.image.commit`, boots as a new VM with the packages present, and
    deleting the base image while the child uses it is refused.
-8. **OCI import.** `source.kind: "oci"`: anonymous registry pull for the node's architecture,
-   layer flattening with whiteouts, gzip and zstd. *Accepted when* `debian:trixie-slim` and
-   `alpine` import and boot, with the import pinned by digest in CI.
+8. **Registry pulls.** `source.kind: "registry"`: anonymous pulls for the node's architecture,
+   through the same unpacking as phase 2. *Accepted when* `debian:trixie-slim` and `alpine`
+   import by digest and boot.
 9. **Tunnels.** `tcp.open` with `vm` or a VM `execId`, and `tcp.*` relayed. *Accepted when* the
    tunnel suite passes against a server in the guest, and an open tunnel keeps the VM busy.
 10. **Host hardening.** The VMM under the host's bubblewrap with `/dev/kvm`, Cloud Hypervisor
@@ -625,43 +701,40 @@ fields are refused, never ignored.
     runs the VMM's sandbox, and budgets refuse with `too_large`.
 11. **Sandboxed access in the guest** (optional). Bubblewrap from the image, the guest's probe,
     and isolated guest policies chained through the host proxy.
+12. **Memory snapshots** (later, by decision, Q1). Cloud Hypervisor snapshot on idle stop and
+    restore on start, so processes survive, with a cold boot as the fallback.
 
-Later, by decision only: memory snapshot and restore on stop (Q4), VMs that outlive a
-supervisor restart (Q5), a NAT network (Q6), flattening (Q13), aarch64 in CI, and a
+Later still, by decision only: flattening (Q9), aarch64 in CI (Q11), and a
 Virtualization.framework backend.
 
 ## Open questions for Steve
 
-1. **Kata.** Does "works with Kata" mean Kata's artifacts (Cloud Hypervisor and its guest kernel,
-   from a Kata install) driven by the supervisor, as recommended? Or must it be the Kata runtime
-   through containerd (`io.containerd.kata.v2`), with kata-agent in the guest?
+Answered on 2026-11-28 (Decisions, above): Kata versus containerd, the guest user, VMs on
+supervisor exit, NAT, and the test host. Still open:
+
+1. **Memory snapshots.** Cold boot with disks kept for now. Should phase 12 snapshot memory on
+   an idle stop so processes survive? It costs up to `memoryBytes` of disk per stopped VM and
+   ties a snapshot to one Cloud Hypervisor version.
 2. **API shape.** A new access mode, `{"mode": "vm", "vm", "access"}`, plus `vm.*` commands, as
    proposed. Or a VM as a kind of *session* (`session.create` with `vm`, `sessionId` on every
    operation), as in the sessions draft? And should the container draft's `container.*` share
    one router with this?
-3. **Guest user.** Is `raw` root by default (container semantics, proposed), or an unprivileged
-   `uid 1000` that the image must have, with root only through `system`?
-4. **Stop semantics.** Cold boot with disks kept (proposed). Or Cloud Hypervisor snapshot and
-   restore, so processes and memory survive an idle stop, at the cost of `memoryBytes` of disk per
-   stopped VM?
-5. **VMs across supervisor restarts.** Stop them on exit (proposed, consistent with commands
-   today). Or let VMMs outlive an upgrade, so the new supervisor reattaches through `run/<n>/`?
-6. **Network.** Is proxy-only egress enough (no UDP, no DNS, no programs that ignore
-   `HTTP_PROXY`)? Or is a NAT mode needed? passt as a vhost-user network backend would avoid
-   root and taps.
-7. **Disk.** Sparse overcommit (proposed), or reserve with `fallocate`? Is a node-wide disk
+3. **Disk.** Sparse overcommit (proposed), or reserve with `fallocate`? Is a node-wide disk
    budget for VMs needed?
-8. **VMM account.** May `install.sh` create `happy-vm` in group `kvm`? And may an admin add
-   `happy-agent` to `kvm` on `core` for testing?
-9. **Kernel.** Rely on Kata's `vmlinux.container`, which leaves Landlock in the guest unknown, or
+4. **VMM account in production.** May `install.sh` create `happy-vm` in group `kvm`, and add the
+   supervisor's user to `kvm` when it is not root?
+5. **Kernel.** Rely on Kata's `vmlinux.container`, which leaves Landlock in the guest unknown, or
    build and publish our own kernel with each release, from a config in this repo?
-10. **Images from registries.** Should the node pull OCI images itself (phase 8), and with which
-    registry credentials, if any? Or should the control plane always deliver a tarball?
-11. **Logs after a stop.** Should the host mirror memory logs of VM processes, so `exec.log`
-    works after an idle stop, or is `not_found` with file logs on `/workspace` enough?
-12. **Watches.** Confirm that watches do not keep a VM busy and survive stops with `overflow`.
-13. **Layers.** Is a 16-layer cap with `too_large` acceptable until flattening, and should
-    flattening be explicit (`vm.image.flatten`) or automatic?
-14. **Workspace in images.** Should an image be able to carry a seed `/workspace`, or is the
+6. **Registry credentials.** Phase 8 pulls anonymously. Are private registries needed, and
+   should their credentials come per import from the control plane?
+7. **Logs after a stop.** Should the host mirror memory logs of VM processes, so `exec.log`
+   works after an idle stop, or is `not_found` with file logs on `/workspace` enough?
+8. **Watches.** Confirm that watches do not keep a VM busy and survive stops with `overflow`.
+9. **Layers.** Is a 16-layer cap with `too_large` acceptable until flattening, and should
+   flattening be explicit (`vm.image.flatten`) or automatic?
+10. **Workspace in images.** Should an image be able to carry a seed `/workspace`, or is the
     workspace always empty at `vm.create`?
-15. **aarch64.** Is an arm64 host a target now (Cloud Hypervisor and Kata support it), or later?
+11. **aarch64.** Is an arm64 host a target now (Cloud Hypervisor and Kata support it), or later?
+12. **Images without `sudo`.** Should the import VM add `sudo` when an image lacks it, which
+    needs the image's package manager and network at import, or is reporting `sudo: false` and
+    relying on `system` enough?
